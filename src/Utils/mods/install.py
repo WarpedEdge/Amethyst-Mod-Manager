@@ -1955,10 +1955,29 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
             prepared.cleanup()
 
 
+def _validate_prepared_package(prepared, log_fn: LogFn) -> bool:
+    """Run a handler's manifest validator before any existing mod is replaced."""
+    validate_package = getattr(prepared.game, "validate_mod_package", None)
+    if not callable(validate_package):
+        return True
+    try:
+        package_errors = list(validate_package(Path(prepared.src_root)) or [])
+    except Exception as exc:
+        package_errors = [f"Package validation failed unexpectedly: {exc}"]
+    if not package_errors:
+        return True
+    log_fn("Install refused by the game package validator:")
+    for error in package_errors:
+        log_fn(f"  {error}")
+    return False
+
+
 def _finish_install(prepared, fomod_selections, *, log_fn,
                     progress_fn=None, on_exists=None, bain_selections=None,
                     interactive=True, replace_existing=None):
     p = prepared
+    if not _validate_prepared_package(p, log_fn):
+        return None
     from Utils.mods.copy import resolve_target_staging
     staging_root = Path(resolve_target_staging(p.game, p.profile_dir))
     staging_root.mkdir(parents=True, exist_ok=True)
@@ -2410,6 +2429,9 @@ def install_collection_archive(
         archive_probe=archive_probe, load_fomod_context=False,
         detect_installers=replicate_hashes is None)
     if prepared is None:
+        return None
+    if not _validate_prepared_package(prepared, log_fn):
+        prepared.cleanup()
         return None
 
     def _pp(done, total, phase=None):

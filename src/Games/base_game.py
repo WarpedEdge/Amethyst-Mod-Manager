@@ -627,6 +627,15 @@ class BaseGame(ABC):
         """
         return []
 
+    def validate_mod_package(self, source_root: Path) -> list[str]:
+        """Validate an extracted archive before replacing or staging a mod.
+
+        Return user-facing errors to refuse the install.  The default accepts
+        the package.  Game handlers use this only when their package manifest
+        carries semantics that the generic layout checks cannot validate.
+        """
+        return []
+
     @property
     def mod_install_as_is_if_no_match(self) -> bool:
         """
@@ -994,6 +1003,17 @@ class BaseGame(ABC):
 
     def native_launch_blocked_reason(self) -> str:
         """Why get_launch_command() returned None, phrased for the user."""
+        return ""
+
+    def direct_proton_launch_blocked_reason(self, exe_path: Path) -> str:
+        """Return an actionable reason to refuse a direct Proton game launch.
+
+        The normal empty result permits the existing route.  A handler may
+        refuse only game executables whose supported integration depends on a
+        launcher-owned Windows path or other store handoff invariant.  Tool
+        executables should remain usable unless the handler explicitly names
+        them here.
+        """
         return ""
 
     def get_launch_handoff(self, profile: "str | None" = None):

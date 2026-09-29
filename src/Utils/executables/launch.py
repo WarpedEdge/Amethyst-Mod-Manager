@@ -3699,6 +3699,20 @@ def launch_exe_via_proton(
     status in Steam, and the Steam Linux Runtime container is used (fixes
     missing audio vs a raw `proton run`).
     """
+    # Some integrations require Steam to create the Windows-visible launch
+    # identity.  Ask the handler before prefix setup, registry helpers, or any
+    # process creation so a refused route is genuinely non-mutating.
+    try:
+        blocked_reason = game.direct_proton_launch_blocked_reason(exe_path)
+    except AttributeError:
+        blocked_reason = ""
+    except Exception as exc:
+        blocked_reason = f"could not validate the direct Proton launch policy: {exc}"
+    if blocked_reason:
+        log_fn(f"Run EXE: refusing direct Proton launch - {blocked_reason}")
+        launch_report.mark_failed(launch_report.actionable(blocked_reason))
+        return
+
     # A normal Run entry owns settings under its own filename.  Manager Play
     # can intentionally resolve to another executable, notably a VFS-only
     # script extender, so its caller supplies the canonical Play-entry key.
