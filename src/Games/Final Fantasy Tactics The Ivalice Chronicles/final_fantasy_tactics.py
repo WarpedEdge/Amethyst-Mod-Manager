@@ -18,6 +18,7 @@ from fftic_detection import (  # noqa: E402
     detect_installation,
 )
 from fftic_packages import inspect_package  # noqa: E402
+from fftic_orchestration import FfticOrchestrator  # noqa: E402
 
 _PROFILES_DIR = get_profiles_dir()
 _DIRECT_LAUNCH_MESSAGE = (
@@ -36,6 +37,7 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
         self._hash_cache = ExecutableHashCache()
+        self._managed_support_controller = FfticOrchestrator()
         self.load_paths()
 
     @property
@@ -123,6 +125,10 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         return detect_installation(
             self._game_path, steam_build=steam_build, ui_version=ui_version,
             hash_cache=self._hash_cache)
+
+    def get_managed_support_controller(self) -> FfticOrchestrator:
+        """Return the read-only production controller for the FFTIC status UI."""
+        return self._managed_support_controller
 
     def validate_mod_package(self, source_root: Path) -> list[str]:
         result = inspect_package(source_root)

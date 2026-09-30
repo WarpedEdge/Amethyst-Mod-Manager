@@ -60,6 +60,7 @@ py.install_sources(
   'fomod_choices_view.py',
   'fomod_wizard_view.py',
   'framework_banner.py',
+  'fftic_status.py',
   'game_state.py',
   'gl_support.py',
   'glue.py',

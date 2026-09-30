@@ -313,6 +313,9 @@ class MainWindow(QMainWindow):
     # detect_frameworks reads filemap.txt + the mod index, too slow for the UI
     # thread on a big modlist. See _refresh_framework_banner.
     _framework_statuses_ready = Signal(int, object)
+    _fftic_status_ready = Signal(int, object)
+    _fftic_status_progress = Signal(int, object)
+    _fftic_operation_ready = Signal(int, object, object)
     # Deploy/restore worker → UI thread (thread-safe queued connections).
     _op_progress = Signal(int, int, object)   # (done, total, phase|None)
     _log_flush_ready = Signal()
@@ -562,12 +565,24 @@ class MainWindow(QMainWindow):
         self._filegraph_loading_ui = []
         self._filegraph_loading_focus = None
         self._framework_statuses_ready.connect(self._on_framework_statuses)
+        self._fftic_status_ready.connect(self._on_fftic_status_ready)
+        self._fftic_status_progress.connect(self._on_fftic_status_progress)
+        self._fftic_operation_ready.connect(self._on_fftic_operation_ready)
         self._nif_archive_ready.connect(self._on_nif_archive_ready)
         from gui_qt.worker import LatestWorker
         self._nif_archive_jobs = LatestWorker("nif-archive-read")
+        self._fftic_status_jobs = LatestWorker("fftic-status")
         self._nif_open_gen = 0
         # Drops stale framework-detect results (game switched mid-compute).
         self._framework_gen = 0
+        self._fftic_status_gen = 0
+        self._fftic_status_cancel = None
+        self._fftic_status_controller = None
+        self._fftic_status_context = None
+        self._fftic_status_closing = False
+        self._fftic_operation_active = False
+        self._fftic_operation_cancel = None
+        self._fftic_refresh_pending = False
         # Deploy/restore state + notification host.
         self._deploy_running = False
         self._deploy_rerun_pending = False
@@ -3486,6 +3501,7 @@ class MainWindow(QMainWindow):
         self._reload_modlist()
         self._reload_plugins()
         self._update_deployed_profile_highlight()
+        self._refresh_fftic_status()
 
         self._refresh_installed_collections()
 
@@ -3636,6 +3652,7 @@ class MainWindow(QMainWindow):
                     self._reload_plugins()
             self._update_deployed_profile_highlight()
         self._refresh_installed_collections()
+        self._refresh_fftic_status()
         # Keep the Profile Settings ★ marker in sync if that tab is open.
         if self._tabs.has_key("profile_settings"):
             v = getattr(self, "_profile_settings_view", None)
@@ -12677,6 +12694,14 @@ class MainWindow(QMainWindow):
         if game is None or not game.is_configured():
             self._notify(self.tr("No configured game selected."), "warning")
             return
+        if getattr(game, "game_id", "") == "final_fantasy_tactics_the_ivalice_chronicles":
+            controller = game.get_managed_support_controller()
+            reason = controller.launch_block_reason()
+            self._append_log(f"FFTIC launch blocked: {reason}")
+            from gui_qt.confirm_overlay import ConfirmOverlay
+            ConfirmOverlay.show_message(
+                self, self.tr("Start FFTIC from Steam"), reason, card_h=300)
+            return
         # The Play button is already disabled while a texture tool runs, but
         # Play can also auto-deploy first - and that deploy would be refused
         # mid-launch. Stop here with a clear reason instead.
@@ -13372,6 +13397,16 @@ class MainWindow(QMainWindow):
             self._auto_deploy_in_progress = False
             self._notify(self.tr("No configured game selected."), "warning")
             return
+        if getattr(game, "game_id", "") == "final_fantasy_tactics_the_ivalice_chronicles":
+            self._auto_deploy_in_progress = False
+            if silent:
+                self._append_log(
+                    "FFTIC auto-deploy skipped: live profile synchronization "
+                    "is unavailable in this build.")
+                self._refresh_fftic_status()
+            else:
+                self._present_fftic_action("synchronize")
+            return
         if not hasattr(game, "deploy"):
             self._auto_deploy_in_progress = False
             self._notify(self.tr("'{0}' does not support deployment.").format(game.name), "warning")
@@ -13422,6 +13457,15 @@ class MainWindow(QMainWindow):
         Restore is synchronous because the app is exiting and mirrors the Tk
         gui.py shutdown path.
         """
+        if getattr(self, "_fftic_operation_active", False):
+            event.ignore()
+            cancel = getattr(self, "_fftic_operation_cancel", None)
+            if cancel is not None:
+                cancel.set()
+            self._notify(self.tr(
+                "Cancelling the FFTIC operation at a safe boundary. Close Amethyst again after it finishes."),
+                "warning")
+            return
         installed = getattr(self, "_installed_wabbajack_view", None)
         if installed is not None and getattr(installed, "_busy", False):
             event.ignore()
@@ -13446,6 +13490,19 @@ class MainWindow(QMainWindow):
             if not self._wabbajack_shutdown_timer.isActive():
                 self._wabbajack_shutdown_timer.start(100)
             return
+        self._fftic_status_closing = True
+        self._fftic_status_gen += 1
+        cancel = self._fftic_status_cancel
+        if cancel is not None:
+            cancel.set()
+        self._fftic_status_cancel = None
+        self._fftic_status_jobs.discard_pending()
+        controller = self._fftic_status_controller
+        context = self._fftic_status_context
+        if controller is not None and context is not None:
+            controller.invalidate(context)
+        self._fftic_status_controller = None
+        self._fftic_status_context = None
         self._save_filter_states()
         self._save_window_state()
         self._discord_presence.stop()
@@ -13526,6 +13583,9 @@ class MainWindow(QMainWindow):
         game = self._gs.game
         if game is None or not game.is_configured():
             self._notify(self.tr("No configured game selected."), "warning")
+            return
+        if getattr(game, "game_id", "") == "final_fantasy_tactics_the_ivalice_chronicles":
+            self._present_fftic_action("remove")
             return
         if self._deploy_running:
             self._notify(self.tr("A deploy is in progress - try again shortly."), "warning")
@@ -13704,6 +13764,7 @@ class MainWindow(QMainWindow):
         self._restore_refresh_conflicts_done = False
         # Refresh the modlist/conflicts + deployed-profile highlight after the op.
         self._reload_modlist()
+        self._refresh_fftic_status()
         self._update_deployed_profile_highlight()
         self._refresh_framework_banner()
         # Deploy/restore adds/removes framework launchers (script extenders)
@@ -16550,6 +16611,7 @@ class MainWindow(QMainWindow):
         if place and names:
             self._apply_install_placement(list(names), place)
         self._reload_modlist()
+        self._refresh_fftic_status()
         # NOTE: the plugin panel is reloaded from _on_conflicts_ready, after the
         # conflict/filemap rebuild queued by _reload_modlist - NOT here. An
         # immediate reload reads the STALE filemap (the just-installed mod's
@@ -17675,6 +17737,7 @@ class MainWindow(QMainWindow):
         self._reload_modlist(rescan_index=True, preserve_overlays=True)
         self._reload_plugins()
         self._refresh_footer_toggle_labels()
+        self._refresh_fftic_status()
         self._notify(self.tr("Modlist refreshed"), "info")
 
     # ---- search boxes ----------------------------------------------------
@@ -20519,6 +20582,196 @@ class MainWindow(QMainWindow):
         self._framework_banner.set_statuses(statuses)
         self._cache_framework_states(statuses)
 
+    def _fftic_context(self):
+        game = self._gs.game
+        provider = getattr(game, "get_managed_support_controller", None)
+        if not callable(provider):
+            return None
+        from fftic_orchestration import InspectionContext, is_fftic_game
+        if not is_fftic_game(game):
+            return None
+        profile_dir = self._gs.profile_dir()
+        staging = self._gs.staging_dir()
+        if staging is None:
+            try:
+                staging = game.get_effective_mod_staging_path()
+            except Exception:
+                staging = None
+        if profile_dir is None or staging is None:
+            return None
+        return InspectionContext(game, self._gs.profile or "", profile_dir, staging)
+
+    def _refresh_fftic_status(self):
+        panel = getattr(self, "_fftic_status", None)
+        if panel is None or self._fftic_status_closing:
+            return
+        if self._fftic_operation_active:
+            self._fftic_refresh_pending = True
+            return
+        context = self._fftic_context()
+        self._fftic_status_gen += 1
+        generation = self._fftic_status_gen
+        previous = self._fftic_status_cancel
+        if previous is not None:
+            previous.set()
+        old_controller = self._fftic_status_controller
+        old_context = self._fftic_status_context
+        if old_controller is not None and old_context is not None:
+            old_controller.invalidate(old_context)
+        if context is None:
+            self._fftic_status_cancel = None
+            self._fftic_status_controller = None
+            self._fftic_status_context = None
+            self._fftic_status_jobs.discard_pending()
+            panel.clear()
+            return
+        import threading
+        cancel = threading.Event()
+        self._fftic_status_cancel = cancel
+        panel.show()
+        panel.set_loading()
+        controller = context.game.get_managed_support_controller()
+        controller.invalidate(context)
+        self._fftic_status_controller = controller
+        self._fftic_status_context = context
+        progress_signal = self._fftic_status_progress
+        ready_signal = self._fftic_status_ready
+
+        def worker():
+            from fftic_orchestration import InspectionCancelled
+            from gui_qt.safe_emit import safe_emit
+            try:
+                model = controller.refresh(
+                    context, cancel=cancel,
+                    progress=lambda update: safe_emit(
+                        progress_signal, generation, update))
+            except InspectionCancelled:
+                return
+            if not cancel.is_set():
+                safe_emit(ready_signal, generation, model)
+
+        self._fftic_status_jobs.submit(worker)
+
+    def _cancel_fftic_operation(self):
+        if not self._fftic_operation_active:
+            return
+        cancel = self._fftic_operation_cancel
+        if cancel is not None:
+            cancel.set()
+        panel = getattr(self, "_fftic_status", None)
+        if panel is not None:
+            panel.set_operation(True, self.tr(
+                "Cancellation requested. Waiting for the next transaction boundary…"))
+
+    def _on_fftic_status_ready(self, generation: int, model):
+        if generation != self._fftic_status_gen:
+            return
+        panel = getattr(self, "_fftic_status", None)
+        if panel is None:
+            return
+        self._fftic_status_cancel = None
+        panel.set_status(model)
+        if model.error:
+            self._append_log(f"FFTIC status error: {model.error}")
+
+    def _on_fftic_status_progress(self, generation: int, update):
+        if generation != self._fftic_status_gen:
+            return
+        if self._fftic_operation_active:
+            panel = getattr(self, "_fftic_status", None)
+            if panel is not None:
+                panel.set_progress(update)
+            self._append_log(
+                f"FFTIC operation: {update.phase} "
+                f"({update.completed}/{update.total})")
+            return
+        self._append_log(
+            f"FFTIC status: {update.phase} "
+            f"({update.completed}/{update.total})")
+
+    def _execute_fftic_plan(self, controller, plan):
+        if self._fftic_operation_active:
+            self._notify(self.tr("An FFTIC operation is already active."), "warning")
+            return
+        import threading
+        from gui_qt.safe_emit import safe_emit
+        cancel = threading.Event()
+        self._fftic_operation_active = True
+        self._fftic_operation_cancel = cancel
+        self._fftic_status_gen += 1
+        generation = self._fftic_status_gen
+        panel = getattr(self, "_fftic_status", None)
+        if panel is not None:
+            panel.set_operation(True, self.tr("Starting the confirmed FFTIC operation…"))
+
+        def worker():
+            result = None
+            error = None
+            try:
+                result = controller.execute(
+                    plan, cancel=cancel,
+                    progress=lambda update: safe_emit(
+                        self._fftic_status_progress, generation, update))
+            except Exception as exc:
+                error = exc
+            safe_emit(self._fftic_operation_ready, generation, result, error)
+
+        self._fftic_status_jobs.submit(worker)
+
+    def _on_fftic_operation_ready(self, generation: int, result, error):
+        if generation != self._fftic_status_gen:
+            return
+        self._fftic_operation_active = False
+        self._fftic_operation_cancel = None
+        self._fftic_refresh_pending = False
+        if error is None:
+            self._notify(self.tr("FFTIC operation completed and was verified."), "info")
+        else:
+            from fftic_managed_executor import ManagedOperationCancelled
+            if isinstance(error, ManagedOperationCancelled):
+                self._notify(self.tr("FFTIC operation cancelled at a safe boundary."), "warning")
+            else:
+                self._notify(self.tr("FFTIC operation failed: {0}").format(error), "error")
+                self._append_log(f"FFTIC operation failed: {error}")
+        self._refresh_fftic_status()
+
+    def _present_fftic_action(self, action: str):
+        context = self._fftic_context()
+        if context is None:
+            self._notify(self.tr("FFTIC status is unavailable for this profile."), "error")
+            return
+        from fftic_orchestration import OperationKind
+        controller = context.game.get_managed_support_controller()
+        try:
+            plan = controller.plan(OperationKind(action))
+        except Exception as exc:
+            self._notify(str(exc), "error")
+            return
+        if not controller.mutation_available:
+            self._notify(controller.last_status.mutation_unavailable_reason, "error")
+            return
+        lines = [f"• {step.component}: {step.action}\n  {step.target}"
+                 for step in plan.steps]
+        binding = plan.binding
+        body = "\n\n".join((
+            f"Game: {getattr(context.game, 'name', binding.game_id)}",
+            f"Profile: {binding.profile}",
+            f"Game path: {binding.game_root}",
+            f"Prefix: {binding.prefix}",
+            f"Staging: {binding.staging_root}",
+            *lines,
+            "Durable recovery information is recorded before each filesystem-changing "
+            "step. Cancellation takes effect at transaction boundaries; an unverified "
+            "rollback requires recovery.",
+        ))
+        from gui_qt.confirm_overlay import ConfirmOverlay
+        ConfirmOverlay.show_over(
+            self, self.tr("Confirm FFTIC managed operation"), body,
+            lambda accepted: self._execute_fftic_plan(controller, plan)
+            if accepted else None,
+            confirm_label=self.tr("Continue"), cancel_label=self.tr("Cancel"),
+            danger=plan.kind.value == "remove", card_h=520)
+
     def _on_framework_statuses(self, gen: int, statuses):
         if gen != self._framework_gen or not hasattr(self, "_framework_banner"):
             return
@@ -20536,6 +20789,7 @@ class MainWindow(QMainWindow):
 
     def _on_modlist_saved(self, edit_ctx=None):
         """Reconcile every committed modlist edit with the native graph."""
+        self._refresh_fftic_status()
         if edit_ctx and edit_ctx[0] == "toggle":
             self._refresh_requirement_flags()
         from Utils.diagnostics.conflicts import timeline_from_edit_ctx
@@ -21450,6 +21704,12 @@ class MainWindow(QMainWindow):
             sig.connect(self._on_plugin_layout_changed)
         from gui_qt.framework_banner import FrameworkBanner
         self._framework_banner = FrameworkBanner()
+        from gui_qt.fftic_status import FfticStatusPanel
+        self._fftic_status = FfticStatusPanel()
+        self._fftic_status.recheck_requested.connect(self._refresh_fftic_status)
+        self._fftic_status.cancel_requested.connect(self._cancel_fftic_operation)
+        self._fftic_status.action_requested.connect(self._present_fftic_action)
+        QTimer.singleShot(0, self._refresh_fftic_status)
         self._plugin_stack.addWidget(self._plugin_view)
         if startup_timing is not None:
             startup_timing.record(
@@ -21495,6 +21755,7 @@ class MainWindow(QMainWindow):
         tabs.addStretch(1)
         # Framework-status banner ABOVE the tabs so it's visible on every
         # sub-tab (one colored row per framework the game declares).
+        v.addWidget(self._fftic_status)
         v.addWidget(self._framework_banner)
         v.addLayout(tabs)
         v.addWidget(self._plugin_stack, 1)

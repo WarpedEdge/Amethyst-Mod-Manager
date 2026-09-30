@@ -378,20 +378,38 @@ def test_transaction_plans() -> None:
 
 
 def test_steam_options() -> None:
-    assert analyze_steam_launch_options("").status == SteamOptionsStatus.MISSING
-    assert analyze_steam_launch_options(COPY_READY_OPTIONS).status \
-        == SteamOptionsStatus.CONFIGURED
+    empty = analyze_steam_launch_options("")
+    assert empty.status == SteamOptionsStatus.MISSING
+    assert empty.required_copy_text == COPY_READY_OPTIONS
+    configured = analyze_steam_launch_options(COPY_READY_OPTIONS)
+    assert configured.status == SteamOptionsStatus.CONFIGURED
+    assert configured.required_copy_text == COPY_READY_OPTIONS
     preserved = analyze_steam_launch_options(
         'MANGOHUD=1 ' + COPY_READY_OPTIONS + ' -windowed')
     assert preserved.status == SteamOptionsStatus.CONFIGURED
     assert preserved.original.startswith("MANGOHUD=1")
     assert "MANGOHUD=1" in preserved.preserved_unrelated
     assert "-windowed" in preserved.preserved_unrelated
-    assert analyze_steam_launch_options(
-        'DOTNET_ROOT="C:\\Wrong" %command%').status == SteamOptionsStatus.DIFFERENT
-    assert analyze_steam_launch_options(
+    assert preserved.required_copy_text.startswith("MANGOHUD=1 WINEDLLOVERRIDES=")
+    assert preserved.required_copy_text.endswith("%command% -windowed")
+    assert preserved.recommendation_is_composed
+    assert preserved.required_copy_text.count("%command%") == 1
+    missing = analyze_steam_launch_options("MANGOHUD=1 %command% -windowed")
+    assert missing.status == SteamOptionsStatus.MISSING
+    assert "MANGOHUD=1" in missing.required_copy_text
+    assert missing.required_copy_text.endswith("%command% -windowed")
+    different = analyze_steam_launch_options(
+        'MANGOHUD=1 DOTNET_ROOT="C:\\Wrong" %command% -windowed')
+    assert different.status == SteamOptionsStatus.DIFFERENT
+    assert 'DOTNET_ROOT="C:\\Program Files\\dotnet"' in different.required_copy_text
+    assert "C:\\Wrong" not in different.required_copy_text
+    assert different.required_copy_text.count("%command%") == 1
+    conflict = analyze_steam_launch_options(
         COPY_READY_OPTIONS.replace("version=n,b", "version=b")
-    ).status == SteamOptionsStatus.CONFLICT
+    )
+    assert conflict.status == SteamOptionsStatus.CONFLICT
+    assert conflict.required_copy_text == COPY_READY_OPTIONS
+    assert not conflict.preserved_unrelated
     assert analyze_steam_launch_options(
         COPY_READY_OPTIONS + " %command%").status == SteamOptionsStatus.CONFLICT
     assert analyze_steam_launch_options(
@@ -402,6 +420,21 @@ def test_steam_options() -> None:
     duplicate = COPY_READY_OPTIONS.replace(
         "%command%", 'DOTNET_ROOT="C:\\Program Files\\dotnet" %command%')
     assert analyze_steam_launch_options(duplicate).status == SteamOptionsStatus.CONFLICT
+    safely_quoted = analyze_steam_launch_options(
+        "LABEL='value with spaces; $HOME' " + COPY_READY_OPTIONS +
+        " 'argument with spaces'")
+    assert safely_quoted.status == SteamOptionsStatus.CONFIGURED
+    assert "LABEL='value with spaces; $HOME'" in safely_quoted.required_copy_text
+    assert safely_quoted.required_copy_text.endswith("%command% 'argument with spaces'")
+    for unsafe in (
+        "env " + COPY_READY_OPTIONS,
+        "sh -c " + COPY_READY_OPTIONS,
+        COPY_READY_OPTIONS + " ; echo unsafe",
+        "EXTRA=$HOME " + COPY_READY_OPTIONS,
+    ):
+        result = analyze_steam_launch_options(unsafe)
+        assert result.status == SteamOptionsStatus.CONFLICT
+        assert result.required_copy_text == COPY_READY_OPTIONS
 
 
 def test_direct_launch_policy_and_no_live_side_effects() -> None:

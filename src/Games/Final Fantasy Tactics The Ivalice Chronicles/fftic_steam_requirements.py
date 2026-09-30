@@ -21,8 +21,6 @@ COPY_READY_OPTIONS = (
 )
 REQUIRED_OPTIONS_SHA256 = hashlib.sha256(COPY_READY_OPTIONS.encode("utf-8")).hexdigest()
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-_SHELL_META = re.compile(
-    r"(?:^|\s)(?:env|sh|bash|gamescope|gamemoderun|mangohud)(?:\s|$)|[;&|<>`]|\$\(")
 
 
 class SteamOptionsStatus(str, Enum):
@@ -39,6 +37,68 @@ class SteamOptionsAnalysis:
     required_copy_text: str
     diagnostics: tuple[str, ...]
     preserved_unrelated: tuple[str, ...]
+    recommendation_is_composed: bool
+
+
+def _safe_assignment(name: str, value: str) -> str:
+    return f"{name}={shlex.quote(value)}"
+
+
+def _has_unsafe_shell_syntax(text: str) -> bool:
+    quote = ""
+    escaped = False
+    word_start = True
+    for character in text:
+        if character in "\r\n":
+            return True
+        if escaped:
+            escaped = False
+            word_start = False
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = ""
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = ""
+            elif character in "$`":
+                return True
+            continue
+        if character in "'\"":
+            quote = character
+            word_start = False
+        elif character.isspace():
+            word_start = True
+        elif character == "#" and word_start:
+            return True
+        elif character in ";&|<>`()$":
+            return True
+        else:
+            word_start = False
+    return False
+
+
+def _safe_composition(
+    assignments_before: list[tuple[str, str]], arguments_after: list[str],
+) -> str:
+    before = [_safe_assignment(name, value)
+              for name, value in assignments_before]
+    required = [f'{name}="{value}"' for name, value in REQUIRED_VALUES.items()]
+    after = [shlex.quote(value) for value in arguments_after]
+    return " ".join((*before, *required, "%command%", *after))
+
+
+def _conflict(original: str, diagnostic: str) -> SteamOptionsAnalysis:
+    return SteamOptionsAnalysis(
+        SteamOptionsStatus.CONFLICT, original, COPY_READY_OPTIONS,
+        (diagnostic,
+         "Unsafe or conflicting syntax could not be preserved automatically; "
+         "the recommendation is the canonical safe replacement."),
+        (), False)
 
 
 def analyze_steam_launch_options(options: str | None) -> SteamOptionsAnalysis:
@@ -46,25 +106,25 @@ def analyze_steam_launch_options(options: str | None) -> SteamOptionsAnalysis:
     if not original.strip():
         return SteamOptionsAnalysis(
             SteamOptionsStatus.MISSING, original, COPY_READY_OPTIONS,
-            ("Steam Launch Options are empty.",), ())
-    if _SHELL_META.search(original):
-        return SteamOptionsAnalysis(
-            SteamOptionsStatus.CONFLICT, original, COPY_READY_OPTIONS,
-            ("The existing wrapper or shell syntax cannot be composed safely.",), ())
+            ("Steam Launch Options are empty; the canonical value is recommended.",),
+            (), False)
+    if _has_unsafe_shell_syntax(original):
+        return _conflict(
+            original, "The existing wrapper or shell syntax cannot be composed safely.")
     try:
         tokens = shlex.split(original, posix=True)
     except ValueError as exc:
-        return SteamOptionsAnalysis(
-            SteamOptionsStatus.CONFLICT, original, COPY_READY_OPTIONS,
-            (f"The existing syntax cannot be parsed safely: {exc}",), ())
+        return _conflict(original, f"The existing syntax cannot be parsed safely: {exc}")
     command_indexes = [i for i, token in enumerate(tokens) if token == "%command%"]
     if len(command_indexes) != 1:
-        return SteamOptionsAnalysis(
-            SteamOptionsStatus.CONFLICT, original, COPY_READY_OPTIONS,
-            (f"Expected exactly one %command% placeholder; found {len(command_indexes)}.",), ())
+        return _conflict(
+            original,
+            f"Expected exactly one %command% placeholder; found {len(command_indexes)}.")
     command_index = command_indexes[0]
     assignments: dict[str, list[tuple[int, str]]] = {}
     unrelated: list[str] = []
+    assignments_before: list[tuple[str, str]] = []
+    arguments_after: list[str] = []
     for index, token in enumerate(tokens):
         if token == "%command%":
             continue
@@ -73,13 +133,18 @@ def analyze_steam_launch_options(options: str | None) -> SteamOptionsAnalysis:
             assignments.setdefault(match.group(1), []).append((index, match.group(2)))
             if match.group(1) not in REQUIRED_VALUES:
                 unrelated.append(token)
+                if index < command_index:
+                    assignments_before.append((match.group(1), match.group(2)))
+                else:
+                    arguments_after.append(token)
         else:
             unrelated.append(token)
             if index < command_index:
-                return SteamOptionsAnalysis(
-                    SteamOptionsStatus.CONFLICT, original, COPY_READY_OPTIONS,
-                    (f"Token before %command% may be a wrapper and cannot be proven safe: {token!r}.",),
-                    tuple(unrelated))
+                return _conflict(
+                    original,
+                    f"Token before %command% may be a wrapper and cannot be proven safe: "
+                    f"{token!r}.")
+            arguments_after.append(token)
     diagnostics: list[str] = []
     conflict = False
     different = False
@@ -107,7 +172,7 @@ def analyze_steam_launch_options(options: str | None) -> SteamOptionsAnalysis:
                 different = True
                 diagnostics.append(f"{name} has a different value: {actual!r}.")
     if conflict:
-        status = SteamOptionsStatus.CONFLICT
+        return _conflict(original, " ".join(diagnostics))
     elif different:
         status = SteamOptionsStatus.DIFFERENT
     elif missing:
@@ -115,5 +180,11 @@ def analyze_steam_launch_options(options: str | None) -> SteamOptionsAnalysis:
     else:
         status = SteamOptionsStatus.CONFIGURED
         diagnostics.append("All required assignments and %command% placement are valid.")
+    recommendation = _safe_composition(assignments_before, arguments_after)
+    composed = recommendation != COPY_READY_OPTIONS
+    if composed:
+        diagnostics.append(
+            "The recommendation safely composes the required assignments with "
+            "the unrelated options shown separately; the original text is unchanged.")
     return SteamOptionsAnalysis(
-        status, original, COPY_READY_OPTIONS, tuple(diagnostics), tuple(unrelated))
+        status, original, recommendation, tuple(diagnostics), tuple(unrelated), composed)

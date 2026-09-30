@@ -6,6 +6,8 @@ py.install_sources(
   'fftic_extraction.py',
   'fftic_generation.py',
   'fftic_lifecycle.py',
+  'fftic_managed_executor.py',
+  'fftic_orchestration.py',
   'fftic_pac.py',
   'final_fantasy_tactics.py',
   'fftic_packages.py',
