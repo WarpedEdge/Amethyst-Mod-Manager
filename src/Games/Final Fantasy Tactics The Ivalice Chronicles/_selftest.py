@@ -292,11 +292,11 @@ def test_reloaded_generation() -> None:
     )
     first = generate_reloaded_configuration(
         private_generation_root=private, windows_game_path=windows,
-        selected_mode=Mode.ENHANCED, managed_package_locations=managed,
+        managed_package_locations=managed,
         user_mods=mods)
     second = generate_reloaded_configuration(
         private_generation_root=private, windows_game_path=windows,
-        selected_mode=Mode.ENHANCED, managed_package_locations=managed,
+        managed_package_locations=managed,
         user_mods=mods)
     assert dict(first.files) == dict(second.files)
     assert first.file_bytes("portable.txt") == b""
@@ -326,7 +326,7 @@ def test_reloaded_generation() -> None:
     try:
         generate_reloaded_configuration(
             private_generation_root=private, windows_game_path=windows,
-            selected_mode=Mode.ENHANCED, managed_package_locations=managed,
+            managed_package_locations=managed,
             user_mods=duplicate_case)
     except ValueError as exc:
         assert "Duplicate user mod ID" in str(exc)
@@ -340,7 +340,7 @@ def test_reloaded_generation() -> None:
     try:
         generate_reloaded_configuration(
             private_generation_root=private, windows_game_path=windows,
-            selected_mode=Mode.ENHANCED, managed_package_locations=managed,
+            managed_package_locations=managed,
             user_mods=managed_user)
     except ValueError as exc:
         assert "Managed package IDs" in str(exc)

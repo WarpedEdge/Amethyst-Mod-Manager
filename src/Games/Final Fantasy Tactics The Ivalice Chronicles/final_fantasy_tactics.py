@@ -1,4 +1,4 @@
-"""Game registration and non-mutating Phase C1 policy for FFTIC."""
+"""Game registration and explicit managed-lifecycle policy for FFTIC."""
 
 from __future__ import annotations
 
@@ -142,9 +142,10 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
 
     def deploy(self, *args, **kwargs) -> None:
         raise RuntimeError(
-            "FFTIC live synchronization is not implemented in Phase C1. "
-            "No game or prefix files were changed.")
+            "FFTIC does not use generic root deployment. Use the explicit managed-runtime "
+            "synchronization service after setup readiness passes. No files were changed.")
 
     def restore(self, *args, **kwargs) -> None:
         raise RuntimeError(
-            "FFTIC has no Phase C1 live deployment to restore. No files were removed.")
+            "FFTIC does not use generic restore. Use the receipt-owned managed-runtime "
+            "removal or rollback service. No files were removed.")

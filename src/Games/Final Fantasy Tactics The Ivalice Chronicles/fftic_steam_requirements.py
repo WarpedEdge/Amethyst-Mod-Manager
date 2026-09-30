@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ COPY_READY_OPTIONS = (
     'DOTNET_BUNDLE_EXTRACT_BASE_DIR="C:\\users\\steamuser\\AppData\\Local\\Temp\\.net" '
     '%command%'
 )
+REQUIRED_OPTIONS_SHA256 = hashlib.sha256(COPY_READY_OPTIONS.encode("utf-8")).hexdigest()
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _SHELL_META = re.compile(
     r"(?:^|\s)(?:env|sh|bash|gamescope|gamemoderun|mangohud)(?:\s|$)|[;&|<>`]|\$\(")

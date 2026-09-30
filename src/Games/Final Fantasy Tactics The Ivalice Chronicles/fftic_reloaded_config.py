@@ -26,6 +26,7 @@ SIGSCAN_ID = "Reloaded.Memory.SigScan.ReloadedII"
 SHARED_HOOKS_ID = "reloaded.sharedlib.hooks"
 NENKAI_ID = "fftivc.utility.modloader"
 MANAGED_ORDER = (SIGSCAN_ID, SHARED_HOOKS_ID, NENKAI_ID)
+_WINDOWS_PATH_TOKEN = object()
 
 
 class Mode(str, Enum):
@@ -39,12 +40,43 @@ class ValidatedSteamPath:
 
     @classmethod
     def from_resolver(cls, value: str) -> "ValidatedSteamPath":
-        """Accept only the production Steam-visible identity proved in Phase B2."""
+        """Accept only the runtime's resolver-validated Steam ``S:`` identity."""
         if not isinstance(value, str) or not re.match(
                 r"^S:\\steamapps\\common\\[^\\]+$", value, re.IGNORECASE):
             raise ValueError(
                 "FFTIC requires a resolver-validated S:\\steamapps\\common\\... path")
         return cls(value.rstrip("\\"))
+
+
+@dataclass(frozen=True)
+class ValidatedWindowsGenerationPath:
+    value: str
+    prefix: Path
+    host_root: Path
+    _attestation: object
+
+    @classmethod
+    def _from_resolved(cls, value: str, prefix: Path,
+                       host_root: Path) -> "ValidatedWindowsGenerationPath":
+        return cls(value, prefix, host_root, _WINDOWS_PATH_TOKEN)
+
+    def revalidate(self) -> None:
+        if self._attestation is not _WINDOWS_PATH_TOKEN:
+            raise ValueError("Managed generation path lacks resolver evidence")
+        current = self.host_root
+        while current != self.prefix and current != current.parent:
+            if current.is_symlink():
+                raise ValueError(f"Managed generation path crosses a symbolic link: {current}")
+            current = current.parent
+        if current != self.prefix:
+            raise ValueError("Managed generation path no longer belongs to the selected prefix")
+        drive_c = (self.prefix / "drive_c").resolve(strict=True)
+        root = self.host_root.resolve(strict=True)
+        if not root.is_dir() or not root.is_relative_to(drive_c):
+            raise ValueError("Managed generation path no longer maps to the selected prefix C: drive")
+        expected = "C:\\" + "\\".join(root.relative_to(drive_c).parts)
+        if expected != self.value:
+            raise ValueError("Managed generation Windows/host mapping changed")
 
 
 @dataclass(frozen=True)
@@ -59,7 +91,6 @@ class UserMod:
 @dataclass(frozen=True)
 class GeneratedReloadedConfig:
     private_generation_root: Path
-    selected_mode: Mode
     files: MappingProxyType
     directories: tuple[str, ...]
     managed_package_sources: MappingProxyType
@@ -123,7 +154,6 @@ def generate_reloaded_configuration(
     *,
     private_generation_root: Path,
     windows_game_path: ValidatedSteamPath,
-    selected_mode: Mode,
     managed_package_locations: dict[str, Path],
     user_mods: tuple[UserMod, ...] | list[UserMod],
 ) -> GeneratedReloadedConfig:
@@ -155,7 +185,6 @@ def generate_reloaded_configuration(
     directories = ("Apps", "Mods", "User/Mods")
     return GeneratedReloadedConfig(
         root,
-        selected_mode,
         MappingProxyType(dict(sorted(files.items()))),
         directories,
         MappingProxyType({key: str(managed_package_locations[key])
@@ -163,3 +192,42 @@ def generate_reloaded_configuration(
         MappingProxyType({mod.mod_id: str(mod.package_location)
                           for mod in sorted(mods, key=lambda item: item.mod_id.casefold())}),
     )
+
+
+def generate_bootstrap_configuration(root: ValidatedWindowsGenerationPath) -> bytes:
+    """Generate the bootstrap schema required by the reviewed Reloaded runtime tuple."""
+    root.revalidate()
+    base = PureWindowsPath(root.value)
+    payload = {
+        "LoaderPath32": str(base / "Loader" / "X86" / "Reloaded.Mod.Loader.dll"),
+        "LoaderPath64": str(base / "Loader" / "X64" / "Reloaded.Mod.Loader.dll"),
+        "LauncherPath": str(base / "Reloaded-II.exe"),
+        "Bootstrapper32Path": str(base / "Loader" / "X86" / "Bootstrapper" /
+                                  "Reloaded.Mod.Loader.Bootstrapper.dll"),
+        "Bootstrapper64Path": str(base / "Loader" / "X64" / "Bootstrapper" /
+                                  "Reloaded.Mod.Loader.Bootstrapper.dll"),
+        "ApplicationConfigDirectory": str(base / "Apps"),
+        "ModUserConfigDirectory": str(base / "User" / "Mods"),
+        "MiscConfigDirectory": str(base / "User" / "Misc"),
+        "PluginConfigDirectory": str(base / "Plugins"),
+        "ModConfigDirectory": str(base / "Mods"),
+        "EnabledPlugins": [],
+        "LanguageFile": "en-GB.xaml",
+        "ThemeFile": "Default.xaml",
+        "FirstLaunch": False,
+        "ShowConsole": True,
+        "LogFileCompressTimeHours": 6,
+        "LogFileDeleteHours": 336,
+        "CrashDumpDeleteHours": 24,
+        # No update feeds are delegated to Reloaded; Amethyst moves only
+        # between complete reviewed compatibility generations.
+        "NuGetFeeds": [],
+        "ForceModPrereleases": False,
+        "ReloadedProcessListRefreshInterval": 1000,
+        "LoaderSetupTimeout": 30000,
+        "LoaderSetupSleeptime": 32,
+        "ProcessRefreshInterval": 200,
+        "SkipWineLaunchWarning": True,
+        "DisableDInput": False,
+    }
+    return _json_bytes(payload)
