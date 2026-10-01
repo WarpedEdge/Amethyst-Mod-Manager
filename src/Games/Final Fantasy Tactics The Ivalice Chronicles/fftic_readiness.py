@@ -317,6 +317,8 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
     steam = receipt["steam_launch_options"]
     current_steam = analyze_steam_launch_options(evidence.steam_options.original)
     if (steam["required_sha256"] != REQUIRED_OPTIONS_SHA256
+            or steam["observed_sha256"] != hashlib.sha256(
+                current_steam.original.encode("utf-8")).hexdigest()
             or evidence.steam_options != current_steam
             or steam["status"] != current_steam.status.value
             or current_steam.status != SteamOptionsStatus.CONFIGURED):

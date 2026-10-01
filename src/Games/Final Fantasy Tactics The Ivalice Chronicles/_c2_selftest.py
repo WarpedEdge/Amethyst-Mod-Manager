@@ -665,6 +665,7 @@ def _receipt(transaction="tx") -> dict:
                                "installed_directory": "FFTIC"},
         "prefix_identity": {"path": "/sandbox/prefix", "runner_identity": SUPPORTED_PROTON_RUNNER},
         "executable_hashes": dict(VERIFIED_HASHES),
+        "evidence_authority": "reviewed-production",
         "compatibility_tuple": {
             "steam_build": "24304444", "ui_version": "v1.5.2",
             "proton_runner": SUPPORTED_PROTON_RUNNER,
@@ -702,8 +703,10 @@ def _receipt(transaction="tx") -> dict:
             {"component": VC_COMPONENT, "state": "sufficient",
              "observed_version": "14.44.35211.0", "required_version": "14.30.0.0"},
         ],
-        "steam_launch_options": {"status": "Configured",
-                                 "required_sha256": REQUIRED_OPTIONS_SHA256},
+        "steam_launch_options": {
+            "status": "Configured", "required_sha256": REQUIRED_OPTIONS_SHA256,
+            "observed_sha256": hashlib.sha256(
+                COPY_READY_OPTIONS.encode("utf-8")).hexdigest()},
         "generated_pac_observations": [], "last_successful_operation": "test",
         "incomplete_operation": None, "recovery_instructions": ["Use the sandbox receipt."],
     }

@@ -28,7 +28,8 @@ PREFIX_CONFIGURATION_PATH = (
     "users/steamuser/AppData/Roaming/Reloaded-Mod-Loader-II/ReloadedII.json")
 _REQUIRED = {
     "schema_version", "transaction_id", "created_at", "updated_at", "steam_app_id",
-    "game_root_identity", "prefix_identity", "executable_hashes", "compatibility_tuple",
+    "game_root_identity", "prefix_identity", "executable_hashes", "evidence_authority",
+    "compatibility_tuple",
     "active_generation_identity", "artifacts", "managed_packages", "configuration_hashes",
     "user_packages", "owned_game_targets", "prefix_owned_configuration",
     "shared_prerequisites", "steam_launch_options", "generated_pac_observations",
@@ -126,8 +127,14 @@ def validate_receipt(data: object) -> dict:
     executables = _exact(data["executable_hashes"], {"classic", "enhanced"}, "executable_hashes")
     for key, value in executables.items():
         _hash(value, f"executable_hashes.{key}")
-    if executables != VERIFIED_HASHES:
-        _fail("executable_hashes reviewed identities")
+    authority = data["evidence_authority"]
+    if authority == "reviewed-production":
+        if executables != VERIFIED_HASHES:
+            _fail("executable_hashes reviewed identities")
+    elif not (isinstance(authority, str)
+              and authority.startswith("isolated-fixture:")
+              and len(authority) <= 128):
+        _fail("evidence_authority")
     compatibility = _exact(data["compatibility_tuple"], {
         "steam_build", "ui_version", "proton_runner", "reloaded", "sigscan",
         "shared_hooks", "nenkai",
@@ -299,13 +306,15 @@ def validate_receipt(data: object) -> dict:
         if observed < required:
             _fail(f"shared_prerequisites[{index}].observed_version")
 
-    steam = _exact(data["steam_launch_options"], {"status", "required_sha256"},
+    steam = _exact(data["steam_launch_options"],
+                   {"status", "required_sha256", "observed_sha256"},
                    "steam_launch_options")
     if steam["status"] not in {"Configured", "Missing", "Different", "Conflict"}:
         _fail("steam_launch_options.status")
     if (_hash(steam["required_sha256"], "steam_launch_options.required_sha256")
             != REQUIRED_OPTIONS_SHA256):
         _fail("steam_launch_options.required_sha256")
+    _hash(steam["observed_sha256"], "steam_launch_options.observed_sha256")
     pacs = data["generated_pac_observations"]
     if not isinstance(pacs, list):
         _fail("generated_pac_observations")

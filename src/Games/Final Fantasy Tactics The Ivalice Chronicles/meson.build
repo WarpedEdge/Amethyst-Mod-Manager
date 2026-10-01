@@ -18,6 +18,7 @@ py.install_sources(
   'fftic_steam_path.py',
   'fftic_steam_requirements.py',
   'fftic_transaction_executor.py',
+  'fftic_workflows.py',
   'fftic_transactions.py',
   subdir: 'Games' / 'Final Fantasy Tactics The Ivalice Chronicles',
 )

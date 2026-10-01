@@ -55,6 +55,21 @@ class FileTransactionJournal:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
+    def read_events(self) -> tuple[dict, ...]:
+        if not self.path.exists():
+            return ()
+        if self.path.is_symlink() or not self.path.is_file():
+            raise TransactionError(f"Transaction journal is not a regular file: {self.path}")
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise TransactionError(f"Transaction journal is corrupt: {exc}") from exc
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or not isinstance(data.get("events"), list)
+                or not all(isinstance(event, dict) for event in data["events"])):
+            raise TransactionError("Transaction journal schema is corrupt")
+        return tuple(data["events"])
+
     def record(self, **values) -> None:
         if os.path.lexists(self.path) and (self.path.is_symlink() or not self.path.is_file()):
             raise TransactionError(f"Transaction journal is not a regular file: {self.path}")

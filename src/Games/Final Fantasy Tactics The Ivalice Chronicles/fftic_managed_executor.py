@@ -41,6 +41,20 @@ class OperationState(str, Enum):
     RECOVERY_REQUIRED = "recovery-required"
 
 
+class RecoveryState(str, Enum):
+    """Durable state reconstructed from one lifecycle attempt."""
+
+    NOT_STARTED = "no operation started"
+    STARTED = "operation started but not prepared"
+    PREPARED = "prepared but not mutated"
+    MUTATION_ATTEMPTED = "mutation attempted"
+    FORWARD_VERIFIED = "forward state verified"
+    ROLLBACK_STARTED = "rollback started"
+    ROLLBACK_VERIFIED = "rollback verified"
+    RECOVERY_REQUIRED = "recovery required"
+    COMPLETED = "operation completed"
+
+
 class ManagedOperationError(RuntimeError):
     """A lifecycle operation failed before a recovery-only condition."""
 
@@ -253,6 +267,7 @@ class StagedLifecycleOperations:
                 operation=plan.kind.value, **values)
 
         try:
+            record(step=-1, phase="operation", state="operation-started")
             for index, step in enumerate(steps):
                 if cancel is not None and cancel.is_set():
                     raise ManagedOperationCancelled(
@@ -271,11 +286,13 @@ class StagedLifecycleOperations:
                        recovery_information=recovery)
                 if step.mutates:
                     attempted.append((step, token, index))
+                    record(step=index, phase=step.name, state="mutation-attempted")
                 step.apply(token, cancel)
                 step.verify(token)
-                record(step=index, phase=step.name, state="durable")
+                record(step=index, phase=step.name, state="forward-verified")
                 if progress is not None:
                     progress(ProgressUpdate(index + 1, len(steps), step.name))
+            record(step=len(steps), phase="operation", state="operation-completed")
             return OperationResult(plan, OperationState.SUCCEEDED, len(steps),
                                    f"FFTIC {plan.kind.value} completed and verified")
         except BaseException as original:
@@ -297,9 +314,44 @@ class StagedLifecycleOperations:
                 raise RecoveryRequiredError(
                     f"Rollback was incomplete for attempt {attempt_id}, plan "
                     f"{plan_fingerprint}: " + "; ".join(failures)) from original
+            if isinstance(original, RecoveryRequiredError):
+                record(step=len(attempted), phase="rollback",
+                       state="recovery-required", original_error=str(original))
+                raise original
             record(step=len(attempted), phase="rollback", state="rollback-verified",
                    original_error=str(original))
             raise
+
+    @staticmethod
+    def recovery_state(events: list[dict] | tuple[dict, ...],
+                       attempt_id: str | None = None) -> RecoveryState:
+        """Classify durable evidence without guessing whether a mutation occurred."""
+        matching = [event for event in events if (
+            attempt_id is None or event.get("attempt_id") == attempt_id)]
+        if not matching:
+            return RecoveryState.NOT_STARTED
+        if attempt_id is None:
+            attempt_id = matching[-1].get("attempt_id")
+            matching = [event for event in matching
+                        if event.get("attempt_id") == attempt_id]
+        states = [event.get("state") for event in matching]
+        if "operation-completed" in states:
+            return RecoveryState.COMPLETED
+        if "recovery-required" in states or "rollback-failed" in states:
+            return RecoveryState.RECOVERY_REQUIRED
+        if "rollback-started" in states and "rollback-verified" not in states:
+            return RecoveryState.ROLLBACK_STARTED
+        if "rollback-verified" in states:
+            return RecoveryState.ROLLBACK_VERIFIED
+        if "forward-verified" in states:
+            return RecoveryState.FORWARD_VERIFIED
+        if "mutation-attempted" in states:
+            return RecoveryState.MUTATION_ATTEMPTED
+        if "write-ahead" in states:
+            return RecoveryState.PREPARED
+        if "operation-started" in states:
+            return RecoveryState.STARTED
+        return RecoveryState.NOT_STARTED
 
     def setup(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
