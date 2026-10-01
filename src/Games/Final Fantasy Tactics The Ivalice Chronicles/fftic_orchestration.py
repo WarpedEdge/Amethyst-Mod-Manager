@@ -20,6 +20,7 @@ try:
     from .fftic_packages import PackageClassification, inspect_package
     from .fftic_pac import PacLaunchEvidence
     from .fftic_prerequisites import PrerequisiteState, inspect_prefix_prerequisites
+    from .fftic_proton import ProtonSelection, resolve_proton_selection
     from .fftic_readiness import (
         ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
         verify_launch_readiness,
@@ -38,6 +39,7 @@ except ImportError:
     from fftic_packages import PackageClassification, inspect_package
     from fftic_pac import PacLaunchEvidence
     from fftic_prerequisites import PrerequisiteState, inspect_prefix_prerequisites
+    from fftic_proton import ProtonSelection, resolve_proton_selection
     from fftic_readiness import (
         ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
         verify_launch_readiness,
@@ -299,7 +301,7 @@ def _manifest_value(path: Path, key: str) -> str | None:
         return None
 
 
-def _ui_version(game_root: Path | None) -> str | None:
+def _pe_version(game_root: Path | None) -> str | None:
     if game_root is None:
         return None
     try:
@@ -309,22 +311,6 @@ def _ui_version(game_root: Path | None) -> str | None:
         return None
     parts = value.split(".") if value else []
     return "v" + ".".join(parts[:3]) if len(parts) >= 3 else None
-
-
-def _runner_identity(prefix: Path | None) -> str:
-    if prefix is None:
-        return ""
-    try:
-        from Utils.wine.prefix import read_prefix_runner, resolve_compat_data
-        lines = (resolve_compat_data(prefix) / "config_info").read_text(
-            encoding="utf-8", errors="replace").splitlines()
-        candidates = [read_prefix_runner(resolve_compat_data(prefix)), *lines]
-    except OSError:
-        candidates = []
-    for value in candidates:
-        if SUPPORTED_PROTON_RUNNER in value:
-            return SUPPORTED_PROTON_RUNNER
-    return next((value.strip() for value in candidates if value.strip()), "")
 
 
 def _managed_root(prefix: Path | None) -> Path | None:
@@ -414,7 +400,7 @@ class DefaultStatusInspector:
                     if steamapps is not None else None)
         build = _manifest_value(manifest, "buildid") if manifest is not None else None
         installation = game.compatibility(
-            steam_build=build, ui_version=_ui_version(game_root))
+            steam_build=build, pe_version=_pe_version(game_root))
         self._cancelled(cancel)
         self._progress(progress, 1, 5, "Inspecting the game and Steam library")
 
@@ -455,7 +441,11 @@ class DefaultStatusInspector:
                 StatusSeverity.ERROR, "The required Steam-created path identity is not verified.",
                 steam_error or "Select the owning Steam library and initialized FFTIC prefix.")
 
-        runner = _runner_identity(prefix)
+        try:
+            proton = resolve_proton_selection(game.steam_id, prefix)
+        except Exception:
+            proton = ProtonSelection(None, "", "")
+        runner = proton.tool_identity
         runner_row = _row(
             "runner", "Proton runner",
             "Ready" if runner == SUPPORTED_PROTON_RUNNER else "Unsupported",
@@ -464,6 +454,7 @@ class DefaultStatusInspector:
              runner == SUPPORTED_PROTON_RUNNER
              else "The selected runner is not the tested FFTIC runner."),
             f"Selected runner: {runner or '<unresolved>'}",
+            f"Prefix runtime: {proton.prefix_runtime or '<unresolved>'}",
             f"Supported runner: {SUPPORTED_PROTON_RUNNER}")
 
         self._cancelled(cancel)
@@ -744,11 +735,15 @@ class DefaultStatusInspector:
         hashes = dict(installation.executable_hashes)
         details = (
             f"Detected Steam build: {build or '<unknown>'}",
-            f"Detected game version: {installation.ui_version or '<unknown>'}",
+            f"PE executable version: {installation.pe_version or '<unknown>'}",
+            (f"Runtime-proven in-game UI metadata: "
+             f"{installation.runtime_proof_ui_version or '<unavailable for this tuple>'}"),
+            "The in-game UI version is recorded proof metadata, not detected before launch.",
             f"Classic executable SHA-256: {hashes.get('classic', '<unavailable>')}",
             f"Enhanced executable SHA-256: {hashes.get('enhanced', '<unavailable>')}",
-            f"Supported tuple: Steam {VERIFIED_STEAM_BUILD}; UI {VERIFIED_UI_VERSION}; "
-            f"runner {SUPPORTED_PROTON_RUNNER}",
+            (f"Supported tuple: Steam {VERIFIED_STEAM_BUILD}; runtime-proven UI metadata "
+             f"{VERIFIED_UI_VERSION}; "
+             f"runner {SUPPORTED_PROTON_RUNNER}"),
             f"Current generation: {generation_id or '<none>'}",
             f"Reloaded-II: {versions['runtime']}; Nenkai: {versions['nenkai']}; "
             f"SigScan: {versions['sigscan']}; Shared Hooks: {versions['hooks']}",

@@ -6,6 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fftic_artifacts import ARTIFACTS
 from fftic_detection import VERIFIED_STEAM_BUILD
@@ -15,6 +16,7 @@ from fftic_orchestration import (
     _PREREQUISITE_RUNNER_BLOCKER, _action_availability,
 )
 from fftic_production import create_production_executor
+from fftic_readiness import SUPPORTED_PROTON_RUNNER
 from fftic_steam_requirements import COPY_READY_OPTIONS
 
 
@@ -118,6 +120,12 @@ def test_composition_derives_owned_paths_and_delays_acquisition() -> None:
     assert inputs.log_root == managed / "logs"
     assert inputs.process_runner is None
     assert inputs.setup_candidates is None
+    selected = SimpleNamespace(
+        tool_identity=SUPPORTED_PROTON_RUNNER, prefix_runtime="11.0-100")
+    with patch("fftic_production.resolve_proton_selection",
+               return_value=selected) as resolver:
+        assert inputs.runner_reader() == SUPPORTED_PROTON_RUNNER
+    resolver.assert_called_once_with(fixture.game.steam_id, fixture.prefix)
     candidates = inputs.artifact_acquirer(None)
     runtime_pins = {
         artifact_id: pin for artifact_id, pin in ARTIFACTS.items()

@@ -9,9 +9,9 @@ try:
     from .fftic_artifacts import ARTIFACTS
     from .fftic_managed_executor import ManagedLifecycleExecutor
     from .fftic_orchestration import (
-        FFTIC_GAME_ID, InspectionContext, _manifest_value, _runner_identity,
-        _ui_version,
+        FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
+    from .fftic_proton import resolve_proton_selection
     from .fftic_prerequisites import inspect_prefix_prerequisites
     from .fftic_steam_path import resolve_steam_s_path
     from .fftic_steam_requirements import analyze_steam_launch_options
@@ -24,9 +24,9 @@ except ImportError:
     from fftic_artifacts import ARTIFACTS
     from fftic_managed_executor import ManagedLifecycleExecutor
     from fftic_orchestration import (
-        FFTIC_GAME_ID, InspectionContext, _manifest_value, _runner_identity,
-        _ui_version,
+        FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
+    from fftic_proton import resolve_proton_selection
     from fftic_prerequisites import inspect_prefix_prerequisites
     from fftic_steam_path import resolve_steam_s_path
     from fftic_steam_requirements import analyze_steam_launch_options
@@ -96,7 +96,7 @@ def create_production_executor(
             build = _manifest_value(current_manifest, "buildid")
             return CurrentInstallationEvidence(
                 game.compatibility(
-                    steam_build=build, ui_version=_ui_version(game_root)),
+                    steam_build=build, pe_version=_pe_version(game_root)),
                 "reviewed-production")
 
         def acquire_reviewed(cancel):
@@ -130,7 +130,8 @@ def create_production_executor(
             installation_reader=production_installation,
             steam_options_reader=lambda: analyze_steam_launch_options(
                 steam_launch_options(game.steam_id)),
-            runner_reader=lambda: _runner_identity(prefix),
+            runner_reader=lambda: resolve_proton_selection(
+                game.steam_id, prefix).tool_identity,
             prerequisite_reader=inspect_prefix_prerequisites,
             process_request_factory=None,
             process_runner=None,

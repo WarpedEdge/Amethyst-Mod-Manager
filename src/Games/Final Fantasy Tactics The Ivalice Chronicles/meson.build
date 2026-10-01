@@ -11,6 +11,7 @@ py.install_sources(
   'fftic_pac.py',
   'final_fantasy_tactics.py',
   'fftic_packages.py',
+  'fftic_proton.py',
   'fftic_prerequisites.py',
   'fftic_production.py',
   'fftic_readiness.py',

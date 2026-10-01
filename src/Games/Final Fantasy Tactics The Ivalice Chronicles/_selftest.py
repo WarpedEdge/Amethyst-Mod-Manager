@@ -140,8 +140,10 @@ def test_identity_detection_and_cache_contract() -> None:
     (game / EXECUTABLES["enhanced"]).write_bytes(b"enhanced")
     exact = detect_installation(
         game, steam_build=VERIFIED_STEAM_BUILD,
-        ui_version="v1.5.2", hash_cache=_KnownHashCache())
+        pe_version="v1.0.0", hash_cache=_KnownHashCache())
     assert exact.status == InstallStatus.EXACT_VERIFIED
+    assert exact.pe_version == "v1.0.0"
+    assert exact.runtime_proof_ui_version == "v1.5.2"
     unknown = detect_installation(game, steam_build=VERIFIED_STEAM_BUILD)
     assert unknown.status == InstallStatus.UNVERIFIED
 

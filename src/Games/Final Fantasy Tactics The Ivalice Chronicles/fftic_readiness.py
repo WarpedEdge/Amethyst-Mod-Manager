@@ -186,7 +186,7 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
             or installation.game_root.resolve() != Path(game["path"]).resolve()
             or dict(installation.executable_hashes) != VERIFIED_HASHES
             or installation.steam_build != compatibility["steam_build"]
-            or installation.ui_version != compatibility["ui_version"]):
+            or installation.runtime_proof_ui_version != compatibility["ui_version"]):
         reject("game", "Current installation evidence does not match the receipt")
     try:
         observed_path = resolve_steam_s_path(

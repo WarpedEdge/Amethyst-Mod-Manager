@@ -814,7 +814,7 @@ def _readiness_fixture(fixture_name: str) -> tuple[dict, ReadinessEvidence]:
     validated = Receipt(validate_receipt(receipt))
     detection = InstallationDetection(
         InstallStatus.EXACT_VERIFIED, game.resolve(), VERIFIED_STEAM_BUILD,
-        VERIFIED_UI_VERSION, tuple(VERIFIED_HASHES.items()), (), ())
+        "v1.0.0", VERIFIED_UI_VERSION, tuple(VERIFIED_HASHES.items()), (), ())
     profile = ROOT / "profiles" / fixture_name
     staging = profile / "mods"
     staging.mkdir(parents=True)

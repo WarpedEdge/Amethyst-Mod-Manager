@@ -144,7 +144,7 @@ class Fixture:
         return CurrentInstallationEvidence(
             InstallationDetection(
                 InstallStatus.UNVERIFIED, self.game, VERIFIED_STEAM_BUILD,
-                VERIFIED_UI_VERSION, self.fixture_hashes, (), ("isolated fixture bytes",)),
+                "v1.0.0", None, self.fixture_hashes, (), ("isolated fixture bytes",)),
             "isolated-fixture:c3c-selftest")
 
     def prerequisites(self, _prefix: Path) -> PrefixPrerequisites:

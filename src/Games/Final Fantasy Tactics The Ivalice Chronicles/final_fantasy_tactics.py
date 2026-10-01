@@ -119,10 +119,10 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
 
     def compatibility(
         self, *, steam_build: str | None = None,
-        ui_version: str | None = None,
+        pe_version: str | None = None,
     ) -> InstallationDetection:
         return detect_installation(
-            self._game_path, steam_build=steam_build, ui_version=ui_version,
+            self._game_path, steam_build=steam_build, pe_version=pe_version,
             hash_cache=self._hash_cache)
 
     def get_managed_support_controller(self) -> FfticOrchestrator:

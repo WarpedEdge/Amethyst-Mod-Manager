@@ -34,6 +34,11 @@ def is_fftic_build() -> bool:
     return FLAVOR == "fftic" or APP_ID == FFTIC_APP_ID
 
 
+def main_window_title(version: str) -> str:
+    """Return the versioned title for the active build display identity."""
+    return f"{DISPLAY_NAME} - v{version}" if version else DISPLAY_NAME
+
+
 def is_our_flatpak() -> bool:
     """Match only the Flatpak ID this package was built to use."""
     return os.environ.get("FLATPAK_ID") == APP_ID

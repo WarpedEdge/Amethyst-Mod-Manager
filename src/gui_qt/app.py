@@ -685,10 +685,8 @@ class MainWindow(QMainWindow):
             from version import __version__ as _mm_version
         except Exception:
             _mm_version = ""
-        self.setWindowTitle(
-            self.tr("Amethyst Mod Manager - v{0}").format(_mm_version) if _mm_version
-            else self.tr("Amethyst Mod Manager")
-        )
+        from Utils.app_identity import main_window_title
+        self.setWindowTitle(main_window_title(_mm_version))
         want_w, want_h = 1280, 800
         try:
             scr = (app or QApplication.instance()).primaryScreen()

@@ -9,6 +9,8 @@ from pathlib import Path
 
 STEAM_APP_ID = "1004640"
 VERIFIED_STEAM_BUILD = "24304444"
+# Runtime-proof metadata for the exact build/hash tuple.  This is the version
+# shown in-game, not a detectable PE file-version property.
 VERIFIED_UI_VERSION = "v1.5.2"
 EXECUTABLES = {
     "classic": "FFT_classic.exe",
@@ -32,7 +34,8 @@ class InstallationDetection:
     status: InstallStatus
     game_root: Path | None
     steam_build: str | None
-    ui_version: str | None
+    pe_version: str | None
+    runtime_proof_ui_version: str | None
     executable_hashes: tuple[tuple[str, str], ...]
     missing_executables: tuple[str, ...]
     diagnostics: tuple[str, ...]
@@ -64,13 +67,13 @@ def detect_installation(
     game_root: Path | None,
     *,
     steam_build: str | None = None,
-    ui_version: str | None = None,
+    pe_version: str | None = None,
     hash_cache: ExecutableHashCache | None = None,
 ) -> InstallationDetection:
     """Classify an installation.  Hashes are cached for the calling session."""
     if game_root is None or not Path(game_root).is_dir():
         return InstallationDetection(
-            InstallStatus.NOT_FOUND, None, steam_build, ui_version, (), (),
+            InstallStatus.NOT_FOUND, None, steam_build, pe_version, None, (), (),
             ("FFTIC installation directory was not found.",),
         )
     root = Path(game_root)
@@ -79,7 +82,7 @@ def detect_installation(
         entries = {entry.name.casefold(): entry for entry in root.iterdir()}
     except OSError as exc:
         return InstallationDetection(
-            InstallStatus.NOT_FOUND, root, steam_build, ui_version, (), (),
+            InstallStatus.NOT_FOUND, root, steam_build, pe_version, None, (), (),
             (f"Cannot inspect FFTIC installation: {exc}",),
         )
     missing: list[str] = []
@@ -91,7 +94,7 @@ def detect_installation(
             resolved[mode] = candidate
     if missing:
         return InstallationDetection(
-            InstallStatus.INCOMPLETE, root, steam_build, ui_version, (),
+            InstallStatus.INCOMPLETE, root, steam_build, pe_version, None, (),
             tuple(missing),
             ("Both Classic and Enhanced executables are required.",),
         )
@@ -100,16 +103,16 @@ def detect_installation(
         hashes = tuple((mode, cache.sha256(resolved[mode])) for mode in EXECUTABLES)
     except OSError as exc:
         return InstallationDetection(
-            InstallStatus.INCOMPLETE, root, steam_build, ui_version, (), (),
+            InstallStatus.INCOMPLETE, root, steam_build, pe_version, None, (), (),
             (f"Cannot read an FFTIC executable: {exc}",),
         )
     exact_hashes = all(dict(hashes)[mode] == VERIFIED_HASHES[mode] for mode in EXECUTABLES)
     exact_build = steam_build == VERIFIED_STEAM_BUILD
-    exact_ui = ui_version == VERIFIED_UI_VERSION
-    if exact_hashes and exact_build and exact_ui:
+    if exact_hashes and exact_build:
         return InstallationDetection(
-            InstallStatus.EXACT_VERIFIED, root, steam_build, ui_version,
-            hashes, (), ("Executable hashes and Steam build match the tested tuple.",),
+            InstallStatus.EXACT_VERIFIED, root, steam_build, pe_version,
+            VERIFIED_UI_VERSION, hashes, (),
+            ("Executable hashes and Steam build match the tested tuple.",),
         )
     reasons: list[str] = []
     if not exact_hashes:
@@ -117,10 +120,7 @@ def detect_installation(
     if not exact_build:
         reasons.append(
             f"Steam build {steam_build or '<unknown>'} is not verified build {VERIFIED_STEAM_BUILD}.")
-    if not exact_ui:
-        reasons.append(
-            f"UI version {ui_version!r} is not verified version {VERIFIED_UI_VERSION!r}.")
     return InstallationDetection(
-        InstallStatus.UNVERIFIED, root, steam_build, ui_version, hashes, (),
+        InstallStatus.UNVERIFIED, root, steam_build, pe_version, None, hashes, (),
         tuple(reasons),
     )
