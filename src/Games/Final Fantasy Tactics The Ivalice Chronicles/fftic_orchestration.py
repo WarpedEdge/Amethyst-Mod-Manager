@@ -19,7 +19,10 @@ try:
     from .fftic_generation import verify_private_generation
     from .fftic_packages import PackageClassification, inspect_package
     from .fftic_pac import PacLaunchEvidence
-    from .fftic_prerequisites import PrerequisiteState, inspect_prefix_prerequisites
+    from .fftic_prerequisites import (
+        PrerequisiteState, inspect_prefix_prerequisites,
+        prerequisite_host_capability,
+    )
     from .fftic_proton import ProtonSelection, resolve_proton_selection
     from .fftic_readiness import (
         ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
@@ -38,7 +41,10 @@ except ImportError:
     from fftic_generation import verify_private_generation
     from fftic_packages import PackageClassification, inspect_package
     from fftic_pac import PacLaunchEvidence
-    from fftic_prerequisites import PrerequisiteState, inspect_prefix_prerequisites
+    from fftic_prerequisites import (
+        PrerequisiteState, inspect_prefix_prerequisites,
+        prerequisite_host_capability,
+    )
     from fftic_proton import ProtonSelection, resolve_proton_selection
     from fftic_readiness import (
         ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
@@ -213,15 +219,16 @@ ExecutorFactory = Callable[
 
 
 _PREREQUISITE_RUNNER_BLOCKER = (
-    "Automatic prerequisite installation is unavailable because Amethyst's "
-    "current typed process boundary does not authorize Flatpak host execution. "
-    "Install the reviewed prerequisites separately, then recheck."
+    "Automatic prerequisite installation is unavailable in this environment. "
+    "Review the managed-action status, restore Flatpak host access if shown, then recheck."
 )
 
 
 def _action_availability(
     rows: tuple[StatusRow, ...], *, receipt_present: bool,
     verification, unsupported: tuple[UnsupportedPackage, ...],
+    prerequisite_host_available: bool = True,
+    prerequisite_host_reason: str = "",
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """Return only lifecycle actions supported by the current exact evidence."""
     by_key = {row.key: row for row in rows}
@@ -235,19 +242,32 @@ def _action_availability(
     required = ("game", "steam_prefix", "runner", "steam_options", "recovery")
     foundation_ready = all(
         by_key.get(key) is not None
-        and by_key[key].state in {"Ready", "Configured"}
+        and by_key[key].state in {"Ready", "Configured", "Retry available"}
         for key in required)
+    prerequisites_setup_safe = all(
+        by_key.get(key) is not None
+        and by_key[key].state in {"Ready", "Not installed", "Update required"}
+        for key in ("dotnet", "vc"))
     prerequisites_ready = all(
         by_key.get(key) is not None and by_key[key].state == "Ready"
+        for key in ("dotnet", "vc"))
+    prerequisite_install_required = any(
+        by_key.get(key) is not None
+        and by_key[key].state in {"Not installed", "Update required"}
         for key in ("dotnet", "vc"))
     no_unsupported = not unsupported
     actions: list[str] = []
 
-    if not prerequisites_ready:
+    if not prerequisites_setup_safe:
         reasons[OperationKind.SETUP.value] = _PREREQUISITE_RUNNER_BLOCKER
         reasons[OperationKind.REPAIR.value] = _PREREQUISITE_RUNNER_BLOCKER
+    elif prerequisite_install_required and not prerequisite_host_available:
+        blocker = prerequisite_host_reason or _PREREQUISITE_RUNNER_BLOCKER
+        reasons[OperationKind.SETUP.value] = blocker
+        reasons[OperationKind.REPAIR.value] = blocker
 
-    if (not receipt_present and foundation_ready and prerequisites_ready
+    if (not receipt_present and foundation_ready and prerequisites_setup_safe
+            and (not prerequisite_install_required or prerequisite_host_available)
             and no_unsupported
             and all(by_key.get(key) is not None
                     and by_key[key].state == "Not installed"
@@ -317,6 +337,36 @@ def _managed_root(prefix: Path | None) -> Path | None:
     if prefix is None:
         return None
     return Path(prefix) / "drive_c" / "Amethyst" / "FFTIC"
+
+
+def _journal_recovery_status(root: Path | None) -> tuple[bool, str, str]:
+    """Return managed-recovery required, retry diagnostic, and journal error."""
+    if root is None:
+        return False, "", ""
+    try:
+        try:
+            from .fftic_managed_executor import RecoveryState, StagedLifecycleOperations
+            from .fftic_transaction_executor import FileTransactionJournal
+        except ImportError:
+            from fftic_managed_executor import RecoveryState, StagedLifecycleOperations
+            from fftic_transaction_executor import FileTransactionJournal
+        events = FileTransactionJournal(root / "journal" / "lifecycle.json").read_events()
+        state = StagedLifecycleOperations.recovery_state(events)
+        required = state in {
+            RecoveryState.MUTATION_ATTEMPTED,
+            RecoveryState.FORWARD_VERIFIED,
+            RecoveryState.ROLLBACK_STARTED,
+            RecoveryState.RECOVERY_REQUIRED,
+        }
+        retry = ""
+        if state == RecoveryState.PREREQUISITE_RETRYABLE:
+            event = next((item for item in reversed(events)
+                          if item.get("state") == "prerequisite-retryable"), {})
+            retry = str(event.get("original_error") or
+                        "The prerequisite attempt can be retried safely.")
+        return required, retry, ""
+    except Exception as exc:
+        return True, "", f"Lifecycle journal could not be verified: {exc}"
 
 
 def _profile_packages(
@@ -700,17 +750,27 @@ class DefaultStatusInspector:
              if profile_ready else "The current profile is not verifier-attested as synchronized."),
             *((verification.issues if verification else ())))
 
+        journal_requires_recovery, journal_retry, journal_error = (
+            _journal_recovery_status(root))
+
         recovery_required = bool(
             receipt_error or generation_error or
             (receipt and receipt.data.get("incomplete_operation")) or
-            (verification and verification.recovery != ReadinessAspect.READY))
+            (verification and verification.recovery != ReadinessAspect.READY) or
+            journal_requires_recovery)
+        recovery_state = ("Recovery required" if recovery_required else
+                          "Retry available" if journal_retry else "Ready")
+        recovery_severity = (StatusSeverity.ERROR if recovery_required else
+                             StatusSeverity.WARNING if journal_retry else
+                             StatusSeverity.READY)
         recovery_row = _row(
             "recovery", "Incomplete operation or recovery",
-            "Recovery required" if recovery_required else "Ready",
-            StatusSeverity.ERROR if recovery_required else StatusSeverity.READY,
+            recovery_state, recovery_severity,
             ("Preserve the managed files and review the diagnostics before retrying."
-             if recovery_required else "No incomplete managed operation is recorded."),
-            receipt_error, generation_error,
+             if recovery_required else
+             "A prerequisite-only attempt left no managed FFTIC state; Setup can be retried."
+             if journal_retry else "No incomplete managed operation is recorded."),
+            receipt_error, generation_error, journal_error, journal_retry,
             *((receipt.data.get("recovery_instructions", ()) if receipt else ())))
 
         ready = bool(verification and verification.ready and not unsupported)
@@ -729,9 +789,12 @@ class DefaultStatusInspector:
             *prerequisite_rows, bootstrap_row, prefix_config_row, profile_row,
             steam_row, recovery_row, launch_row, unsupported_row,
         )
+        host_available, host_reason = prerequisite_host_capability(probe=False)
         available_actions, action_reasons = _action_availability(
             rows, receipt_present=receipt is not None,
-            verification=verification, unsupported=unsupported)
+            verification=verification, unsupported=unsupported,
+            prerequisite_host_available=host_available,
+            prerequisite_host_reason=host_reason)
         hashes = dict(installation.executable_hashes)
         details = (
             f"Detected Steam build: {build or '<unknown>'}",
@@ -860,11 +923,11 @@ class FfticOrchestrator:
         targets = {
             OperationKind.SETUP: (
                 OperationStep(
+                    "prefix", "download, install, and verify missing reviewed prerequisites",
+                    str(context.game.get_prefix_path())),
+                OperationStep(
                     "managed runtime", "acquire and publish the reviewed generation",
                     "private FFTIC root"),
-                OperationStep(
-                    "prefix", "install missing reviewed prerequisites",
-                    str(context.game.get_prefix_path())),
                 OperationStep(
                     "bootstrap", "deploy receipt-owned ASI files and configuration",
                     str(context.game.get_game_path())),

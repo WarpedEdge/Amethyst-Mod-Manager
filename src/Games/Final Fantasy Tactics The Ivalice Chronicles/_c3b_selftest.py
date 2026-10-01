@@ -12,7 +12,8 @@ from fftic_artifacts import ArtifactDisposition, ArtifactPin
 from fftic_managed_executor import (
     LifecycleStep, ManagedLifecycleExecutor, ManagedOperationCancelled,
     ManagedOperationError, MutationCoordinator, OperationBusyError,
-    OperationState, ProcessRequest, ProcessResult, RecoveryRequiredError,
+    OperationState, PrerequisiteRetryableError, ProcessRequest, ProcessResult,
+    RecoveryRequiredError, RecoveryState,
     StagedLifecycleOperations,
 )
 from fftic_orchestration import (
@@ -309,6 +310,34 @@ def test_duplicate_suppression_and_attempt_identity():
     assert states[OperationKind.REPAIR]["value"] == 2
 
 
+def test_prerequisite_retryable_requires_verified_owned_rollback():
+    workflows, states = _workflows()
+    action, verifier = workflows[OperationKind.SETUP]
+
+    def prerequisite_failure(token, _cancel):
+        states[OperationKind.SETUP]["value"] = token["before"] + 1
+        raise PrerequisiteRetryableError("shared prerequisite retained; retry Setup")
+
+    workflows[OperationKind.SETUP] = (
+        LifecycleStep(
+            action.name, action.prepare, action.recovery_information,
+            prerequisite_failure, action.verify, action.rollback,
+            action.verify_rollback),
+        verifier,
+    )
+    journal = _Journal()
+    controller, _states = _controller(workflows, journal)
+    try:
+        controller.execute(controller.plan(OperationKind.SETUP))
+    except PrerequisiteRetryableError:
+        pass
+    else:
+        raise AssertionError("Retryable prerequisite failure reported success")
+    assert states[OperationKind.SETUP]["value"] == 0
+    assert StagedLifecycleOperations.recovery_state(
+        journal.events) == RecoveryState.PREREQUISITE_RETRYABLE
+
+
 def test_prerequisite_request_is_injectable_and_flatpak_closed():
     from fftic_readiness import SUPPORTED_PROTON_RUNNER
     payload = b"reviewed installer fixture"
@@ -317,6 +346,7 @@ def test_prerequisite_request_is_injectable_and_flatpak_closed():
     prefix = ROOT / "process-prefix"; prefix.mkdir(exist_ok=True)
     working = ROOT / "process-working"; working.mkdir(exist_ok=True)
     logs = ROOT / "process-logs"; logs.mkdir(exist_ok=True)
+    steam = ROOT / "steam"; steam.mkdir(exist_ok=True)
     pin = ArtifactPin(
         "fixture", "Fixture Runtime", "1.0", "https://example.invalid/f.exe",
         "installer.exe", len(payload), hashlib.sha256(payload).hexdigest(), "x64",
@@ -326,7 +356,11 @@ def test_prerequisite_request_is_injectable_and_flatpak_closed():
         ("/install", "/quiet", "/norestart"), (0,), (3010,), True, True, True, True)
     environment = (("PATH", "/usr/bin"),
                    ("STEAM_COMPAT_DATA_PATH", str(prefix.parent)),
-                   ("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(ROOT / "steam")))
+                   ("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(steam)),
+                   ("SteamAppId", "1004640"),
+                   ("SteamGameId", "1004640"),
+                   ("SteamOverlayGameId", "1004640"),
+                   ("STEAM_COMPAT_APP_ID", "1004640"))
     request = ProcessRequest(
         installer, executable, pin, runner, SUPPORTED_PROTON_RUNNER, prefix,
         installer.arguments, environment, logs / "installer.log", working,
@@ -418,6 +452,7 @@ TESTS = (
     test_rollback_raise_and_unverified_rollback_require_recovery,
     test_cancellation_between_steps_and_safe_retry,
     test_duplicate_suppression_and_attempt_identity,
+    test_prerequisite_retryable_requires_verified_owned_rollback,
     test_prerequisite_request_is_injectable_and_flatpak_closed,
     test_refresh_explicit_cancel_and_close_cancel_are_distinct,
 )

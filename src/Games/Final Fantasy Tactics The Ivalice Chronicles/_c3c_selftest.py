@@ -17,7 +17,7 @@ from fftic_detection import (
 from fftic_managed_executor import (
     ManagedLifecycleExecutor, ManagedOperationCancelled, OperationState,
     ProcessRequest, ProcessResult, RecoveryRequiredError, RecoveryState,
-    StagedLifecycleOperations,
+    PrerequisiteRetryableError, StagedLifecycleOperations,
 )
 from fftic_orchestration import (
     FFTIC_GAME_ID, OperationBinding, OperationKind, OperationPlan, OperationStep,
@@ -117,7 +117,11 @@ class Fixture:
         generations = self.prefix / "drive_c/Amethyst/FFTIC/generations"
         candidates = ReviewedCandidateSet(tuple(
             (artifact_id, self.cache / pin.filename)
-            for artifact_id, pin in ARTIFACTS.items()))
+            for artifact_id, pin in ARTIFACTS.items()
+            if pin.disposition.value == "extract"), tuple(
+            (artifact_id, self.cache / pin.filename)
+            for artifact_id, pin in ARTIFACTS.items()
+            if pin.disposition.value == "execute"))
         self.inputs = WorkflowInputs(
             isolation_root=self.root, game_root=self.game,
             steam_library=self.library, app_manifest=self.manifest,
@@ -424,7 +428,7 @@ def test_cancellation_failure_rollback_and_restart_evidence() -> None:
     assert read_receipt(interrupted_remove.inputs.receipts_root) is not None
 
 
-def test_prerequisite_failure_requires_repair_without_prefix_rollback_claim() -> None:
+def test_prerequisite_failure_is_retryable_without_prefix_rollback_claim() -> None:
     blocked = Fixture("missing-prerequisite", missing_dotnet=True)
     baseline = sorted(path.relative_to(blocked.prefix).as_posix()
                       for path in blocked.prefix.rglob("*"))
@@ -457,7 +461,11 @@ def test_prerequisite_failure_requires_repair_without_prefix_rollback_claim() ->
             runner_identity=SUPPORTED_PROTON_RUNNER, prefix=failing.prefix,
             arguments=plan.arguments,
             environment=(("STEAM_COMPAT_DATA_PATH", str(failing.prefix)),
-                         ("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(failing.library))),
+                         ("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(failing.library)),
+                         ("SteamAppId", "1004640"),
+                         ("SteamGameId", "1004640"),
+                         ("SteamOverlayGameId", "1004640"),
+                         ("STEAM_COMPAT_APP_ID", "1004640")),
             log_path=failing.root / "logs/prerequisite.log",
             working_directory=failing.root / "logs",
             accepted_exit_codes=plan.success_exit_codes,
@@ -479,9 +487,9 @@ def test_prerequisite_failure_requires_repair_without_prefix_rollback_claim() ->
     diagnostic = None
     try:
         failing.run(OperationKind.SETUP)
-    except RecoveryRequiredError as exc:
+    except PrerequisiteRetryableError as exc:
         diagnostic = str(exc)
-        assert "setup or repair" in diagnostic
+        assert "Retry Setup" in diagnostic
         assert str(failing.root / "logs/prerequisite.log") in diagnostic
     else:
         raise AssertionError("Fake prerequisite failure reported success")
@@ -497,8 +505,28 @@ def test_prerequisite_failure_requires_repair_without_prefix_rollback_claim() ->
     }
     assert (failing.prefix / "drive_c/fake-installer-mutation.txt").read_text() == "mutated"
     assert read_receipt(failing.inputs.receipts_root) is None
+    assert not failing.inputs.active_state_file.exists()
+    assert not (failing.game / "version.dll").exists()
+    assert not (failing.game / "Reloaded.Mod.Loader.Bootstrapper.asi").exists()
+    assert not (failing.prefix / "drive_c" / PREFIX_CONFIGURATION_PATH).exists()
+    assert (not failing.inputs.generations_root.exists()
+            or not any(failing.inputs.generations_root.iterdir()))
     assert StagedLifecycleOperations.recovery_state(
-        failing.composition.journal.read_events()) == RecoveryState.RECOVERY_REQUIRED
+        failing.composition.journal.read_events()
+    ) == RecoveryState.PREREQUISITE_RETRYABLE
+
+    # The same durable journal must permit a fresh composition and retry once
+    # the shared prerequisite has become sufficient.
+    failing._missing_dotnet = False
+    failing.recompose()
+    result = failing.run(OperationKind.SETUP)
+    assert result.state == OperationState.SUCCEEDED
+    assert len(requests) == 1
+    assert (failing.prefix / "drive_c/fake-installer-mutation.txt").read_text() == "mutated"
+    assert read_receipt(failing.inputs.receipts_root) is not None
+    assert failing.inputs.active_state_file.is_file()
+    assert (failing.game / "version.dll").is_file()
+    assert (failing.game / "Reloaded.Mod.Loader.Bootstrapper.asi").is_file()
 
 
 def test_prepare_is_read_only_and_executable_inputs_are_regular() -> None:
@@ -805,7 +833,7 @@ def main() -> None:
         test_complete_setup_repair_synchronize_update_and_remove,
         test_collisions_drift_duplicates_and_missing_inputs_fail_closed,
         test_cancellation_failure_rollback_and_restart_evidence,
-        test_prerequisite_failure_requires_repair_without_prefix_rollback_claim,
+        test_prerequisite_failure_is_retryable_without_prefix_rollback_claim,
         test_prepare_is_read_only_and_executable_inputs_are_regular,
         test_current_evidence_mutation_fails_closed,
         test_hostile_receipt_paths_never_touch_external_targets,

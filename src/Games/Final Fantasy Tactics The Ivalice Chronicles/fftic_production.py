@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 try:
     from .fftic_artifact_service import acquire_artifact
     from .fftic_artifacts import ARTIFACTS
     from .fftic_managed_executor import ManagedLifecycleExecutor
+    from .fftic_managed_executor import ProcessRequest
     from .fftic_orchestration import (
         FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
     from .fftic_proton import resolve_proton_selection
-    from .fftic_prerequisites import inspect_prefix_prerequisites
+    from .fftic_prerequisites import (
+        inspect_prefix_prerequisites, prerequisite_host_capability,
+    )
+    from .fftic_prerequisite_runner import FfticPrerequisiteRunner
     from .fftic_steam_path import resolve_steam_s_path
     from .fftic_steam_requirements import analyze_steam_launch_options
     from .fftic_workflows import (
@@ -23,11 +28,15 @@ except ImportError:
     from fftic_artifact_service import acquire_artifact
     from fftic_artifacts import ARTIFACTS
     from fftic_managed_executor import ManagedLifecycleExecutor
+    from fftic_managed_executor import ProcessRequest
     from fftic_orchestration import (
         FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
     from fftic_proton import resolve_proton_selection
-    from fftic_prerequisites import inspect_prefix_prerequisites
+    from fftic_prerequisites import (
+        inspect_prefix_prerequisites, prerequisite_host_capability,
+    )
+    from fftic_prerequisite_runner import FfticPrerequisiteRunner
     from fftic_steam_path import resolve_steam_s_path
     from fftic_steam_requirements import analyze_steam_launch_options
     from fftic_workflows import (
@@ -46,6 +55,13 @@ def _canonical_directory(value, label: str) -> Path:
     if resolved != path:
         raise ValueError(f"The selected {label} crosses a symbolic link")
     return resolved
+
+
+def _prerequisite_is_sufficient(plan, prefix: Path) -> bool:
+    current = inspect_prefix_prerequisites(prefix)
+    return any(
+        item.component == plan.component and item.state.value == "sufficient"
+        for item in (current.dotnet_desktop, current.vc_runtime))
 
 
 def create_production_executor(
@@ -100,15 +116,88 @@ def create_production_executor(
                 "reviewed-production")
 
         def acquire_reviewed(cancel):
-            acquired = []
+            prerequisites = inspect_prefix_prerequisites(prefix)
+            prerequisite_health = {
+                "dotnet-desktop-runtime": prerequisites.dotnet_desktop,
+                "vc-runtime": prerequisites.vc_runtime,
+            }
+            for health in prerequisite_health.values():
+                if health.state.value not in {
+                        "missing", "insufficient", "sufficient"}:
+                    raise ValueError(
+                        f"Cannot acquire setup artifacts while {health.component} "
+                        f"health is {health.state.value}")
+            if any(health.state.value in {"missing", "insufficient"}
+                   for health in prerequisite_health.values()):
+                available, reason = prerequisite_host_capability(probe=True)
+                if not available:
+                    raise ValueError(reason)
+            archives = []
+            installers = []
             for artifact_id, pin in ARTIFACTS.items():
-                if pin.disposition.value != "extract":
+                health = prerequisite_health.get(artifact_id)
+                if (pin.disposition.value == "execute"
+                        and (health is None or health.state.value == "sufficient")):
                     continue
                 result = artifact_acquire(
                     pin, artifact_cache, cancel=cancel,
                     quarantine_root=artifact_cache / "quarantine")
-                acquired.append((artifact_id, Path(result.path)))
-            return ReviewedCandidateSet(tuple(acquired))
+                destination = (installers if pin.disposition.value == "execute"
+                               else archives)
+                destination.append((artifact_id, Path(result.path)))
+            return ReviewedCandidateSet(tuple(archives), tuple(installers))
+
+        def process_request(plan):
+            selection = resolve_proton_selection(game.steam_id, prefix)
+            runner = selection.proton_script
+            if selection.tool_identity != plan.runner_identity:
+                raise ValueError("The selected Proton identity changed before installation")
+            if runner is None:
+                raise ValueError("The selected Proton installation could not be resolved")
+            runner = Path(runner).absolute()
+            if (runner.is_symlink() or not runner.is_file()
+                    or runner.resolve(strict=True) != runner):
+                raise ValueError("The selected Proton script is not canonical")
+            from Utils.launchers.steam import find_steam_root_for_proton_script
+            steam_root = find_steam_root_for_proton_script(runner)
+            if steam_root is None:
+                raise ValueError("The Steam client root for selected Proton is unavailable")
+            steam_root = _canonical_directory(steam_root, "Steam client root")
+            from Utils.wine.prefix import resolve_compat_data
+            compatdata = Path(resolve_compat_data(prefix)).absolute()
+            if compatdata.is_symlink() or not compatdata.is_dir():
+                raise ValueError("The selected FFTIC compatdata root is unavailable")
+            compatdata = compatdata.resolve(strict=True)
+            if not (prefix == compatdata or prefix.parent == compatdata):
+                raise ValueError("The selected prefix does not belong to its compatdata root")
+            from Utils.wine.protontricks import strip_appimage_env
+            environment = strip_appimage_env(os.environ.copy())
+            environment.update({
+                "STEAM_COMPAT_DATA_PATH": str(compatdata),
+                "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(steam_root),
+                "STEAM_COMPAT_INSTALL_PATH": str(game_root),
+                "SteamAppId": "1004640",
+                "SteamGameId": "1004640",
+                "SteamOverlayGameId": "1004640",
+                "STEAM_COMPAT_APP_ID": "1004640",
+            })
+            log_root = managed / "logs"
+            log_root.mkdir(parents=True, exist_ok=True)
+            return ProcessRequest(
+                plan=plan, executable=Path(plan.installer_path),
+                executable_pin=plan.artifact, runner=runner,
+                runner_identity=selection.tool_identity, prefix=prefix,
+                arguments=plan.arguments,
+                environment=tuple(sorted(environment.items())),
+                log_path=log_root / f"{plan.artifact.artifact_id}.log",
+                working_directory=artifact_cache,
+                accepted_exit_codes=plan.success_exit_codes,
+                restart_exit_codes=plan.restart_exit_codes,
+                timeout_seconds=600,
+                allow_flatpak_host_spawn=Path("/.flatpak-info").is_file(),
+                post_install_health_check=lambda selected_plan, selected_prefix:
+                    _prerequisite_is_sufficient(selected_plan, selected_prefix),
+            )
 
         inputs = WorkflowInputs(
             isolation_root=None,
@@ -133,8 +222,8 @@ def create_production_executor(
             runner_reader=lambda: resolve_proton_selection(
                 game.steam_id, prefix).tool_identity,
             prerequisite_reader=inspect_prefix_prerequisites,
-            process_request_factory=None,
-            process_runner=None,
+            process_request_factory=process_request,
+            process_runner=FfticPrerequisiteRunner(),
             setup_candidates=None,
             artifact_acquirer=acquire_reviewed,
         )

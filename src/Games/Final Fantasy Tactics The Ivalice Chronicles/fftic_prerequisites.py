@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -61,6 +62,33 @@ class PrefixPrerequisites:
     vc_runtime: PrerequisiteHealth
 
 
+def prerequisite_host_capability(*, probe: bool = False) -> tuple[bool, str]:
+    """Check the fixed Flatpak host boundary without probing during status."""
+    if not Path("/.flatpak-info").is_file():
+        return True, ""
+    if shutil.which("flatpak-spawn") is None:
+        return False, (
+            "FFTIC prerequisite setup cannot reach the host because flatpak-spawn "
+            "is unavailable. Restore the app's org.freedesktop.Flatpak access, "
+            "restart Amethyst, then recheck.")
+    if not probe:
+        return True, ""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["flatpak-spawn", "--host", "true"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"FFTIC prerequisite host capability check failed: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or "host portal denied the request").strip()
+        return False, (
+            "FFTIC prerequisite setup cannot use Flatpak host execution. "
+            f"Restore org.freedesktop.Flatpak access, restart Amethyst, then recheck: {detail}")
+    return True, ""
+
+
 def _version_tuple(value: str) -> tuple[int, ...] | None:
     try:
         return tuple(int(part) for part in value.split("."))
@@ -100,7 +128,10 @@ def plan_installer(*, artifact_id: str, installer_path: Path, prefix: Path,
                  else ("/install", "/quiet", "/norestart"))
     return InstallerPlan(
         pin.component, pin, Path(installer_path), Path(prefix), runner_identity,
-        arguments, (0,), (3010,), True, True, True, True,
+        # Wine truncates Windows process exit codes to eight bits on some
+        # paths, so ERROR_SUCCESS_REBOOT_REQUIRED (3010) may arrive as 194.
+        # No other non-zero installer result is accepted by this plan.
+        arguments, (0,), (3010, 194), False, True, True, True,
     )
 
 

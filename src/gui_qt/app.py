@@ -77,6 +77,15 @@ if _MODULE_STARTUP_TIMING is not None:
 # log anyway. Shadowing the builtin makes every print(...) below crash-proof.
 from Utils.app_log import safe_print as print  # noqa: A004
 
+_FFTIC_SETUP_CONFIRMATION = (
+    "Setup downloads the exact pinned Reloaded-II, Nenkai, SigScan, and "
+    "Shared Hooks components; installs missing or insufficient .NET Desktop "
+    "Runtime and VC++ Runtime into this selected FFTIC prefix; then installs "
+    "the managed FFTIC runtime. Shared Microsoft prerequisites remain in the "
+    "prefix if managed support is later removed. Steam Launch Options remain "
+    "manual and Amethyst will never edit Steam configuration automatically."
+)
+
 # Qt's "no maximum" sentinel. PySide6 doesn't export QWIDGETSIZE_MAX, so undoing
 # a setFixedSize/setFixedWidth means writing the value out.
 _QWIDGETSIZE_MAX = (1 << 24) - 1
@@ -20755,17 +20764,20 @@ class MainWindow(QMainWindow):
         lines = [f"• {step.component}: {step.action}\n  {step.target}"
                  for step in plan.steps]
         binding = plan.binding
-        body = "\n\n".join((
+        setup_notice = (_FFTIC_SETUP_CONFIRMATION
+                        if plan.kind.value == "setup" else "")
+        body = "\n\n".join(value for value in (
             f"Game: {getattr(context.game, 'name', binding.game_id)}",
             f"Profile: {binding.profile}",
             f"Game path: {binding.game_root}",
             f"Prefix: {binding.prefix}",
             f"Staging: {binding.staging_root}",
+            setup_notice,
             *lines,
             "Durable recovery information is recorded before each filesystem-changing "
             "step. Cancellation takes effect at transaction boundaries; an unverified "
             "rollback requires recovery.",
-        ))
+        ) if value)
         from gui_qt.confirm_overlay import ConfirmOverlay
         ConfirmOverlay.show_over(
             self, self.tr("Confirm FFTIC managed operation"), body,

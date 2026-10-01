@@ -52,6 +52,7 @@ class RecoveryState(str, Enum):
     ROLLBACK_STARTED = "rollback started"
     ROLLBACK_VERIFIED = "rollback verified"
     RECOVERY_REQUIRED = "recovery required"
+    PREREQUISITE_RETRYABLE = "prerequisite retryable"
     COMPLETED = "operation completed"
 
 
@@ -65,6 +66,10 @@ class ManagedOperationCancelled(ManagedOperationError):
 
 class RecoveryRequiredError(ManagedOperationError):
     """Rollback was incomplete; durable evidence must be preserved."""
+
+
+class PrerequisiteRetryableError(ManagedOperationError):
+    """A shared prerequisite stopped before managed state remained live."""
 
 
 class OperationBusyError(ManagedOperationError):
@@ -175,15 +180,32 @@ class ProcessRequest:
                        for key, value in self.environment)):
             raise ManagedOperationError("Installer environment is invalid")
         required = {"STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH"}
-        if not required.issubset(dict(self.environment)):
+        environment = dict(self.environment)
+        if not required.issubset(environment):
             raise ManagedOperationError("Installer environment lacks the Steam app context")
+        if any(environment.get(key) != "1004640" for key in (
+                "SteamAppId", "SteamGameId", "SteamOverlayGameId",
+                "STEAM_COMPAT_APP_ID")):
+            raise ManagedOperationError("Installer environment has the wrong Steam app identity")
+        compatdata = self._directory_unlinked(
+            Path(environment["STEAM_COMPAT_DATA_PATH"]), "Compatdata root")
+        if prefix != compatdata and prefix.parent != compatdata:
+            raise ManagedOperationError("Installer prefix is outside its compatdata root")
+        self._directory_unlinked(
+            Path(environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"]),
+            "Steam client root")
         if not callable(self.post_install_health_check):
             raise ManagedOperationError("Installer request lacks a post-install health check")
         if self.timeout_seconds <= 0:
             raise ManagedOperationError("Installer timeout must be positive")
         if self.allow_flatpak_host_spawn:
-            raise ManagedOperationError(
-                "Flatpak host installer execution is not authorized by the C3B boundary")
+            import shutil
+            if not Path("/.flatpak-info").is_file():
+                raise ManagedOperationError(
+                    "Flatpak host execution was requested outside a Flatpak sandbox")
+            if shutil.which("flatpak-spawn") is None:
+                raise ManagedOperationError(
+                    "Flatpak host execution is unavailable because flatpak-spawn is missing")
 
 
 @dataclass(frozen=True)
@@ -314,6 +336,10 @@ class StagedLifecycleOperations:
                 raise RecoveryRequiredError(
                     f"Rollback was incomplete for attempt {attempt_id}, plan "
                     f"{plan_fingerprint}: " + "; ".join(failures)) from original
+            if isinstance(original, PrerequisiteRetryableError):
+                record(step=len(attempted), phase="prerequisite",
+                       state="prerequisite-retryable", original_error=str(original))
+                raise original
             if isinstance(original, RecoveryRequiredError):
                 record(step=len(attempted), phase="rollback",
                        state="recovery-required", original_error=str(original))
@@ -337,6 +363,8 @@ class StagedLifecycleOperations:
         states = [event.get("state") for event in matching]
         if "operation-completed" in states:
             return RecoveryState.COMPLETED
+        if "prerequisite-retryable" in states:
+            return RecoveryState.PREREQUISITE_RETRYABLE
         if "recovery-required" in states or "rollback-failed" in states:
             return RecoveryState.RECOVERY_REQUIRED
         if "rollback-started" in states and "rollback-verified" not in states:

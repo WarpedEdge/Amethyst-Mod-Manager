@@ -1317,8 +1317,8 @@ def test_pac_prerequisites_and_lifecycle() -> None:
         artifact_id="dotnet-desktop-runtime", installer_path=ROOT / "cache" / "dotnet.exe",
         prefix=ROOT / "prefix", runner_identity="fixture-runner", health=missing)
     assert plan.arguments == ("/install", "/quiet", "/norestart")
-    assert plan.success_exit_codes == (0,) and plan.restart_exit_codes == (3010,)
-    assert plan.snapshot_required and plan.shared_runtime_retained_on_removal
+    assert plan.success_exit_codes == (0,) and plan.restart_exit_codes == (3010, 194)
+    assert not plan.snapshot_required and plan.shared_runtime_retained_on_removal
     assert plan_installer(
         artifact_id="vc-runtime", installer_path=ROOT / "cache" / "vc.exe",
         prefix=ROOT / "prefix", runner_identity="fixture-runner", health=sufficient) is None

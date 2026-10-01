@@ -14,9 +14,13 @@ from fftic_orchestration import (
     FFTIC_GAME_ID, FfticOrchestrator, FfticStatusViewModel, InspectionContext,
     InspectionResult, OperationKind, StatusRow, StatusSeverity,
     _PREREQUISITE_RUNNER_BLOCKER, _action_availability,
+    _journal_recovery_status,
 )
 from fftic_production import create_production_executor
-from fftic_readiness import SUPPORTED_PROTON_RUNNER
+from fftic_prerequisites import (
+    DOTNET_COMPONENT, classify_prerequisite, plan_installer,
+)
+from fftic_readiness import ReadinessAspect, SUPPORTED_PROTON_RUNNER
 from fftic_steam_requirements import COPY_READY_OPTIONS
 
 
@@ -118,7 +122,8 @@ def test_composition_derives_owned_paths_and_delays_acquisition() -> None:
     assert inputs.receipts_root == managed / "receipts"
     assert inputs.journal_file == managed / "journal/lifecycle.json"
     assert inputs.log_root == managed / "logs"
-    assert inputs.process_runner is None
+    assert inputs.process_runner is not None
+    assert inputs.process_request_factory is not None
     assert inputs.setup_candidates is None
     selected = SimpleNamespace(
         tool_identity=SUPPORTED_PROTON_RUNNER, prefix_runtime="11.0-100")
@@ -126,7 +131,11 @@ def test_composition_derives_owned_paths_and_delays_acquisition() -> None:
                return_value=selected) as resolver:
         assert inputs.runner_reader() == SUPPORTED_PROTON_RUNNER
     resolver.assert_called_once_with(fixture.game.steam_id, fixture.prefix)
-    candidates = inputs.artifact_acquirer(None)
+    health = SimpleNamespace(
+        dotnet_desktop=SimpleNamespace(state=SimpleNamespace(value="sufficient")),
+        vc_runtime=SimpleNamespace(state=SimpleNamespace(value="sufficient")))
+    with patch("fftic_production.inspect_prefix_prerequisites", return_value=health):
+        candidates = inputs.artifact_acquirer(None)
     runtime_pins = {
         artifact_id: pin for artifact_id, pin in ARTIFACTS.items()
         if pin.disposition.value == "extract"
@@ -156,6 +165,133 @@ def test_invalid_composition_keeps_read_only_status() -> None:
     assert model.rows[0].key == "recovery"
 
 
+def test_prerequisite_acquisition_matrix_and_host_capability() -> None:
+    fixture = Fixture()
+    calls = []
+
+    def acquire(pin, cache, **_kwargs):
+        calls.append(pin.artifact_id)
+        path = Path(cache) / pin.filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+        return SimpleNamespace(path=path)
+
+    executor, reason = create_production_executor(
+        fixture.context, lambda _plan: True, artifact_acquire=acquire,
+        cache_root=fixture.cache)
+    assert executor is not None, reason
+    acquire_candidates = executor._operations.inputs.artifact_acquirer
+    extract_ids = {artifact_id for artifact_id, pin in ARTIFACTS.items()
+                   if pin.disposition.value == "extract"}
+
+    def health(dotnet, vc):
+        def item(component, value):
+            return SimpleNamespace(
+                component=component, state=SimpleNamespace(value=value))
+        return SimpleNamespace(
+            dotnet_desktop=item(".NET Desktop Runtime", dotnet),
+            vc_runtime=item("VC++ Runtime", vc))
+
+    cases = (
+        (("missing", "missing"), {"dotnet-desktop-runtime", "vc-runtime"}),
+        (("missing", "sufficient"), {"dotnet-desktop-runtime"}),
+        (("sufficient", "missing"), {"vc-runtime"}),
+        (("sufficient", "sufficient"), set()),
+        (("insufficient", "sufficient"), {"dotnet-desktop-runtime"}),
+    )
+    for states, installers in cases:
+        calls.clear()
+        with patch("fftic_production.inspect_prefix_prerequisites",
+                   return_value=health(*states)):
+            candidates = acquire_candidates(None)
+        assert set(candidates.paths()) == extract_ids | installers
+        assert set(calls) == extract_ids | installers
+
+    for unsafe in ("unknown", "unhealthy"):
+        with patch("fftic_production.inspect_prefix_prerequisites",
+                   return_value=health(unsafe, "sufficient")):
+            try:
+                acquire_candidates(None)
+            except ValueError as exc:
+                assert unsafe in str(exc)
+            else:
+                raise AssertionError(f"{unsafe} prerequisite health was acquired")
+
+    calls.clear()
+    with patch("fftic_production.inspect_prefix_prerequisites",
+               return_value=health("missing", "sufficient")), \
+            patch("fftic_production.prerequisite_host_capability",
+                  return_value=(False, "host portal denied")) as capability:
+        try:
+            acquire_candidates(None)
+        except ValueError as exc:
+            assert "host portal denied" in str(exc)
+        else:
+            raise AssertionError("Installer-dependent acquisition ignored host capability")
+    capability.assert_called_once_with(probe=True)
+    assert calls == []
+
+    with patch("fftic_prerequisites.prerequisite_host_capability",
+               side_effect=AssertionError("status-only capability check leaked into factory")):
+        still_available, unavailable_reason = create_production_executor(
+            fixture.context, lambda _plan: True, cache_root=fixture.cache)
+    assert still_available is not None and not unavailable_reason
+
+
+def test_production_request_binds_exact_proton_prefix_and_steam_context() -> None:
+    fixture = Fixture()
+    fixture.cache.mkdir(parents=True)
+    installer = fixture.cache / ARTIFACTS["dotnet-desktop-runtime"].filename
+    installer.write_bytes(b"synthetic request candidate")
+    runner = fixture.root / "steam/steamapps/common/Proton Experimental/proton"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    (runner.parent / "version").write_text(
+        f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    steam_client = fixture.root / "steam"
+    selection = SimpleNamespace(
+        proton_script=runner, tool_identity=SUPPORTED_PROTON_RUNNER,
+        prefix_runtime="11.0-100")
+    with patch("fftic_production.resolve_proton_selection",
+               return_value=selection), \
+            patch("Utils.launchers.steam.find_steam_root_for_proton_script",
+                  return_value=steam_client):
+        executor, reason = create_production_executor(
+            fixture.context, lambda _plan: True, cache_root=fixture.cache)
+        assert executor is not None, reason
+        health = classify_prerequisite(
+            component=DOTNET_COMPONENT, required_version="9.0.20",
+            observed_version=None, healthy=True, present=False)
+        plan = plan_installer(
+            artifact_id="dotnet-desktop-runtime", installer_path=installer,
+            prefix=fixture.prefix, runner_identity=SUPPORTED_PROTON_RUNNER,
+            health=health)
+        request = executor._operations.inputs.process_request_factory(plan)
+    environment = dict(request.environment)
+    assert request.executable == installer
+    assert request.executable_pin == ARTIFACTS["dotnet-desktop-runtime"]
+    assert request.runner == runner and request.prefix == fixture.prefix
+    assert request.arguments == ("/install", "/quiet", "/norestart")
+    assert request.accepted_exit_codes == (0,)
+    assert request.restart_exit_codes == (3010, 194)
+    assert environment["STEAM_COMPAT_DATA_PATH"] == str(fixture.prefix.parent)
+    assert environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"] == str(steam_client)
+    assert all(environment[key] == "1004640" for key in (
+        "SteamAppId", "SteamGameId", "SteamOverlayGameId",
+        "STEAM_COMPAT_APP_ID"))
+    assert request.log_path.parent == fixture.prefix / "drive_c/Amethyst/FFTIC/logs"
+
+    wrong = SimpleNamespace(
+        proton_script=runner, tool_identity="wrong-proton", prefix_runtime="11.0-100")
+    with patch("fftic_production.resolve_proton_selection", return_value=wrong):
+        try:
+            executor._operations.inputs.process_request_factory(plan)
+        except ValueError as exc:
+            assert "identity changed" in str(exc)
+        else:
+            raise AssertionError("Wrong selected Proton identity was accepted")
+
+
 def test_action_gating_and_prerequisite_blocker() -> None:
     setup_rows = tuple(_row(key, "Configured" if key == "steam_options" else "Ready")
                        for key in ("game", "steam_prefix", "runner", "dotnet", "vc",
@@ -176,8 +312,88 @@ def test_action_gating_and_prerequisite_blocker() -> None:
         for row in setup_rows)
     actions, reasons = _action_availability(
         missing, receipt_present=False, verification=None, unsupported=())
+    assert OperationKind.SETUP.value in actions
+
+    actions, reasons = _action_availability(
+        missing, receipt_present=False, verification=None, unsupported=(),
+        prerequisite_host_available=False,
+        prerequisite_host_reason="flatpak-spawn unavailable")
+    assert OperationKind.SETUP.value not in actions
+    assert dict(reasons)["setup"] == "flatpak-spawn unavailable"
+
+    actions, _reasons = _action_availability(
+        setup_rows, receipt_present=False, verification=None, unsupported=(),
+        prerequisite_host_available=False,
+        prerequisite_host_reason="flatpak-spawn unavailable")
+    assert OperationKind.SETUP.value in actions
+
+    unknown = tuple(
+        _row(row.key, "Unverified") if row.key == "dotnet" else row
+        for row in setup_rows)
+    actions, reasons = _action_availability(
+        unknown, receipt_present=False, verification=None, unsupported=())
     assert OperationKind.SETUP.value not in actions
     assert dict(reasons)["setup"] == _PREREQUISITE_RUNNER_BLOCKER
+
+
+def test_host_unavailable_does_not_block_noninstaller_actions() -> None:
+    foundation = tuple(
+        _row(key, "Configured" if key == "steam_options" else "Ready")
+        for key in ("game", "steam_prefix", "runner", "dotnet", "vc",
+                    "steam_options", "recovery", "profile"))
+    managed_keys = (
+        "runtime", "nenkai", "sigscan", "hooks", "bootstrap", "prefix_config")
+    repair_rows = foundation + tuple(
+        _row(key, "Not installed" if key == "bootstrap" else "Ready")
+        for key in managed_keys)
+    actions, _reasons = _action_availability(
+        repair_rows, receipt_present=True, verification=None, unsupported=(),
+        prerequisite_host_available=False,
+        prerequisite_host_reason="flatpak-spawn unavailable")
+    assert OperationKind.REPAIR.value in actions
+
+    protected = dict(
+        game=ReadinessAspect.READY, artifacts=ReadinessAspect.READY,
+        generation=ReadinessAspect.READY, prefix=ReadinessAspect.READY,
+        prerequisites=ReadinessAspect.READY, bootstrap=ReadinessAspect.READY,
+        steam_options=ReadinessAspect.READY, recovery=ReadinessAspect.READY,
+        attested=True)
+    synchronized = SimpleNamespace(
+        **protected, profile=ReadinessAspect.READY, ready=True)
+    actions, _reasons = _action_availability(
+        foundation + tuple(_row(key) for key in managed_keys),
+        receipt_present=True, verification=synchronized, unsupported=(),
+        prerequisite_host_available=False,
+        prerequisite_host_reason="flatpak-spawn unavailable")
+    assert OperationKind.REMOVE.value in actions
+
+    stale_profile = SimpleNamespace(
+        **protected, profile=ReadinessAspect.INVALID, ready=False)
+    actions, _reasons = _action_availability(
+        foundation + tuple(_row(key) for key in managed_keys),
+        receipt_present=True, verification=stale_profile, unsupported=(),
+        prerequisite_host_available=False,
+        prerequisite_host_reason="flatpak-spawn unavailable")
+    assert OperationKind.SYNCHRONIZE.value in actions
+
+
+def test_retryable_and_genuine_recovery_journal_status() -> None:
+    fixture = Fixture()
+    managed = fixture.prefix / "drive_c/Amethyst/FFTIC"
+    from fftic_transaction_executor import FileTransactionJournal
+    journal = FileTransactionJournal(managed / "journal/lifecycle.json")
+    journal.record(
+        plan_fingerprint="retry", attempt_id="retry", operation="setup",
+        step=0, phase="prerequisite", state="prerequisite-retryable",
+        original_error="Retry Setup and review /tmp/prerequisite.log")
+    required, retry, error = _journal_recovery_status(managed)
+    assert not required and "Retry Setup" in retry and not error
+
+    journal.record(
+        plan_fingerprint="managed", attempt_id="managed", operation="setup",
+        step=0, phase="bootstrap", state="mutation-attempted")
+    required, retry, error = _journal_recovery_status(managed)
+    assert required and not retry and not error
 
 
 def test_repair_gating_covers_every_managed_component() -> None:
@@ -222,13 +438,27 @@ def test_panel_enables_only_current_actions() -> None:
     app.processEvents()
 
 
+def test_setup_confirmation_keeps_steam_manual_and_shared_runtimes() -> None:
+    from gui_qt.app import _FFTIC_SETUP_CONFIRMATION
+    assert "downloads the exact pinned" in _FFTIC_SETUP_CONFIRMATION
+    assert ".NET Desktop Runtime and VC++ Runtime" in _FFTIC_SETUP_CONFIRMATION
+    assert "remain" in _FFTIC_SETUP_CONFIRMATION
+    assert "Steam Launch Options remain manual" in _FFTIC_SETUP_CONFIRMATION
+    assert "never edit Steam configuration" in _FFTIC_SETUP_CONFIRMATION
+
+
 def main() -> None:
     tests = (
         test_composition_derives_owned_paths_and_delays_acquisition,
         test_invalid_composition_keeps_read_only_status,
+        test_prerequisite_acquisition_matrix_and_host_capability,
+        test_production_request_binds_exact_proton_prefix_and_steam_context,
         test_action_gating_and_prerequisite_blocker,
+        test_host_unavailable_does_not_block_noninstaller_actions,
+        test_retryable_and_genuine_recovery_journal_status,
         test_repair_gating_covers_every_managed_component,
         test_panel_enables_only_current_actions,
+        test_setup_confirmation_keeps_steam_manual_and_shared_runtimes,
     )
     for test in tests:
         test()

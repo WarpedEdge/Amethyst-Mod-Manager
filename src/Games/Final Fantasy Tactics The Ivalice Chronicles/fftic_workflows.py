@@ -33,7 +33,8 @@ try:
     )
     from .fftic_managed_executor import (
         LifecycleStep, ManagedOperationCancelled, ManagedOperationError, OperationResult,
-        PrerequisiteProcessRunner, ProcessRequest, RecoveryRequiredError,
+        PrerequisiteProcessRunner, PrerequisiteRetryableError, ProcessRequest,
+        RecoveryRequiredError,
         RecoveryState, StagedLifecycleOperations,
     )
     from .fftic_orchestration import OperationKind, OperationPlan
@@ -72,7 +73,8 @@ except ImportError:
     )
     from fftic_managed_executor import (
         LifecycleStep, ManagedOperationCancelled, ManagedOperationError, OperationResult,
-        PrerequisiteProcessRunner, ProcessRequest, RecoveryRequiredError,
+        PrerequisiteProcessRunner, PrerequisiteRetryableError, ProcessRequest,
+        RecoveryRequiredError,
         RecoveryState, StagedLifecycleOperations,
     )
     from fftic_orchestration import OperationKind, OperationPlan
@@ -105,14 +107,24 @@ class WorkflowError(ManagedOperationError):
 
 @dataclass(frozen=True)
 class ReviewedCandidateSet:
-    """Explicit archive set; no URL resolution or acquisition is performed."""
+    """Explicit, disposition-separated candidates; performs no acquisition."""
 
     archives: tuple[tuple[str, Path], ...]
+    installers: tuple[tuple[str, Path], ...] = ()
 
     def paths(self) -> dict[str, Path]:
-        result = dict(self.archives)
-        if len(result) != len(self.archives):
+        candidates = (*self.archives, *self.installers)
+        result = dict(candidates)
+        if len(result) != len(candidates):
             raise WorkflowError("Reviewed candidate set contains duplicate component IDs")
+        if any(ARTIFACTS.get(artifact_id) is None
+               or ARTIFACTS[artifact_id].disposition.value != "extract"
+               for artifact_id, _path in self.archives):
+            raise WorkflowError("Installer candidate was supplied as a generation archive")
+        if any(ARTIFACTS.get(artifact_id) is None
+               or ARTIFACTS[artifact_id].disposition.value != "execute"
+               for artifact_id, _path in self.installers):
+            raise WorkflowError("Generation archive was supplied as an installer candidate")
         return result
 
 
@@ -157,6 +169,7 @@ class WorkflowInputs:
 @dataclass
 class _Baseline:
     kind: OperationKind
+    plan: OperationPlan | None
     receipt: bytes | None
     active_state: bytes | None
     game_files: dict[str, bytes | None]
@@ -417,6 +430,7 @@ class FfticLifecycleComposition:
         config_path = self.inputs.prefix / "drive_c" / PREFIX_CONFIGURATION_PATH
         baseline = _Baseline(
             kind=kind,
+            plan=plan,
             receipt=self._read_optional(receipt_path),
             active_state=self._read_optional(self.inputs.active_state_file),
             game_files={name: self._read_optional(self.inputs.game_root / name) for name in (
@@ -543,15 +557,20 @@ class FfticLifecycleComposition:
         return generation, paths
 
     def _run_prerequisites(self, token: _Baseline, paths: dict[str, Path], cancel) -> None:
-        current = self.inputs.prerequisite_reader(self.inputs.prefix)
         attempted_logs: list[Path] = []
-        health_by_id = {
-            "dotnet-desktop-runtime": current.dotnet_desktop,
-            "vc-runtime": current.vc_runtime,
-        }
-        for artifact_id, health in health_by_id.items():
+        for artifact_id, attribute in (
+                ("dotnet-desktop-runtime", "dotnet_desktop"),
+                ("vc-runtime", "vc_runtime")):
+            if token.plan is None:
+                raise WorkflowError("Prerequisite execution lost its operation plan")
+            self._revalidate(token.plan)
+            current = self.inputs.prerequisite_reader(self.inputs.prefix)
+            health = getattr(current, attribute)
             if health.state == PrerequisiteState.SUFFICIENT:
                 continue
+            if cancel is not None and cancel.is_set():
+                raise ManagedOperationCancelled(
+                    "FFTIC setup cancelled before prerequisite execution")
             if self.inputs.process_runner is None or self.inputs.process_request_factory is None:
                 raise WorkflowError(
                     f"{health.component} is missing and no authorized prerequisite runner was injected")
@@ -577,16 +596,17 @@ class FfticLifecycleComposition:
                 if cancel is not None and cancel.is_set():
                     raise RuntimeError("operation was interrupted after prerequisite installation")
             except BaseException as exc:
-                raise RecoveryRequiredError(
-                    f"Prerequisite setup may have changed the shared Proton prefix; "
-                    f"run FFTIC setup or repair and review {request.log_path}: {exc}") from exc
+                raise PrerequisiteRetryableError(
+                    "Prerequisite execution did not complete. Shared-prefix changes, "
+                    f"if any, were retained. Retry Setup and review {request.log_path}: "
+                    f"{exc}") from exc
         after = self.inputs.prerequisite_reader(self.inputs.prefix)
         if any(item.state != PrerequisiteState.SUFFICIENT
                for item in (after.dotnet_desktop, after.vc_runtime)):
             logs = ", ".join(str(path) for path in attempted_logs)
-            raise RecoveryRequiredError(
-                "Prerequisite setup did not establish sufficient evidence; run FFTIC "
-                f"setup or repair and review: {logs}")
+            raise PrerequisiteRetryableError(
+                "Prerequisite setup did not establish sufficient evidence. Shared-prefix "
+                f"changes were retained. Retry Setup and review: {logs}")
 
     def _transaction(self) -> FfticTransactionExecutor:
         roots = (

@@ -13,6 +13,7 @@ py.install_sources(
   'fftic_packages.py',
   'fftic_proton.py',
   'fftic_prerequisites.py',
+  'fftic_prerequisite_runner.py',
   'fftic_production.py',
   'fftic_readiness.py',
   'fftic_receipts.py',
