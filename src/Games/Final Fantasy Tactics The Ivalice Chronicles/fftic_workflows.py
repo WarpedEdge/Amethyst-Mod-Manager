@@ -126,7 +126,7 @@ class CurrentInstallationEvidence:
 
 @dataclass(frozen=True)
 class WorkflowInputs:
-    isolation_root: Path
+    isolation_root: Path | None
     game_root: Path
     steam_library: Path
     app_manifest: Path
@@ -149,6 +149,7 @@ class WorkflowInputs:
     process_request_factory: Callable[[object], ProcessRequest] | None = None
     process_runner: PrerequisiteProcessRunner | None = None
     setup_candidates: ReviewedCandidateSet | None = None
+    artifact_acquirer: Callable[[object], ReviewedCandidateSet] | None = None
     pac_launch_evidence: tuple[PacLaunchEvidence, ...] = ()
     failure_injector: Callable[[str, OperationKind], None] | None = None
 
@@ -196,10 +197,13 @@ class FfticLifecycleComposition:
             validator=self._revalidate, workflows=workflows, journal=self.journal)
 
     def _validate_roots(self) -> None:
-        root = Path(self.inputs.isolation_root)
-        if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root.absolute():
-            raise ValueError("The isolated lifecycle root must be canonical and unlinked")
-        root = root.resolve()
+        root = None
+        if self.inputs.isolation_root is not None:
+            root = Path(self.inputs.isolation_root)
+            if (root.is_symlink() or not root.is_dir()
+                    or root.resolve(strict=True) != root.absolute()):
+                raise ValueError("The isolated lifecycle root must be canonical and unlinked")
+            root = root.resolve()
         path_fields = (
             "game_root", "steam_library", "app_manifest", "prefix", "profile_dir",
             "staging_root", "artifact_cache", "extraction_root", "generations_root",
@@ -208,10 +212,10 @@ class FfticLifecycleComposition:
         )
         for field in path_fields:
             path = Path(getattr(self.inputs, field)).absolute()
-            if not path.is_relative_to(root):
+            if root is not None and not path.is_relative_to(root):
                 raise ValueError(f"{field} escapes the isolated lifecycle root: {path}")
             current = path
-            while current != root and current != current.parent:
+            while current != current.parent and (root is None or current != root):
                 if os.path.lexists(current) and current.is_symlink():
                     # The verified Steam S: mapping is below prefix/dosdevices and is
                     # never itself one of the supplied roots.
@@ -480,15 +484,16 @@ class FfticLifecycleComposition:
             raise WorkflowError(f"Unsupported lifecycle operation {token.kind.value}")
 
     def _candidate_paths(self, candidates: ReviewedCandidateSet | None,
-                         *, require_all: bool = True) -> dict[str, Path]:
+                         *, required_ids: set[str] | None = None) -> dict[str, Path]:
+        expected = set(ARTIFACTS) if required_ids is None else set(required_ids)
         if candidates is None:
             paths = {artifact_id: self.inputs.artifact_cache / pin.filename
-                     for artifact_id, pin in ARTIFACTS.items()}
+                     for artifact_id, pin in ARTIFACTS.items()
+                     if artifact_id in expected}
         else:
             paths = candidates.paths()
-        expected = set(ARTIFACTS)
-        if require_all and set(paths) != expected:
-            raise WorkflowError("All and only the reviewed component candidates are required")
+        if not expected.issubset(paths) or not set(paths).issubset(ARTIFACTS):
+            raise WorkflowError("The required reviewed component candidates are missing")
         for artifact_id, path in paths.items():
             path = Path(path)
             pin = ARTIFACTS.get(artifact_id)
@@ -517,7 +522,8 @@ class FfticLifecycleComposition:
 
     def _build(self, token: _Baseline, cancel,
                candidates: ReviewedCandidateSet | None) -> tuple[GenerationResult, dict[str, Path]]:
-        paths = self._candidate_paths(candidates)
+        required = {*MANAGED_ARTIFACTS.values(), "reloaded-ii"}
+        paths = self._candidate_paths(candidates, required_ids=required)
         trees = self._verified_trees(paths, cancel)
         steam = resolve_steam_s_path(
             steam_library=self.inputs.steam_library, app_manifest=self.inputs.app_manifest,
@@ -801,10 +807,14 @@ class FfticLifecycleComposition:
     def _setup(self, token: _Baseline, cancel) -> None:
         if read_receipt(self.inputs.receipts_root) is not None:
             raise WorkflowError("Setup refuses an existing managed receipt; use repair or synchronize")
-        paths = self._candidate_paths(self.inputs.setup_candidates)
+        candidates = self.inputs.setup_candidates
+        if candidates is None and self.inputs.artifact_acquirer is not None:
+            candidates = self.inputs.artifact_acquirer(cancel)
+        paths = self._candidate_paths(
+            candidates, required_ids={*MANAGED_ARTIFACTS.values(), "reloaded-ii"})
         self._run_prerequisites(token, paths, cancel)
         self._cancelled(cancel)
-        generation, _paths = self._build(token, cancel, self.inputs.setup_candidates)
+        generation, _paths = self._build(token, cancel, candidates)
         self._inject("generation", token.kind)
         self._cancelled(cancel)
         self._install_bootstrap(token, generation)

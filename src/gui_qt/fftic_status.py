@@ -144,9 +144,10 @@ class FfticStatusPanel(QFrame):
         self._operation_active = active
         self._recheck.setEnabled(True)
         self._recheck.setText(self.tr("Cancel operation") if active else self.tr("Recheck"))
-        for button in self._action_buttons.values():
+        available = set(self._model.available_actions) if self._model else set()
+        for key, button in self._action_buttons.items():
             button.setEnabled(False if active else bool(
-                self._model and self._model.mutation_available))
+                self._model and self._model.mutation_available and key in available))
         if active and phase:
             self._detail_text.setPlainText(phase)
 
@@ -200,15 +201,15 @@ class FfticStatusPanel(QFrame):
             self._rows.append(widget)
 
         unavailable = model.mutation_unavailable_reason
+        action_reasons = dict(model.action_unavailable_reasons)
+        available = set(model.available_actions)
         recovery = next((row for row in model.rows if row.key == "recovery"), None)
         blocked = bool(recovery and recovery.state == "Recovery required")
         for key, button in self._action_buttons.items():
-            enabled = model.mutation_available and not blocked
-            if key in {"setup", "synchronize"} and model.unsupported_packages:
-                enabled = False
+            enabled = model.mutation_available and not blocked and key in available
             button.setEnabled(enabled)
             reason = (self.tr("Resolve recovery-required state before another mutation.")
-                      if blocked else unavailable)
+                      if blocked else unavailable or action_reasons.get(key, ""))
             button.setToolTip("" if enabled else reason)
             button.setAccessibleDescription(
                 "Available" if enabled else reason)

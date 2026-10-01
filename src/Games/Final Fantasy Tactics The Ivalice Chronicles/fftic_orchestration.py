@@ -147,6 +147,8 @@ class FfticStatusViewModel:
     launch_instruction: str
     error: str = ""
     observation_sha256: str = ""
+    available_actions: tuple[str, ...] = ()
+    action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
 
     def row(self, key: str) -> StatusRow:
         return next(item for item in self.rows if item.key == key)
@@ -170,6 +172,8 @@ class InspectionResult:
     ready: bool
     verifier_attested: bool
     observation_sha256: str = ""
+    available_actions: tuple[str, ...] = ()
+    action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
 
 
 ProgressCallback = Callable[[ProgressUpdate], None]
@@ -198,6 +202,84 @@ class AuthorizedExecutor(Protocol):
 
     def execute(self, plan: OperationPlan, cancel: threading.Event | None,
                 progress: ProgressCallback | None): ...
+
+
+ExecutorFactory = Callable[
+    [InspectionContext, Callable[[OperationPlan], bool]],
+    tuple[AuthorizedExecutor | None, str],
+]
+
+
+_PREREQUISITE_RUNNER_BLOCKER = (
+    "Automatic prerequisite installation is unavailable because Amethyst's "
+    "current typed process boundary does not authorize Flatpak host execution. "
+    "Install the reviewed prerequisites separately, then recheck."
+)
+
+
+def _action_availability(
+    rows: tuple[StatusRow, ...], *, receipt_present: bool,
+    verification, unsupported: tuple[UnsupportedPackage, ...],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Return only lifecycle actions supported by the current exact evidence."""
+    by_key = {row.key: row for row in rows}
+    reasons = {
+        kind.value: "Current FFTIC evidence does not authorize this action. Recheck the status details."
+        for kind in OperationKind
+    }
+    reasons[OperationKind.UPDATE.value] = (
+        "Managed-runtime update is unavailable until a distinct reviewed artifact "
+        "identity is defined. Use Synchronize for profile-only changes.")
+    required = ("game", "steam_prefix", "runner", "steam_options", "recovery")
+    foundation_ready = all(
+        by_key.get(key) is not None
+        and by_key[key].state in {"Ready", "Configured"}
+        for key in required)
+    prerequisites_ready = all(
+        by_key.get(key) is not None and by_key[key].state == "Ready"
+        for key in ("dotnet", "vc"))
+    no_unsupported = not unsupported
+    actions: list[str] = []
+
+    if not prerequisites_ready:
+        reasons[OperationKind.SETUP.value] = _PREREQUISITE_RUNNER_BLOCKER
+        reasons[OperationKind.REPAIR.value] = _PREREQUISITE_RUNNER_BLOCKER
+
+    if (not receipt_present and foundation_ready and prerequisites_ready
+            and no_unsupported
+            and all(by_key.get(key) is not None
+                    and by_key[key].state == "Not installed"
+                    for key in ("runtime", "nenkai", "sigscan", "hooks"))
+            and by_key.get("bootstrap") is not None
+            and by_key["bootstrap"].state == "Not installed"
+            and by_key.get("prefix_config") is not None
+            and by_key["prefix_config"].state == "Not installed"):
+        actions.append(OperationKind.SETUP.value)
+
+    managed = tuple(by_key.get(key) for key in (
+        "runtime", "nenkai", "sigscan", "hooks", "bootstrap", "prefix_config"))
+    if (receipt_present and foundation_ready and prerequisites_ready
+            and no_unsupported and all(row is not None for row in managed)
+            and by_key.get("profile") is not None
+            and by_key["profile"].state == "Ready"
+            and any(row.state == "Not installed" for row in managed)
+            and not any(row.state in {"Conflict", "Different"} for row in managed)):
+        actions.append(OperationKind.REPAIR.value)
+
+    if verification is not None and verification.attested:
+        protected = (
+            verification.game, verification.artifacts, verification.generation,
+            verification.prefix, verification.prerequisites, verification.bootstrap,
+            verification.steam_options, verification.recovery,
+        )
+        if (receipt_present and no_unsupported
+                and all(value == ReadinessAspect.READY for value in protected)
+                and verification.profile != ReadinessAspect.READY):
+            actions.append(OperationKind.SYNCHRONIZE.value)
+        if receipt_present and verification.ready and no_unsupported:
+            actions.append(OperationKind.REMOVE.value)
+
+    return tuple(actions), tuple((kind.value, reasons[kind.value]) for kind in OperationKind)
 
 
 def _row(key: str, label: str, state: str, severity: StatusSeverity,
@@ -656,6 +738,9 @@ class DefaultStatusInspector:
             *prerequisite_rows, bootstrap_row, prefix_config_row, profile_row,
             steam_row, recovery_row, launch_row, unsupported_row,
         )
+        available_actions, action_reasons = _action_availability(
+            rows, receipt_present=receipt is not None,
+            verification=verification, unsupported=unsupported)
         hashes = dict(installation.executable_hashes)
         details = (
             f"Detected Steam build: {build or '<unknown>'}",
@@ -678,7 +763,9 @@ class DefaultStatusInspector:
         return InspectionResult(
             rows, details, unsupported, steam_options.required_copy_text,
             steam_options.preserved_unrelated, ready,
-            bool(verification and verification.attested))
+            bool(verification and verification.attested),
+            available_actions=available_actions,
+            action_unavailable_reasons=action_reasons)
 
     @staticmethod
     def _observation_identity(context: InspectionContext) -> str:
@@ -691,9 +778,12 @@ class FfticOrchestrator:
     """UI-facing controller. Inspection is always separate from execution."""
 
     def __init__(self, inspector: StatusInspector | None = None,
-                 executor: AuthorizedExecutor | None = None):
+                 executor: AuthorizedExecutor | None = None,
+                 executor_factory: ExecutorFactory | None = None):
         self._inspector = inspector or DefaultStatusInspector()
         self._executor = executor
+        self._executor_factory = executor_factory
+        self._executor_unavailable_reason = EXECUTION_UNAVAILABLE
         self._last_context: InspectionContext | None = None
         self._last_status: FfticStatusViewModel | None = None
         self._state_lock = threading.Lock()
@@ -725,14 +815,24 @@ class FfticOrchestrator:
             result = self._inspector.inspect(context, cancel, progress)
             observation = (result.observation_sha256
                            or DefaultStatusInspector._observation_identity(context))
+            if self._executor_factory is not None:
+                executor, reason = self._executor_factory(context, self.revalidate_plan)
+                self._executor = executor
+                self._executor_unavailable_reason = reason or EXECUTION_UNAVAILABLE
+            mutation_available = self.mutation_available
+            available_actions = result.available_actions
+            if not available_actions and not result.action_unavailable_reasons:
+                available_actions = tuple(kind.value for kind in OperationKind)
             model = FfticStatusViewModel(
                 FFTIC_GAME_ID, "FFTIC Mod Support", result.rows, result.details,
                 result.unsupported_packages, result.steam_copy_text,
                 result.steam_preserved_options, result.ready,
-                result.verifier_attested, self.mutation_available,
-                "" if self.mutation_available else EXECUTION_UNAVAILABLE,
+                result.verifier_attested, mutation_available,
+                "" if mutation_available else self._executor_unavailable_reason,
                 "Start FFTIC normally from Steam. Amethyst's direct Proton route is not supported.",
-                observation_sha256=observation)
+                observation_sha256=observation,
+                available_actions=available_actions,
+                action_unavailable_reasons=result.action_unavailable_reasons)
         except InspectionCancelled:
             raise
         except Exception as exc:
@@ -744,7 +844,7 @@ class FfticOrchestrator:
                       "FFTIC status could not be inspected safely.", error),),
                 (error,), (), COPY_READY_OPTIONS, (), False, False,
                 self.mutation_available,
-                "" if self.mutation_available else EXECUTION_UNAVAILABLE,
+                "" if self.mutation_available else self._executor_unavailable_reason,
                 "Start FFTIC normally from Steam only after readiness is verified.",
                 error=error)
         with self._state_lock:
@@ -758,6 +858,10 @@ class FfticOrchestrator:
         if context is None or status is None:
             raise RuntimeError(
                 "Recheck FFTIC status before constructing an operation plan")
+        if kind.value not in status.available_actions:
+            reason = dict(status.action_unavailable_reasons).get(
+                kind.value, "Current FFTIC evidence does not authorize this action.")
+            raise RuntimeError(reason)
         targets = {
             OperationKind.SETUP: (
                 OperationStep(
@@ -892,7 +996,7 @@ class FfticOrchestrator:
     def execute(self, plan: OperationPlan, cancel: threading.Event | None = None,
                 progress: ProgressCallback | None = None):
         if not self.mutation_available:
-            raise PermissionError(EXECUTION_UNAVAILABLE)
+            raise PermissionError(self._executor_unavailable_reason)
         if not isinstance(plan, OperationPlan) or not self.plan_is_current(plan):
             raise RuntimeError(
                 "This FFTIC operation plan is stale. Recheck status and confirm the action again.")

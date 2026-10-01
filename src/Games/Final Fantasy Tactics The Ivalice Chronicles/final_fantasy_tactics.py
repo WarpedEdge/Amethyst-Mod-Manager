@@ -19,6 +19,7 @@ from fftic_detection import (  # noqa: E402
 )
 from fftic_packages import inspect_package  # noqa: E402
 from fftic_orchestration import FfticOrchestrator  # noqa: E402
+from fftic_production import create_production_executor  # noqa: E402
 
 _PROFILES_DIR = get_profiles_dir()
 _DIRECT_LAUNCH_MESSAGE = (
@@ -37,7 +38,8 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
         self._hash_cache = ExecutableHashCache()
-        self._managed_support_controller = FfticOrchestrator()
+        self._managed_support_controller = FfticOrchestrator(
+            executor_factory=create_production_executor)
         self.load_paths()
 
     @property
@@ -62,8 +64,7 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
 
     @property
     def auto_install_deps(self) -> list[str]:
-        # Managed prerequisite installation belongs to a later explicit,
-        # snapshot-protected setup transaction, never Add Game.
+        # FFTIC prerequisites are never installed implicitly by Add Game.
         return []
 
     @property
@@ -90,9 +91,7 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         return self._game_path
 
     def get_mod_data_path(self) -> Path | None:
-        # Content is staged as an ordinary profile mod.  Future synchronization
-        # snapshots it into Reloaded's private Mods root; it is never deployed
-        # into the live game tree by the generic data path.
+        # Profile content is published by the FFTIC managed synchronizer.
         return None
 
     def get_mod_staging_path(self) -> Path:
@@ -127,7 +126,7 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
             hash_cache=self._hash_cache)
 
     def get_managed_support_controller(self) -> FfticOrchestrator:
-        """Return the read-only production controller for the FFTIC status UI."""
+        """Return the FFTIC status and explicitly confirmed lifecycle controller."""
         return self._managed_support_controller
 
     def validate_mod_package(self, source_root: Path) -> list[str]:

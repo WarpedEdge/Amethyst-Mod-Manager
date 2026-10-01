@@ -463,8 +463,8 @@ def get_wine_prefixes_dir() -> Path:
     return d
 
 
-def get_download_cache_dir() -> Path:
-    """Return the download cache root directory, creating it if it doesn't exist.
+def get_download_cache_dir(*, create: bool = True) -> Path:
+    """Return the download cache root, creating it unless ``create`` is false.
 
     Honours the user-configured path from ``[paths] download_cache_path`` in
     amethyst.ini.  When unset (or unwritable) falls back to
@@ -473,20 +473,39 @@ def get_download_cache_dir() -> Path:
     The setting is read on every call so a path change in the Settings panel
     takes effect without restarting.
     """
-    try:
-        from Utils.ui.config import load_download_cache_path  # lazy: avoid cycles
-        custom = load_download_cache_path().strip()
-    except Exception:
+    if create:
+        try:
+            from Utils.ui.config import load_download_cache_path  # lazy: avoid cycles
+            custom = load_download_cache_path().strip()
+        except Exception:
+            custom = ""
+        config = get_config_dir()
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        config = (Path(xdg) if xdg else Path.home() / ".config") / APP_NAME
         custom = ""
+        ini = config / "amethyst.ini"
+        if ini.is_file():
+            try:
+                import configparser
+                parser = configparser.ConfigParser(strict=False)
+                parser.read(ini)
+                custom = parser.get(
+                    "paths", "download_cache_path", fallback="").strip()
+            except Exception:
+                pass
     if custom:
         d = Path(custom).expanduser()
+        if not create:
+            return d
         try:
             d.mkdir(parents=True, exist_ok=True)
             return d
         except OSError:
             pass  # fall through to default
-    d = get_config_dir() / "download_cache"
-    d.mkdir(parents=True, exist_ok=True)
+    d = config / "download_cache"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -550,18 +569,21 @@ def migrate_legacy_application_caches() -> list[str]:
     return errors
 
 
-def get_download_cache_dir_for_game(game_name: str | None) -> Path:
+def get_download_cache_dir_for_game(
+        game_name: str | None, *, create: bool = True) -> Path:
     """Per-game cache subfolder under :func:`get_download_cache_dir`.
 
-    Falls back to the cache root when *game_name* is empty.  Game name is
+    Falls back to the cache root when *game_name* is empty. When ``create`` is
+    false, this resolves the configured location without creating it. Game name is
     used as a directory component verbatim, matching the convention used
     elsewhere (e.g. :func:`get_game_config_path`).
     """
-    root = get_download_cache_dir()
+    root = get_download_cache_dir(create=create)
     if not game_name:
         return root
     d = root / game_name
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 

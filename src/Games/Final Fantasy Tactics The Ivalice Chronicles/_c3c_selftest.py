@@ -793,9 +793,9 @@ def test_removal_failure_boundaries_restore_exact_owned_state() -> None:
                     if baseline[key] != after[key]})
 
 
-def test_production_handler_stays_non_mutating() -> None:
+def test_production_handler_uses_guarded_composition() -> None:
     source = Path(__file__).with_name("final_fantasy_tactics.py").read_text(encoding="utf-8")
-    assert "FfticOrchestrator()" in source
+    assert "executor_factory=create_production_executor" in source
     assert "ManagedLifecycleExecutor" not in source
     assert "FfticLifecycleComposition" not in source
 
@@ -813,7 +813,7 @@ def main() -> None:
         test_preexisting_backup_survives_failed_removal,
         test_cleanup_and_cross_operation_failure_boundaries,
         test_removal_failure_boundaries_restore_exact_owned_state,
-        test_production_handler_stays_non_mutating,
+        test_production_handler_uses_guarded_composition,
     )
     for test in tests:
         try:
