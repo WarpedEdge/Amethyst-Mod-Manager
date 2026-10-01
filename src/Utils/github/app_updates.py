@@ -8,6 +8,12 @@ import shlex
 import subprocess
 
 from Utils.github.cache import fetch_text as _gh_fetch_text
+from Utils.app_identity import (
+    APP_ID as _APP_ID,
+    CONFIG_NAMESPACE,
+    is_our_flatpak,
+    official_updates_allowed,
+)
 
 _APP_UPDATE_RELEASES_API_URL = "https://api.github.com/repos/ChrisDKN/Amethyst-Mod-Manager/releases/latest"
 _APP_UPDATE_RELEASES_LIST_API_URL = "https://api.github.com/repos/ChrisDKN/Amethyst-Mod-Manager/releases?per_page=20"
@@ -17,8 +23,6 @@ _APP_UPDATE_FLATPAK_BUNDLE_URL = (
     "https://github.com/ChrisDKN/Amethyst-Mod-Manager/releases/download/"
     "v{tag}/AmethystModManager.flatpak"
 )
-_APP_ID = "io.github.Amethyst.ModManager"
-
 # Hosted Flatpak remote (GitHub Pages). Adding this remote lets the OS handle
 # updates natively (`flatpak update`, GNOME Software, Discover) with delta
 # downloads. `stable` and `beta` are the two OSTree branches published to it.
@@ -45,7 +49,7 @@ def is_flatpak() -> bool:
     terminal) sandboxes us under that host app, so the file test would
     wrongly steer from-source sessions to the flatpak update path.
     """
-    return os.environ.get("FLATPAK_ID") == "io.github.Amethyst.ModManager"
+    return is_our_flatpak()
 
 
 def _parse_version(s: str) -> tuple:
@@ -256,12 +260,14 @@ def run_flatpak_installer(latest_tag: str) -> bool:
     """
     import shutil
 
+    if not official_updates_allowed():
+        return False
     if not shutil.which("flatpak-spawn"):
         return False
 
     config_dir = os.path.join(
         os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "AmethystModManager",
+        CONFIG_NAMESPACE,
     )
     os.makedirs(config_dir, exist_ok=True)
     log_path = os.path.join(config_dir, "amethyst-update.log")
@@ -436,6 +442,8 @@ def flatpak_installed_from_remote() -> bool:
     --repo-url (or any non-remote install) have no matching origin → False.
     Conservatively returns False when the host can't be queried.
     """
+    if not official_updates_allowed():
+        return False
     cp = _host_flatpak("info", "--show-origin", _APP_ID)
     if cp is None or cp.returncode != 0:
         return False
@@ -474,6 +482,8 @@ def polish_flatpak_origin() -> None:
     Discover label. System remotes added from our .flatpakrepo are enumerable
     anyway, so there is nothing to heal there.
     """
+    if not official_updates_allowed():
+        return
     found = _remote_for_our_url()
     if not found:
         return
@@ -501,6 +511,8 @@ def flatpak_remote_branch_available(branch: str) -> bool:
     branch would fail silently in the detached child. Callers use this to
     surface "channel not published yet" instead.
     """
+    if not official_updates_allowed():
+        return False
     name, scope = _effective_remote()
     cp = _host_flatpak("remote-info", scope, name, f"{_APP_ID}//{branch}")
     return cp is not None and cp.returncode == 0
@@ -564,9 +576,11 @@ def _launch_remote_reinstall(branch: str) -> str:
 
     Shared tail of enroll/update. Returns "launched" or "unavailable".
     """
+    if not official_updates_allowed():
+        return "unavailable"
     config_dir = os.path.join(
         os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "AmethystModManager",
+        CONFIG_NAMESPACE,
     )
     os.makedirs(config_dir, exist_ok=True)
     log_path = os.path.join(config_dir, "amethyst-update.log")
@@ -621,6 +635,8 @@ def enroll_flatpak_remote(*, allow_prerelease: bool = False) -> str:
     remote-add consumes carries the signing key.
     """
     import shutil
+    if not official_updates_allowed():
+        return "unavailable"
     if not shutil.which("flatpak-spawn"):
         return "unavailable"
 
@@ -651,6 +667,8 @@ def update_flatpak_from_remote(*, allow_prerelease: bool = False) -> str:
     "unavailable" (host flatpak unreachable).
     """
     import shutil
+    if not official_updates_allowed():
+        return "unavailable"
     if not shutil.which("flatpak-spawn"):
         return "unavailable"
 

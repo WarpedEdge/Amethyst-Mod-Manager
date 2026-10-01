@@ -42,6 +42,12 @@ from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from Utils.app_log import app_log
+from Utils.app_identity import (
+    APP_ID as _FLATPAK_APP_ID,
+    CONFIG_NAMESPACE as _CONFIG_NAMESPACE,
+    ipc_socket_name,
+    protocol_registration_allowed,
+)
 
 # Max size of logs/nxm.log before it is rotated to nxm.log.old.
 _NXM_LOG_MAX_BYTES = 512_000
@@ -90,17 +96,11 @@ def _resolve_socket_path() -> Path:
     if flatpak_id:
         app_run = Path(f"/run/user/{uid}/app/{flatpak_id}")
         if app_run.is_dir():
-            return app_run / "amethyst-mod-manager.sock"
+            return app_run / ipc_socket_name()
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        return Path(xdg) / "amethyst-mod-manager.sock"
-    return Path(f"/tmp/amethyst-mod-manager-{uid}.sock")
-
-
-# Our Flatpak app id - hard-coded so a *native/AppImage* sender can still try
-# the Flatpak per-app runtime dir (the host sees it at the same path) even
-# though FLATPAK_ID isn't in its environment.
-_FLATPAK_APP_ID = "io.github.Amethyst.ModManager"
+        return Path(xdg) / ipc_socket_name()
+    return Path("/tmp") / f"{ipc_socket_name()[:-5]}-{uid}.sock"
 
 
 def _home_socket_path() -> Path:
@@ -113,8 +113,8 @@ def _home_socket_path() -> Path:
     --filesystem=home and HOME is not redirected), so a socket here is the one
     path every install variant can reach.
     """
-    return (Path.home() / ".local" / "share" / "AmethystModManager"
-            / "amethyst-mod-manager.sock")
+    return (Path.home() / ".local" / "share" / _CONFIG_NAMESPACE
+            / ipc_socket_name())
 
 
 # Every socket path the app *might* use across launch contexts.
@@ -134,11 +134,11 @@ def _candidate_socket_paths() -> list[Path]:
     flatpak_id = os.environ.get("FLATPAK_ID")
     if flatpak_id:
         app_run = Path(f"/run/user/{uid}/app/{flatpak_id}")
-        paths.append(app_run / "amethyst-mod-manager.sock")
+        paths.append(app_run / ipc_socket_name())
 
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        paths.append(Path(xdg) / "amethyst-mod-manager.sock")
+        paths.append(Path(xdg) / ipc_socket_name())
 
     # Cross-variant meeting point in the real home (see _home_socket_path).
     paths.append(_home_socket_path())
@@ -147,11 +147,11 @@ def _candidate_socket_paths() -> list[Path]:
     # primary socket lives in its per-app runtime dir, which the host sees at
     # this same path.
     paths.append(
-        Path(f"/run/user/{uid}/app/{_FLATPAK_APP_ID}") / "amethyst-mod-manager.sock")
+        Path(f"/run/user/{uid}/app/{_FLATPAK_APP_ID}") / ipc_socket_name())
 
     # Env-independent /tmp fallback. NOTE: under Flatpak /tmp is sandbox-
     # private, so this only ever connects same-variant instances.
-    paths.append(Path(f"/tmp/amethyst-mod-manager-{uid}.sock"))
+    paths.append(Path("/tmp") / f"{ipc_socket_name()[:-5]}-{uid}.sock")
 
     # Deduplicate while preserving order.
     seen: set[Path] = set()
@@ -166,7 +166,8 @@ def _candidate_socket_paths() -> list[Path]:
 _SOCKET_PATH = _resolve_socket_path()
 # The env-independent /tmp fallback - always bound by the server in addition to
 # _SOCKET_PATH so that a sender which lost XDG_RUNTIME_DIR can still reach us.
-_FALLBACK_SOCKET_PATH = Path(f"/tmp/amethyst-mod-manager-{os.getuid()}.sock")
+_FALLBACK_SOCKET_PATH = (
+    Path("/tmp") / f"{ipc_socket_name()[:-5]}-{os.getuid()}.sock")
 
 # XDG .desktop file name used to register the handler
 _DESKTOP_FILE_NAME = "amethystmodmanager-nxm.desktop"
@@ -657,6 +658,8 @@ class NxmHandler:
         XDG default; only a mismatch needs the destructive scrub and several
         desktop-helper subprocesses.
         """
+        if not protocol_registration_allowed():
+            return False
         try:
             expected = cls._desktop_contents()
             desktop_path = cls._desktop_path()
@@ -800,6 +803,10 @@ class NxmHandler:
         Returns True on success, False if it could not be registered
         (e.g. xdg-mime not available).
         """
+        if not protocol_registration_allowed():
+            nxm_log("FFTIC build: leaving host nxm:// registration unchanged")
+            return False
+
         # Always scrub first. This removes any leftover .desktop from a
         # different install variant (e.g. flatpak vs native) so the handler
         # doesn't get routed to an old/other instance of the manager.
@@ -929,11 +936,14 @@ class NxmHandler:
         Remove the .desktop file(s) from *every* install variant
         (flatpak + non-flatpak) and clear the xdg-mime default, best-effort.
         """
-        cls._scrub_all()
+        if protocol_registration_allowed():
+            cls._scrub_all()
 
     @classmethod
     def is_registered(cls) -> bool:
         """Check whether our .desktop file exists."""
+        if not protocol_registration_allowed():
+            return False
         return cls._desktop_path().is_file()
 
 

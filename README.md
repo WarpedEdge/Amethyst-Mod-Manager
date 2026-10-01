@@ -82,6 +82,29 @@ Installing from a bundle skips the 32-bit compat extensions that running Windows
 flatpak install --user flathub org.freedesktop.Platform.Compat.i386//24.08 org.freedesktop.Platform.GL32.default//24.08
 ```
 
+#### FFTIC test Flatpak
+
+Every push to the `fftic-support` branch builds a separate FFTIC test bundle.
+Open that push's **Build FFTIC Flatpak** run on the repository's **Actions**
+page and download the `Amethyst-FFTIC-ModManager` artifact. GitHub downloads
+artifacts as ZIP files; extract it before installing:
+
+```bash
+unzip Amethyst-FFTIC-ModManager.zip
+flatpak install --user ./Amethyst-FFTIC-ModManager.flatpak
+flatpak run io.github.Amethyst.FFTIC.ModManager
+```
+
+Uninstall only the test flavor with:
+
+```bash
+flatpak uninstall --user io.github.Amethyst.FFTIC.ModManager
+```
+
+The test flavor installs beside the official `io.github.Amethyst.ModManager`
+Flatpak with separate configuration and staging data; installing or removing
+it does not replace the official application.
+
 ### AUR
 <a href='https://aur.archlinux.org/packages/amethyst-mod-manager'>
 	<img width='240' alt='Get on AUR' src='https://upload.wikimedia.org/wikipedia/commons/e/e8/Archlinux-logo-standard-version.png'/>

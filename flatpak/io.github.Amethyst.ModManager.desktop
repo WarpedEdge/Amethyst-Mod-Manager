@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Amethyst Mod Manager
+Name=@DISPLAY_NAME@
 Comment=Linux Mod Manager
 Exec=amethyst-mod-manager %u
-Icon=io.github.Amethyst.ModManager
+Icon=@APPLICATION_ID@
 Categories=Game;Utility;
 Terminal=false
 StartupWMClass=amethyst-mod-manager

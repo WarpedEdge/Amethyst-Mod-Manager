@@ -5,7 +5,8 @@ project(
   license_files: 'LICENSE',
 )
 
-application_id = 'io.github.Amethyst.ModManager'
+application_id = get_option('application_id')
+display_name = get_option('display_name')
 
 py = import('python').find_installation()
 
@@ -20,8 +21,14 @@ install_data(
   install_dir: get_option('bindir'),
 )
 
-install_data(
-  'flatpak' / '@0@.desktop'.format(application_id),
+desktop_conf = configuration_data()
+desktop_conf.set('APPLICATION_ID', application_id)
+desktop_conf.set('DISPLAY_NAME', display_name)
+configure_file(
+  input: 'flatpak' / 'io.github.Amethyst.ModManager.desktop',
+  output: '@0@.desktop'.format(application_id),
+  configuration: desktop_conf,
+  install: true,
   install_dir: get_option('datadir') / 'applications',
 )
 
@@ -42,6 +49,8 @@ install_data(
 )
 
 metainfo_conf = configuration_data()
+metainfo_conf.set('APPLICATION_ID', application_id)
+metainfo_conf.set('DISPLAY_NAME', display_name)
 metainfo_conf.set('VERSION', meson.project_version())
 date = ''
 git = find_program('git', required: false)
@@ -53,7 +62,7 @@ if (date == '')
 endif
 metainfo_conf.set('DATE', date)
 metainfo_file = configure_file(
-  input: 'flatpak' / '@0@.metainfo.xml.in'.format(application_id),
+  input: 'flatpak' / 'io.github.Amethyst.ModManager.metainfo.xml.in',
   output: '@0@.metainfo.xml'.format(application_id),
   configuration: metainfo_conf,
   install_dir: get_option('datadir') / 'metainfo',

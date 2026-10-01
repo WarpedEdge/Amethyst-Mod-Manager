@@ -1,0 +1,35 @@
+option(
+  'application_id',
+  type: 'string',
+  value: 'io.github.Amethyst.ModManager',
+  description: 'Reverse-DNS application ID used by the installed package',
+)
+
+option(
+  'display_name',
+  type: 'string',
+  value: 'Amethyst Mod Manager',
+  description: 'Application name shown in desktop metadata and the UI',
+)
+
+option(
+  'flavor',
+  type: 'combo',
+  choices: ['stable', 'fftic'],
+  value: 'stable',
+  description: 'Packaging flavor used for runtime isolation boundaries',
+)
+
+option(
+  'config_namespace',
+  type: 'string',
+  value: 'AmethystModManager',
+  description: 'Directory name below the XDG configuration root',
+)
+
+option(
+  'default_staging_root',
+  type: 'string',
+  value: '~/Games/Amethyst',
+  description: 'Default staging root for newly configured games',
+)

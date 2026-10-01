@@ -69,7 +69,8 @@ def _flatpak_required_grant(path) -> Path | None:
             app = parts[2] if len(parts) > 2 else ""
             # The app's own ~/.var/app/<FLATPAK_ID> tree is always visible to
             # itself; a missing path there is genuinely missing, not blocked.
-            own_id = os.environ.get("FLATPAK_ID", "io.github.Amethyst.ModManager")
+            from Utils.app_identity import APP_ID
+            own_id = os.environ.get("FLATPAK_ID", APP_ID)
             if app in _GRANTED_VAR_APPS or app == own_id:
                 return None
             if _has_writable_ancestor(p, home / ".var" / "app"):
@@ -102,7 +103,8 @@ def flatpak_blocked_path_hint(path) -> str | None:
     grant = _flatpak_required_grant(path)
     if grant is None:
         return None
-    app_id = os.environ.get("FLATPAK_ID", "io.github.Amethyst.ModManager")
+    from Utils.app_identity import APP_ID
+    app_id = os.environ.get("FLATPAK_ID", APP_ID)
     filesystem = shlex.quote(f"--filesystem={grant}")
     return f"flatpak override --user {filesystem} {shlex.quote(app_id)}"
 
@@ -122,7 +124,8 @@ def grant_flatpak_path_access(
     if not grants:
         return True, [], ""
 
-    app_id = os.environ.get("FLATPAK_ID", "io.github.Amethyst.ModManager")
+    from Utils.app_identity import APP_ID
+    app_id = os.environ.get("FLATPAK_ID", APP_ID)
     filesystems = " ".join(
         shlex.quote(f"--filesystem={grant}") for grant in grants)
     manual = (f"flatpak override --user {filesystems} "

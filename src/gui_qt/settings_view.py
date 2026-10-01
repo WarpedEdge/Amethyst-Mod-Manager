@@ -1434,10 +1434,12 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
         GNOME Software / Discover, delta downloads). Once enrolled, the button
         is hidden. No-op outside the flatpak or when already remote-tracked.
         """
+        from Utils.app_identity import official_updates_allowed
         from Utils.github.app_updates import (
             is_flatpak, flatpak_installed_from_remote,
         )
-        if not is_flatpak() or flatpak_installed_from_remote():
+        if (not official_updates_allowed() or not is_flatpak()
+                or flatpak_installed_from_remote()):
             return
         self._action_row(
             g, self.tr("Enable automatic updates…"),

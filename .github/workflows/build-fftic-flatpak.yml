@@ -1,0 +1,24 @@
+name: Build FFTIC Flatpak
+
+on:
+  push:
+    branches:
+      - fftic-support
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fftic-flatpak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build FFTIC Flatpak
+    uses: ./.github/workflows/build.yml
+    with:
+      build_appimage: false
+      build_flatpak: true
+      flatpak_flavor: fftic
+      source_ref: ${{ github.sha }}

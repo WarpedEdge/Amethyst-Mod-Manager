@@ -154,7 +154,8 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
 
     def _vanilla_passthrough_command(command: list[str], game) -> list[str]:
         """Return launcher argv on the side of the sandbox that owns it."""
-        if os.environ.get("FLATPAK_ID") != "io.github.Amethyst.ModManager":
+        from Utils.app_identity import is_our_flatpak
+        if not is_our_flatpak():
             return list(command)
         from Utils.flatpak.env import flatpak_forward_env_args
         portal = ["flatpak-spawn", "--host"]

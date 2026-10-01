@@ -233,6 +233,12 @@ class Ror2mmHandler:
 
         Returns True when at least one desktop entry was written.
         """
+        from Utils.app_identity import protocol_registration_allowed
+        if not protocol_registration_allowed():
+            _handler_log(
+                f"FFTIC build: leaving host {cls._SCHEME}:// registration unchanged")
+            return False
+
         import os
         import subprocess
 
@@ -379,6 +385,10 @@ class Ror2mmHandler:
         import subprocess
 
         from Nexus.nxm_handler import NxmHandler
+        from Utils.app_identity import protocol_registration_allowed
+
+        if not protocol_registration_allowed():
+            return False
 
         try:
             expected = cls._desktop_contents()

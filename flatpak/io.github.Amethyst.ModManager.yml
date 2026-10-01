@@ -87,6 +87,13 @@ finish-args:
   # 32-bit binaries; the default sandbox blocks both, killing wine with SIGSYS.
   - --allow=multiarch
   - --env=MOD_MANAGER_GAMES=/app/share/amethyst-mod-manager/Games
+  # Explicit runtime identity lets the same source tree produce isolated
+  # side-by-side flavors while preserving these stable defaults.
+  - --env=AMETHYST_APP_ID=io.github.Amethyst.ModManager
+  - --env=AMETHYST_FLAVOR=stable
+  - --env=AMETHYST_DISPLAY_NAME=Amethyst Mod Manager
+  - --env=AMETHYST_CONFIG_NAMESPACE=AmethystModManager
+  - --env=AMETHYST_DEFAULT_STAGING_ROOT=~/Games/Amethyst
   - --env=XDG_DATA_DIRS=/app/share:/usr/share
   - --env=QT_QPA_PLATFORM=xcb
   # Unconditional, so the xcb above is always OURS: Utils.environment.xdg.host_env() reads
@@ -177,6 +184,12 @@ modules:
 
   - name: amethyst-mod-manager
     buildsystem: meson
+    config-opts:
+      - -Dapplication_id=io.github.Amethyst.ModManager
+      - -Ddisplay_name=Amethyst Mod Manager
+      - -Dflavor=stable
+      - -Dconfig_namespace=AmethystModManager
+      - -Ddefault_staging_root=~/Games/Amethyst
     sources:
       - type: dir
         path: ..

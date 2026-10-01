@@ -33,6 +33,10 @@ on:
         description: Flatpak builder container override. Empty selects from the manifest.
         type: string
         default: ""
+      flatpak_flavor:
+        description: Flatpak packaging flavor (stable or fftic).
+        type: string
+        default: stable
 
 jobs:
   filegraph-test:
@@ -395,7 +399,7 @@ jobs:
     env:
       # Callers must pass `secrets: inherit` for these to be non-empty.
       # secrets.* is not allowed in step-level `if:`, so surface a flag here.
-      HAVE_GPG: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY != '' }}
+      HAVE_GPG: ${{ inputs.flatpak_flavor == 'stable' && secrets.FLATPAK_GPG_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -406,6 +410,41 @@ jobs:
         with:
           name: filegraph-native
           path: src/
+
+      - name: Prepare Flatpak flavor
+        id: identity
+        shell: bash
+        env:
+          FLATPAK_FLAVOR: ${{ inputs.flatpak_flavor }}
+        run: |
+          set -euo pipefail
+          case "$FLATPAK_FLAVOR" in
+            stable)
+              app_id="io.github.Amethyst.ModManager"
+              manifest="flatpak/io.github.Amethyst.ModManager.yml"
+              echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+              echo "bundle=AmethystModManager.flatpak" >> "$GITHUB_OUTPUT"
+              echo "artifact=AmethystModManager-flatpak" >> "$GITHUB_OUTPUT"
+              ;;
+            fftic)
+              app_id="io.github.Amethyst.FFTIC.ModManager"
+              manifest="flatpak/io.github.Amethyst.FFTIC.ModManager.generated.yml"
+              ./flatpak/generate-flavor-manifest.sh fftic "$manifest"
+              echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+              echo "bundle=Amethyst-FFTIC-ModManager.flatpak" >> "$GITHUB_OUTPUT"
+              echo "artifact=Amethyst-FFTIC-ModManager" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported Flatpak flavor: $FLATPAK_FLAVOR" >&2
+              exit 2
+              ;;
+          esac
+          actual_app_id=$(sed -n 's/^app-id: *//p' "$manifest")
+          if [ "$actual_app_id" != "$app_id" ]; then
+            echo "Expected app-id $app_id, found $actual_app_id" >&2
+            exit 1
+          fi
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
 
       # Sign the export commits at BUILD time (the action passes --gpg-sign to
       # flatpak-builder). Without this the bundle's commit is unsigned, and a
@@ -430,6 +469,10 @@ jobs:
         id: branch
         shell: bash
         run: |
+          if [ '${{ inputs.flatpak_flavor }}' = fftic ]; then
+            echo "name=fftic" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           explicit='${{ inputs.flatpak_channel }}'
           if [ -n "$explicit" ]; then
             echo "name=$explicit" >> "$GITHUB_OUTPUT"
@@ -451,25 +494,27 @@ jobs:
       - name: Build Flatpak (repo)
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          manifest-path: flatpak/io.github.Amethyst.ModManager.yml
+          manifest-path: ${{ steps.identity.outputs.manifest }}
           branch: ${{ steps.branch.outputs.name }}
           build-bundle: false
           repo-dir: repo
-          cache-key: flatpak-builder-v2-${{ hashFiles('flatpak/io.github.Amethyst.ModManager.yml', 'flatpak/pypi-dependencies.yaml', 'flatpak/maturin.yaml', 'flatpak/Cargo.lock', 'flatpak/cargo-sources.json') }}
+          cache-key: flatpak-builder-v2-${{ hashFiles('flatpak/io.github.Amethyst.ModManager.yml', 'flatpak/pypi-dependencies.yaml', 'flatpak/maturin.yaml', 'flatpak/Cargo.lock', 'flatpak/cargo-sources.json') }}${{ inputs.flatpak_flavor == 'fftic' && format('-fftic-{0}', hashFiles('flatpak/generate-flavor-manifest.sh')) || '' }}
           upload-artifact: false
           # Empty when secrets aren't inherited → the action skips signing.
-          gpg-sign: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          gpg-sign: ${{ inputs.flatpak_flavor == 'stable' && secrets.FLATPAK_GPG_KEY_ID || '' }}
 
-      # Bundle with --repo-url: installing the .flatpak then auto-configures
-      # the hosted remote as the app's origin, so bundle users get native
-      # `flatpak update` / Discover updates from day one (no enroll button).
+      # Stable bundles use --repo-url so installs auto-configure the hosted
+      # update remote. The FFTIC test flavor deliberately omits that option.
       # --gpg-keys embeds the public signing key so install + future updates
       # are signature-verified - but ONLY when this build actually signed its
       # commits (embedding a key while the commit is unsigned makes the bundle
       # UNINSTALLABLE: "GPG verification enabled, but no signatures found").
-      - name: Bundle (auto-enrolling remote)
+      - name: Bundle Flatpak
         env:
           GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          APP_ID: ${{ steps.identity.outputs.app_id }}
+          BUNDLE_FILE: ${{ steps.identity.outputs.bundle }}
+          FLATPAK_FLAVOR: ${{ inputs.flatpak_flavor }}
         shell: bash
         run: |
           set -euo pipefail
@@ -480,22 +525,27 @@ jobs:
           else
             echo "Unsigned build - bundle will not embed a verification key."
           fi
-          flatpak build-bundle repo AmethystModManager.flatpak \
-            io.github.Amethyst.ModManager '${{ steps.branch.outputs.name }}' \
+          REPOOPT=""
+          if [ "$FLATPAK_FLAVOR" = stable ]; then
+            REPOOPT="--repo-url=https://chrisdkn.github.io/Amethyst-Mod-Manager/repo/"
+          fi
+          flatpak build-bundle repo "$BUNDLE_FILE" \
+            "$APP_ID" '${{ steps.branch.outputs.name }}' \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
-            --repo-url=https://chrisdkn.github.io/Amethyst-Mod-Manager/repo/ \
-            $GPGOPT
+            $REPOOPT $GPGOPT
+          test -s "$BUNDLE_FILE"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AmethystModManager-flatpak
-          path: AmethystModManager.flatpak
+          name: ${{ steps.identity.outputs.artifact }}
+          path: ${{ steps.identity.outputs.bundle }}
           if-no-files-found: error
           compression-level: 0
 
       # The raw OSTree repo for this build - consumed by release.yml's
       # publish-pages job, which merges it into the accumulated gh-pages repo.
       - uses: actions/upload-artifact@v4
+        if: ${{ inputs.flatpak_flavor == 'stable' }}
         with:
           name: AmethystModManager-flatpak-repo
           path: repo/

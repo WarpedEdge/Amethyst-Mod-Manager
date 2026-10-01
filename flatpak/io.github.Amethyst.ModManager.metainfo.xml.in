@@ -9,11 +9,11 @@
   release entry, package managers report "No version information found".
 -->
 <component type="desktop-application">
-  <id>io.github.Amethyst.ModManager</id>
+  <id>@APPLICATION_ID@</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
-  <name>Amethyst Mod Manager</name>
+  <name>@DISPLAY_NAME@</name>
   <summary>Manage game mods on Linux and the Steam Deck</summary>
 
   <description>
@@ -25,7 +25,7 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.Amethyst.ModManager.desktop</launchable>
+  <launchable type="desktop-id">@APPLICATION_ID@.desktop</launchable>
 
   <url type="homepage">https://github.com/ChrisDKN/Amethyst-Mod-Manager</url>
   <url type="bugtracker">https://github.com/ChrisDKN/Amethyst-Mod-Manager/issues</url>

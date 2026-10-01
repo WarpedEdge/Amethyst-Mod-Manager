@@ -16,7 +16,9 @@ import threading
 import uuid
 from pathlib import Path
 
-APP_NAME = "AmethystModManager"
+from Utils.app_identity import CONFIG_NAMESPACE, DEFAULT_STAGING_ROOT
+
+APP_NAME = CONFIG_NAMESPACE
 
 
 def get_config_dir() -> Path:
@@ -73,7 +75,7 @@ def get_loot_game_dir(game_id: str) -> Path:
 
 
 def get_default_staging_root() -> Path:
-    """Return the built-in default mod-staging root: ``~/Games/Amethyst``.
+    """Return this build flavor's default mod-staging root.
 
     Mod staging must live on the *same filesystem* as the game install so that
     deployed files can be hardlinked.  Under Flatpak the app's config dir lives
@@ -84,7 +86,7 @@ def get_default_staging_root() -> Path:
     on the ``--filesystem=home`` mount alongside the games, so hardlinks work in
     the Flatpak, AppImage and native installs alike.
     """
-    return Path.home() / "Games" / "Amethyst"
+    return Path(DEFAULT_STAGING_ROOT).expanduser()
 
 
 def get_default_game_staging_root(game_name: str) -> Path:

@@ -4052,6 +4052,10 @@ class MainWindow(QMainWindow):
         ETag-cache throttle is bypassed so a manual user action triggers an
         immediate re-check instead of waiting out the 1-hour throttle window.
         """
+        from Utils.app_identity import official_updates_allowed
+        if not official_updates_allowed():
+            return
+
         import threading
         from gui_qt.safe_emit import safe_emit
         from version import __version__
@@ -22788,7 +22792,9 @@ def _apply_app_identity(app) -> None:
     from pathlib import Path
     from PySide6.QtGui import QIcon
 
-    app.setApplicationName("Amethyst Mod Manager")
+    from Utils.app_identity import APP_ID, DISPLAY_NAME, is_our_flatpak
+
+    app.setApplicationName(DISPLAY_NAME)
     # NB: intentionally NOT calling setApplicationDisplayName - Qt auto-appends
     # " - {DisplayName}" to every setWindowTitle(), which duplicated the app
     # name in the title bar ("… - v2.0.0 - Amethyst Mod Manager").
@@ -22813,12 +22819,12 @@ def _apply_app_identity(app) -> None:
     # terminal) sets FLATPAK_ID to that host app, and /.flatpak-info exists
     # for any flatpak-sandboxed parent, so neither is a reliable "we are the
     # Amethyst flatpak" signal on its own.
-    if os.environ.get("FLATPAK_ID") == "io.github.Amethyst.ModManager":
-        app.setDesktopFileName("io.github.Amethyst.ModManager")
+    if is_our_flatpak():
+        app.setDesktopFileName(APP_ID)
     elif os.environ.get("APPDIR") or os.environ.get("APPIMAGE"):
         app.setDesktopFileName("amethyst-mod-manager")
     else:
-        app.setDesktopFileName("io.github.Amethyst.ModManager")
+        app.setDesktopFileName(APP_ID)
 
 def run(startup_timing=None) -> int:
     phase_started = _startup_time.perf_counter()
@@ -22896,6 +22902,10 @@ def run(startup_timing=None) -> int:
     # serialized in one worker (they patch the same mimeapps.list) and start it
     # after the splash is visible, off the splash-critical path.
     def _register_protocol_handlers():
+        from Utils.app_identity import protocol_registration_allowed
+        if not protocol_registration_allowed():
+            return
+
         registration_started = _startup_time.perf_counter()
         nxm_current = False
         try:
