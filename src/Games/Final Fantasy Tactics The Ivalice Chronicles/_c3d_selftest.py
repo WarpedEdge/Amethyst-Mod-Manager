@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fftic_artifacts import ARTIFACTS
 from fftic_detection import VERIFIED_STEAM_BUILD
+from fftic_managed_executor import ManagedOperationError
 from fftic_orchestration import (
     FFTIC_GAME_ID, FfticOrchestrator, FfticStatusViewModel, InspectionContext,
     InspectionResult, OperationKind, StatusRow, StatusSeverity,
@@ -249,13 +251,16 @@ def test_production_request_binds_exact_proton_prefix_and_steam_context() -> Non
     (runner.parent / "version").write_text(
         f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
     steam_client = fixture.root / "steam"
+    steam_alias = fixture.root / "alias/root"
+    steam_alias.parent.mkdir()
+    steam_alias.symlink_to(steam_client, target_is_directory=True)
     selection = SimpleNamespace(
         proton_script=runner, tool_identity=SUPPORTED_PROTON_RUNNER,
         prefix_runtime="11.0-100")
     with patch("fftic_production.resolve_proton_selection",
                return_value=selection), \
             patch("Utils.launchers.steam.find_steam_root_for_proton_script",
-                  return_value=steam_client):
+                  return_value=steam_alias):
         executor, reason = create_production_executor(
             fixture.context, lambda _plan: True, cache_root=fixture.cache)
         assert executor is not None, reason
@@ -280,6 +285,45 @@ def test_production_request_binds_exact_proton_prefix_and_steam_context() -> Non
         "SteamAppId", "SteamGameId", "SteamOverlayGameId",
         "STEAM_COMPAT_APP_ID"))
     assert request.log_path.parent == fixture.prefix / "drive_c/Amethyst/FFTIC/logs"
+    with patch("fftic_managed_executor.validate_file", return_value=True):
+        replace(request, allow_flatpak_host_spawn=False).validate()
+
+    unsafe_environment = tuple(
+        (key, str(steam_alias) if key == "STEAM_COMPAT_CLIENT_INSTALL_PATH" else value)
+        for key, value in request.environment)
+    with patch("fftic_managed_executor.validate_file", return_value=True):
+        try:
+            replace(
+                request, environment=unsafe_environment,
+                allow_flatpak_host_spawn=False).validate()
+        except ManagedOperationError as exc:
+            assert "Steam client root crosses a symbolic link" in str(exc)
+        else:
+            raise AssertionError("ProcessRequest accepted an unresolved Steam alias")
+
+    missing_alias = fixture.root / "alias/missing-root"
+    missing_alias.symlink_to(fixture.root / "missing-steam", target_is_directory=True)
+    with patch("Utils.launchers.steam.find_steam_root_for_proton_script",
+               return_value=missing_alias):
+        try:
+            executor._operations.inputs.process_request_factory(plan)
+        except ValueError as exc:
+            assert "Steam client root" in str(exc) and "unavailable" in str(exc)
+        else:
+            raise AssertionError("Missing Steam client target was accepted")
+
+    unrelated_compatdata = fixture.root / "other-compatdata"
+    unrelated_compatdata.mkdir()
+    with patch("Utils.launchers.steam.find_steam_root_for_proton_script",
+               return_value=steam_alias), \
+            patch("Utils.wine.prefix.resolve_compat_data",
+                  return_value=unrelated_compatdata):
+        try:
+            executor._operations.inputs.process_request_factory(plan)
+        except ValueError as exc:
+            assert "does not belong" in str(exc)
+        else:
+            raise AssertionError("Unrelated compatdata root was accepted")
 
     wrong = SimpleNamespace(
         proton_script=runner, tool_identity="wrong-proton", prefix_runtime="11.0-100")

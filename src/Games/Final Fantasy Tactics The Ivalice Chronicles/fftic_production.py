@@ -57,6 +57,19 @@ def _canonical_directory(value, label: str) -> Path:
     return resolved
 
 
+def _canonical_steam_client_root(value) -> Path:
+    """Resolve Steam's standard client alias, then validate its real target."""
+    if value is None:
+        raise ValueError(
+            "The Steam client root for selected Proton is unavailable")
+    try:
+        resolved = Path(value).absolute().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            "The Steam client root for selected Proton is unavailable") from exc
+    return _canonical_directory(resolved, "Steam client root")
+
+
 def _prerequisite_is_sufficient(plan, prefix: Path) -> bool:
     current = inspect_prefix_prerequisites(prefix)
     return any(
@@ -160,9 +173,7 @@ def create_production_executor(
                 raise ValueError("The selected Proton script is not canonical")
             from Utils.launchers.steam import find_steam_root_for_proton_script
             steam_root = find_steam_root_for_proton_script(runner)
-            if steam_root is None:
-                raise ValueError("The Steam client root for selected Proton is unavailable")
-            steam_root = _canonical_directory(steam_root, "Steam client root")
+            steam_root = _canonical_steam_client_root(steam_root)
             from Utils.wine.prefix import resolve_compat_data
             compatdata = Path(resolve_compat_data(prefix)).absolute()
             if compatdata.is_symlink() or not compatdata.is_dir():

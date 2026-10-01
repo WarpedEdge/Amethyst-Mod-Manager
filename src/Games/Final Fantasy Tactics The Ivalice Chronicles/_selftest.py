@@ -109,11 +109,30 @@ def test_collision_safe_discovery_imports() -> None:
     for name, sentinel in _GENERIC_MODULE_SENTINELS.items():
         assert sys.modules[name] is sentinel
     try:
-        from Utils.games.discovery import discover_games, get_load_failures
-        games = discover_games()
-        assert "Final Fantasy Tactics: The Ivalice Chronicles" in games
+        from Utils.games import discovery
+        loaded_paths = []
+        original_loader = discovery.importlib.util.spec_from_file_location
+
+        def record_loader(name, location, *args, **kwargs):
+            loaded_paths.append(Path(location).as_posix())
+            return original_loader(name, location, *args, **kwargs)
+
+        with patch.object(
+                discovery.importlib.util, "spec_from_file_location",
+                side_effect=record_loader):
+            games = discovery.discover_games()
+        fftic_games = [
+            game for game in games.values()
+            if getattr(game, "game_id", None)
+            == "final_fantasy_tactics_the_ivalice_chronicles"
+        ]
+        assert len(fftic_games) == 1
+        for excluded in (
+                "fftic_prerequisite_runner.py",
+                "_prerequisite_production_selftest.py"):
+            assert not any(path.endswith("/" + excluded) for path in loaded_paths)
         fftic_failures = [
-            failure for failure in get_load_failures()
+            failure for failure in discovery.get_load_failures()
             if "Final Fantasy Tactics The Ivalice Chronicles" in failure[0]
         ]
         assert not fftic_failures, fftic_failures
