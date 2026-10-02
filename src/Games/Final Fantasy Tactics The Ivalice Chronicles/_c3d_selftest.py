@@ -303,7 +303,9 @@ def test_production_request_binds_exact_proton_prefix_and_steam_context() -> Non
 
     missing_alias = fixture.root / "alias/missing-root"
     missing_alias.symlink_to(fixture.root / "missing-steam", target_is_directory=True)
-    with patch("Utils.launchers.steam.find_steam_root_for_proton_script",
+    with patch("fftic_production.resolve_proton_selection",
+               return_value=selection), \
+            patch("Utils.launchers.steam.find_steam_root_for_proton_script",
                return_value=missing_alias):
         try:
             executor._operations.inputs.process_request_factory(plan)
@@ -314,7 +316,9 @@ def test_production_request_binds_exact_proton_prefix_and_steam_context() -> Non
 
     unrelated_compatdata = fixture.root / "other-compatdata"
     unrelated_compatdata.mkdir()
-    with patch("Utils.launchers.steam.find_steam_root_for_proton_script",
+    with patch("fftic_production.resolve_proton_selection",
+               return_value=selection), \
+            patch("Utils.launchers.steam.find_steam_root_for_proton_script",
                return_value=steam_alias), \
             patch("Utils.wine.prefix.resolve_compat_data",
                   return_value=unrelated_compatdata):
@@ -546,6 +550,75 @@ def test_setup_confirmation_keeps_steam_manual_and_shared_runtimes() -> None:
     assert "never edit Steam configuration" in _FFTIC_SETUP_CONFIRMATION
 
 
+def test_post_launch_focus_is_distinct_from_read_only_recheck() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from gui_qt.app import MainWindow
+    from gui_qt.fftic_status import FfticStatusPanel
+
+    app = QApplication.instance() or QApplication([])
+    calls = []
+    host = SimpleNamespace(_refresh_fftic_status=lambda **kw: calls.append(kw))
+    MainWindow._on_fftic_application_state_changed(host, Qt.ApplicationInactive)
+    assert calls == []
+    MainWindow._on_fftic_application_state_changed(host, Qt.ApplicationActive)
+    assert calls == [{"auto_reconcile": True}]
+
+    panel = FfticStatusPanel()
+    panel.recheck_requested.connect(lambda: calls.append({"read_only": True}))
+    panel._recheck.click()
+    assert calls[-1] == {"read_only": True}
+    assert "without changing files" in panel._recheck.toolTip()
+    panel.close()
+    app.processEvents()
+
+
+def test_automatic_status_ready_attempts_once_after_failure() -> None:
+    from gui_qt.app import MainWindow
+
+    planned = []
+    started = []
+    shown = []
+    notices = []
+    refreshed = []
+    plan = object()
+    controller = SimpleNamespace(plan=lambda kind: (planned.append(kind), plan)[1])
+    panel = SimpleNamespace(set_status=lambda model: shown.append(model))
+    host = SimpleNamespace(
+        _fftic_status_gen=7, _fftic_status=panel,
+        _fftic_status_cancel=object(), _fftic_status_controller=controller,
+        _fftic_operation_active=False, _fftic_operation_cancel=None,
+        _fftic_refresh_pending=False, _fftic_auto_operation=False,
+        _fftic_auto_attempted=set(),
+        _execute_fftic_plan=lambda selected, selected_plan:
+            started.append((selected, selected_plan)),
+        _notify=lambda message, level: notices.append((message, level)),
+        _append_log=lambda message: None,
+        _refresh_fftic_status=lambda: refreshed.append(True),
+        tr=lambda message: message,
+    )
+    model = SimpleNamespace(error=None)
+
+    MainWindow._on_fftic_status_ready(host, 7, (model, "completed-log-hash"))
+    assert planned == [OperationKind.RECONCILE_RUNTIME_OUTPUT]
+    assert started == [(controller, plan)]
+    assert host._fftic_auto_attempted == {"completed-log-hash"}
+    assert host._fftic_auto_operation
+
+    MainWindow._on_fftic_operation_ready(host, 7, None, RuntimeError("synthetic failure"))
+    assert not host._fftic_auto_operation
+    assert notices == [(
+        "Could not save FFTIC launch results. Check that FFTIC is closed, "
+        "then open FFTIC status and use Confirm runtime output.", "error")]
+    assert refreshed == [True]
+
+    MainWindow._on_fftic_status_ready(host, 7, (model, "completed-log-hash"))
+    assert planned == [OperationKind.RECONCILE_RUNTIME_OUTPUT]
+    assert started == [(controller, plan)]
+    assert shown == [model, model]
+
+
 def main() -> None:
     tests = (
         test_composition_derives_owned_paths_and_delays_acquisition,
@@ -559,6 +632,8 @@ def main() -> None:
         test_reconciliation_is_narrowly_gated_from_genuine_recovery,
         test_panel_enables_only_current_actions,
         test_setup_confirmation_keeps_steam_manual_and_shared_runtimes,
+        test_post_launch_focus_is_distinct_from_read_only_recheck,
+        test_automatic_status_ready_attempts_once_after_failure,
     )
     for test in tests:
         test()

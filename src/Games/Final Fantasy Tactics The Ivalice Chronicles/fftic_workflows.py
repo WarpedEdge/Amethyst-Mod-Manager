@@ -1052,6 +1052,54 @@ class FfticLifecycleComposition:
             baseline=baseline, required_mod_ids=required)
         return supplied + ((observed,) if observed is not None else ())
 
+    def automatic_reconciliation_ready(self) -> str | None:
+        """Read-only gate for the ordinary, completed, enabled-mod launch."""
+        if self.inputs.process_running is None:
+            return None
+        try:
+            if self.inputs.process_running():
+                return None
+            receipt = read_receipt(self.inputs.receipts_root)
+            if (receipt is None or receipt.data["schema_version"] < 2
+                    or receipt.data["generated_pac_observations"]
+                    or not any(item["enabled"] for item in receipt.data["user_packages"])):
+                return None
+            self._validate_receipt_context(receipt)
+            current_users = [{
+                "mod_id": mod.mod_id, "enabled": mod.enabled,
+                "priority": mod.amethyst_priority,
+                "classification": mod.classification.value,
+                "content_identity": manifest_digest(content_manifest(mod.package_location)),
+            } for mod in read_profile_mods(self.inputs.profile_dir, self.inputs.staging_root)]
+            if current_users != receipt.data["user_packages"]:
+                return None
+            baseline = baseline_set_from_receipt(receipt.data["generated_pac_baseline"])
+            matching = next((item for item in self._dynamic_pac_evidence(receipt)
+                             if all((item.generation_id == baseline.generation_id,
+                                     item.profile_fingerprint == baseline.profile_fingerprint,
+                                     item.transaction_id == baseline.transaction_id,
+                                     item.activation_id == baseline.activation_id,
+                                     item.compatibility_fingerprint == baseline.compatibility_fingerprint))), None)
+            if matching is None:
+                return None
+            paths = {item.relative_path: item for item in baseline.paths}
+            if len(paths) != 4:
+                return None
+            output_modes = set()
+            for relative, before in paths.items():
+                target = self._receipt_pac_path(relative)
+                if not os.path.lexists(target):
+                    continue
+                if (target.is_symlink() or not target.is_file()
+                        or before.state not in {PacOwnershipState.ABSENT,
+                                                PacOwnershipState.OWNED_EXACT}):
+                    return None
+                output_modes.add(relative.split("/")[1])
+            return (matching.log_sha256 if len(output_modes) == 1
+                    and not self.inputs.process_running() else None)
+        except Exception:
+            return None
+
     def _verify_legacy_reconciliation_context(self, receipt: Receipt, root: Path,
                                               manifest_hash: str) -> None:
         """Correlate every non-normalized input before replacing a legacy generation."""

@@ -73,6 +73,7 @@ class FfticStatusPanel(QFrame):
         self._recheck = QPushButton(self.tr("Recheck"))
         self._recheck.setObjectName("FormButton")
         self._recheck.setCursor(Qt.PointingHandCursor)
+        self._recheck.setToolTip(self.tr("Read current FFTIC status without changing files."))
         self._recheck.clicked.connect(self._request_recheck_or_cancel)
         bar.addWidget(self._recheck)
         outer.addWidget(head)

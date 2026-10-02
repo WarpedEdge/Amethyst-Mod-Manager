@@ -592,6 +592,8 @@ class MainWindow(QMainWindow):
         self._fftic_operation_active = False
         self._fftic_operation_cancel = None
         self._fftic_refresh_pending = False
+        self._fftic_auto_attempted = set()
+        self._fftic_auto_operation = False
         # Deploy/restore state + notification host.
         self._deploy_running = False
         self._deploy_rerun_pending = False
@@ -20612,7 +20614,13 @@ class MainWindow(QMainWindow):
             return None
         return InspectionContext(game, self._gs.profile or "", profile_dir, staging)
 
-    def _refresh_fftic_status(self):
+    def _on_fftic_application_state_changed(self, state):
+        # Returning from Steam/game is the post-launch lifecycle point. Recheck
+        # remains a read-only status action and never requests this path.
+        if state == Qt.ApplicationActive:
+            self._refresh_fftic_status(auto_reconcile=True)
+
+    def _refresh_fftic_status(self, *, auto_reconcile=False):
         panel = getattr(self, "_fftic_status", None)
         if panel is None or self._fftic_status_closing:
             return
@@ -20659,7 +20667,9 @@ class MainWindow(QMainWindow):
             except InspectionCancelled:
                 return
             if not cancel.is_set():
-                safe_emit(ready_signal, generation, model)
+                evidence_key = (controller.automatic_reconciliation_ready()
+                                if auto_reconcile and not model.error else None)
+                safe_emit(ready_signal, generation, (model, evidence_key))
 
         self._fftic_status_jobs.submit(worker)
 
@@ -20680,10 +20690,23 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "_fftic_status", None)
         if panel is None:
             return
+        model, evidence_key = model if isinstance(model, tuple) else (model, None)
         self._fftic_status_cancel = None
         panel.set_status(model)
         if model.error:
             self._append_log(f"FFTIC status error: {model.error}")
+        if (evidence_key and not self._fftic_operation_active
+                and evidence_key not in self._fftic_auto_attempted):
+            try:
+                from fftic_orchestration import OperationKind
+                plan = self._fftic_status_controller.plan(
+                    OperationKind.RECONCILE_RUNTIME_OUTPUT)
+            except Exception as exc:
+                self._append_log(f"FFTIC completed-launch check changed: {exc}")
+                return
+            self._fftic_auto_attempted.add(evidence_key)
+            self._fftic_auto_operation = True
+            self._execute_fftic_plan(self._fftic_status_controller, plan)
 
     def _on_fftic_status_progress(self, generation: int, update):
         if generation != self._fftic_status_gen:
@@ -20713,7 +20736,9 @@ class MainWindow(QMainWindow):
         generation = self._fftic_status_gen
         panel = getattr(self, "_fftic_status", None)
         if panel is not None:
-            panel.set_operation(True, self.tr("Starting the confirmed FFTIC operation…"))
+            panel.set_operation(True, self.tr(
+                "Saving verified launch results…" if self._fftic_auto_operation
+                else "Starting the confirmed FFTIC operation…"))
 
         def worker():
             result = None
@@ -20735,14 +20760,21 @@ class MainWindow(QMainWindow):
         self._fftic_operation_active = False
         self._fftic_operation_cancel = None
         self._fftic_refresh_pending = False
+        automatic = self._fftic_auto_operation
+        self._fftic_auto_operation = False
         if error is None:
-            self._notify(self.tr("FFTIC operation completed and was verified."), "info")
+            self._notify(self.tr(
+                "FFTIC launch results saved." if automatic
+                else "FFTIC operation completed and was verified."), "info")
         else:
             from fftic_managed_executor import ManagedOperationCancelled
             if isinstance(error, ManagedOperationCancelled):
                 self._notify(self.tr("FFTIC operation cancelled at a safe boundary."), "warning")
             else:
-                self._notify(self.tr("FFTIC operation failed: {0}").format(error), "error")
+                self._notify(self.tr(
+                    "Could not save FFTIC launch results. Check that FFTIC is closed, "
+                    "then open FFTIC status and use Confirm runtime output." if automatic else
+                    "FFTIC operation failed: {0}").format(error), "error")
                 self._append_log(f"FFTIC operation failed: {error}")
         self._refresh_fftic_status()
 
@@ -21720,6 +21752,8 @@ class MainWindow(QMainWindow):
         self._framework_banner = FrameworkBanner()
         from gui_qt.fftic_status import FfticStatusPanel
         self._fftic_status = FfticStatusPanel()
+        QApplication.instance().applicationStateChanged.connect(
+            self._on_fftic_application_state_changed)
         self._fftic_status.recheck_requested.connect(self._refresh_fftic_status)
         self._fftic_status.cancel_requested.connect(self._cancel_fftic_operation)
         self._fftic_status.action_requested.connect(self._present_fftic_action)

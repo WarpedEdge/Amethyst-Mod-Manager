@@ -822,7 +822,8 @@ class DefaultStatusInspector:
             StatusSeverity.WARNING if reconciliation_state != "Ready" else StatusSeverity.READY,
             ("Confirm the recoverable managed-runtime reconciliation plan."
              if normalization_pending else
-             "Confirm adoption of only the baseline-correlated generated PAC transition."
+             "Amethyst saves completed launch results when it regains focus and can "
+             "verify them. If this remains pending, use Confirm runtime output."
              if pac_confirmation_pending else
              "No pending managed runtime output requires confirmation."))
 
@@ -848,7 +849,8 @@ class DefaultStatusInspector:
             recovery_state, recovery_severity,
             ("Preserve the managed files and review the diagnostics before retrying."
              if recovery_required else
-             "A known post-launch transition is awaiting explicit confirmation."
+             "Launch results are waiting to be saved. Return to Amethyst after "
+             "closing the game, or use Confirm runtime output."
              if normalization_pending or pac_confirmation_pending else
              "A prerequisite-only attempt left no managed FFTIC state; Setup can be retried."
              if journal_retry else "No incomplete managed operation is recorded."),
@@ -940,6 +942,15 @@ class FfticOrchestrator:
     def mutation_available(self) -> bool:
         return bool(self._executor is not None and
                     getattr(self._executor, "authorized", False) is True)
+
+    def automatic_reconciliation_ready(self) -> str | None:
+        status = self.last_status
+        probe = getattr(self._executor, "automatic_reconciliation_ready", None)
+        if (status and status.mutation_available
+                and OperationKind.RECONCILE_RUNTIME_OUTPUT.value in status.available_actions
+                and callable(probe)):
+            return probe()
+        return None
 
     @property
     def last_status(self) -> FfticStatusViewModel | None:

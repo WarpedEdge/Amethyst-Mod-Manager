@@ -723,6 +723,7 @@ def test_runtime_output_confirmation_uses_bound_log_and_baseline() -> None:
     ))
     (log_root / "wrong.txt").write_text("\n".join(wrong_lines), encoding="utf-8")
     receipt_before = (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes()
+    assert not fixture.composition.automatic_reconciliation_ready()
     try:
         fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
     except WorkflowError as exc:
@@ -744,8 +745,10 @@ def test_runtime_output_confirmation_uses_bound_log_and_baseline() -> None:
         "[fftivc.utility.modloader] Game successfully loaded modded pack.",
     ))
     (log_root / "matching.txt").write_text("\n".join(lines), encoding="utf-8")
+    assert fixture.composition.automatic_reconciliation_ready()
 
     fixture.recompose(process_running=lambda: True)
+    assert not fixture.composition.automatic_reconciliation_ready()
     try:
         fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
     except WorkflowError as exc:
@@ -754,8 +757,39 @@ def test_runtime_output_confirmation_uses_bound_log_and_baseline() -> None:
         raise AssertionError("Runtime reconciliation ran while FFTIC was reported active")
     assert target.read_bytes() == b"managed runtime output"
     fixture.recompose(process_running=lambda: False)
+    (fixture.profile / "modlist.txt").write_text(
+        "-High\n+Low\n-Disabled\n", encoding="utf-8")
+    assert not fixture.composition.automatic_reconciliation_ready()
+    (fixture.profile / "modlist.txt").write_text(
+        "+High\n+Low\n-Disabled\n", encoding="utf-8")
+    assert fixture.composition.automatic_reconciliation_ready()
+
+    unrelated = fixture.game / "data/classic/modded.pac"
+    unrelated.parent.mkdir(parents=True, exist_ok=True)
+    unrelated.write_bytes(b"unrelated output")
+    assert not fixture.composition.automatic_reconciliation_ready()
+    unrelated.unlink()
+    unrelated.symlink_to(target)
+    assert not fixture.composition.automatic_reconciliation_ready()
+    unrelated.unlink()
+
+    original = _owned_state(fixture)
+    def fail_after_adoption(name, kind):
+        if name == "final-verifier" and kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
+            raise RuntimeError("injected after adoption")
+    fixture.recompose(failure_injector=fail_after_adoption, process_running=lambda: False)
+    assert fixture.composition.automatic_reconciliation_ready()
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Injected reconciliation failure succeeded")
+    assert _owned_state(fixture) == original
+    fixture.recompose(failure_injector=None, process_running=lambda: False)
 
     fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    assert not fixture.composition.automatic_reconciliation_ready()
     adopted = read_receipt(fixture.inputs.receipts_root)
     observations = adopted.data["generated_pac_observations"]
     assert len(observations) == 1
@@ -959,6 +993,7 @@ def test_all_disabled_absent_pac_confirmation_and_lifecycle() -> None:
         return fixture, payloads
 
     fixture, payloads = absent_fixture("all-disabled-absent")
+    assert not fixture.composition.automatic_reconciliation_ready()
     original = _owned_state(fixture)
     receipt = read_receipt(fixture.inputs.receipts_root)
     assert receipt.data["generated_pac_observations"] == []

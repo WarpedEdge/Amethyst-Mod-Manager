@@ -446,6 +446,9 @@ class ManagedLifecycleExecutor:
 
     authorized = True
 
+    def automatic_reconciliation_ready(self) -> str | None:
+        return self._operations.automatic_reconciliation_ready()
+
     def __init__(self, operations: LifecycleOperations,
                  *, coordinator: MutationCoordinator = MUTATION_COORDINATOR) -> None:
         self._operations = operations
