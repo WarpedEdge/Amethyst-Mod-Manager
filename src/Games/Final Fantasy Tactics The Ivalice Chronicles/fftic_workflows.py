@@ -14,7 +14,7 @@ import os
 import shutil
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -28,8 +28,8 @@ try:
     )
     from .fftic_generation import (
         MANAGED_ARTIFACTS, GenerationResult, build_private_generation,
-        read_profile_mods,
-        verify_private_generation,
+        content_manifest, manifest_digest, read_profile_mods,
+        verify_legacy_reloaded_normalization, verify_private_generation,
     )
     from .fftic_managed_executor import (
         LifecycleStep, ManagedOperationCancelled, ManagedOperationError, OperationResult,
@@ -38,13 +38,18 @@ try:
         RecoveryState, StagedLifecycleOperations,
     )
     from .fftic_orchestration import OperationKind, OperationPlan
-    from .fftic_pac import PacLaunchEvidence, PacObservation, PacOwnershipState, pac_ownership
+    from .fftic_pac import (
+        PacLaunchEvidence, PacObservation, PacOwnershipState,
+        baseline_set_from_receipt, capture_generated_pacs, capture_pac_baseline,
+        inspect_matching_launch_log,
+        pac_ownership,
+    )
     from .fftic_prerequisites import (
         PrefixPrerequisites,
         PrerequisiteState, plan_installer,
     )
     from .fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
+        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER, profile_fingerprint,
         verify_launch_readiness,
     )
     from .fftic_receipts import (
@@ -68,8 +73,8 @@ except ImportError:
     )
     from fftic_generation import (
         MANAGED_ARTIFACTS, GenerationResult, build_private_generation,
-        read_profile_mods,
-        verify_private_generation,
+        content_manifest, manifest_digest, read_profile_mods,
+        verify_legacy_reloaded_normalization, verify_private_generation,
     )
     from fftic_managed_executor import (
         LifecycleStep, ManagedOperationCancelled, ManagedOperationError, OperationResult,
@@ -78,13 +83,18 @@ except ImportError:
         RecoveryState, StagedLifecycleOperations,
     )
     from fftic_orchestration import OperationKind, OperationPlan
-    from fftic_pac import PacLaunchEvidence, PacObservation, PacOwnershipState, pac_ownership
+    from fftic_pac import (
+        PacLaunchEvidence, PacObservation, PacOwnershipState,
+        baseline_set_from_receipt, capture_generated_pacs, capture_pac_baseline,
+        inspect_matching_launch_log,
+        pac_ownership,
+    )
     from fftic_prerequisites import (
         PrefixPrerequisites,
         PrerequisiteState, plan_installer,
     )
     from fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
+        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER, profile_fingerprint,
         verify_launch_readiness,
     )
     from fftic_receipts import (
@@ -163,6 +173,7 @@ class WorkflowInputs:
     setup_candidates: ReviewedCandidateSet | None = None
     artifact_acquirer: Callable[[object], ReviewedCandidateSet] | None = None
     pac_launch_evidence: tuple[PacLaunchEvidence, ...] = ()
+    process_running: Callable[[], bool] | None = None
     failure_injector: Callable[[str, OperationKind], None] | None = None
 
 
@@ -183,6 +194,8 @@ class _Baseline:
     cleanup_moves: list[tuple[Path, Path]] | None = None
     transaction_backups: list[tuple[Path, str]] | None = None
     mutated_files: set[Path] | None = None
+    activation_id: str | None = None
+    pac_backup_files: dict[Path, bytes | None] | None = None
 
 
 class FfticLifecycleComposition:
@@ -421,6 +434,12 @@ class FfticLifecycleComposition:
                                    "Receipt backup path", kind="file")
         for item in data["generated_pac_observations"]:
             self._receipt_pac_path(item["relative_path"])
+        if data["schema_version"] >= 2:
+            for item in data["generated_pac_baseline"]["paths"]:
+                self._receipt_pac_path(item["relative_path"])
+                if item["backup_path"] is not None:
+                    self._bounded_path(item["backup_path"], self.inputs.backup_root,
+                                       "PAC baseline backup", kind="file")
 
     def _prepare(self, plan: OperationPlan, kind: OperationKind) -> _Baseline:
         if plan.kind != kind:
@@ -446,6 +465,7 @@ class FfticLifecycleComposition:
         baseline.quarantine_moves = []
         baseline.cleanup_moves = []
         baseline.mutated_files = set()
+        baseline.pac_backup_files = {}
         current_receipt = read_receipt(self.inputs.receipts_root)
         if current_receipt is not None:
             self._validate_receipt_context(current_receipt)
@@ -455,6 +475,13 @@ class FfticLifecycleComposition:
                     self._receipt_pac_path(item["relative_path"]))
                 for item in current_receipt.data["generated_pac_observations"]
             }
+            if kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
+                baseline.pac_files = {
+                    relative: self._read_optional(self._receipt_pac_path(relative))
+                    for relative in (
+                        "data/classic/modded.pac", "data/classic/modded.en.pac",
+                        "data/enhanced/modded.pac", "data/enhanced/modded.en.pac")
+                }
             for record in (*current_receipt.data["owned_game_targets"],
                            *current_receipt.data["prefix_owned_configuration"]):
                 if record["backup_path"] is not None:
@@ -462,6 +489,13 @@ class FfticLifecycleComposition:
                         record["backup_path"], self.inputs.backup_root,
                         "Receipt backup path", kind="file")
                     baseline.backup_files[backup] = self._read_optional(backup)
+            if current_receipt.data["schema_version"] >= 2:
+                for item in current_receipt.data["generated_pac_baseline"]["paths"]:
+                    if item["backup_path"] is not None:
+                        backup = self._bounded_path(
+                            item["backup_path"], self.inputs.backup_root,
+                            "PAC baseline backup", kind="file")
+                        baseline.pac_backup_files[backup] = self._read_optional(backup)
         self._operation_token = baseline
         return baseline
 
@@ -480,7 +514,20 @@ class FfticLifecycleComposition:
             raise ManagedOperationCancelled(
                 "FFTIC lifecycle operation cancelled at a durable boundary")
 
+    def _ensure_stopped(self) -> None:
+        if self.inputs.process_running is None:
+            return
+        try:
+            running = self.inputs.process_running()
+        except Exception as exc:
+            raise WorkflowError(
+                "Could not verify that FFTIC, Proton, Wine, and Reloaded are stopped") from exc
+        if running:
+            raise WorkflowError(
+                "Close FFTIC and related Proton/Wine processes before this operation")
+
     def _apply(self, token: _Baseline, cancel) -> None:
+        self._ensure_stopped()
         if token.kind == OperationKind.SETUP:
             self._setup(token, cancel)
         elif token.kind == OperationKind.REPAIR:
@@ -494,6 +541,8 @@ class FfticLifecycleComposition:
                 "for profile-only changes")
         elif token.kind == OperationKind.REMOVE:
             self._remove(token, cancel)
+        elif token.kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
+            self._reconcile_runtime_output(token, cancel)
         else:
             raise WorkflowError(f"Unsupported lifecycle operation {token.kind.value}")
 
@@ -536,6 +585,7 @@ class FfticLifecycleComposition:
 
     def _build(self, token: _Baseline, cancel,
                candidates: ReviewedCandidateSet | None) -> tuple[GenerationResult, dict[str, Path]]:
+        self._ensure_stopped()
         required = {*MANAGED_ARTIFACTS.values(), "reloaded-ii"}
         paths = self._candidate_paths(candidates, required_ids=required)
         trees = self._verified_trees(paths, cancel)
@@ -617,6 +667,7 @@ class FfticLifecycleComposition:
         return FfticTransactionExecutor(
             allowed_roots=roots,
             lock_path=self.inputs.backup_root / "fftic-transaction.lock",
+            process_running=self.inputs.process_running,
             journal=self.journal)
 
     def _bootstrap_sources(self, generation: GenerationResult) -> tuple[Path, Path]:
@@ -692,10 +743,13 @@ class FfticLifecycleComposition:
         generated.unlink()
 
     def _activate(self, token: _Baseline, generation: GenerationResult) -> None:
+        self._ensure_stopped()
+        activation_id = f"activate-{uuid.uuid4().hex}"
         activate_generation(
             self.inputs.active_state_file, generation.generation_id, generation.root,
-            journal=self.journal, transaction_id=f"activate-{uuid.uuid4().hex}",
+            journal=self.journal, transaction_id=activation_id,
             previous_generation=generation.previous_generation)
+        token.activation_id = activation_id
         token.mutated_files.add(self.inputs.active_state_file)
         self._inject("activation", token.kind)
 
@@ -744,9 +798,69 @@ class FfticLifecycleComposition:
             prefix=self.inputs.prefix, host_generation_root=generation.root))
         bootstrap_hash = hashlib.sha256(bootstrap_bytes).hexdigest()
         app_hashes = manifest["configuration"]["hashes"]
+        compatibility_tuple = {
+            "steam_build": "24304444", "ui_version": "v1.5.2",
+            "proton_runner": runner,
+            "reloaded": "1.31.0", "sigscan": "1.2.14",
+            "shared_hooks": "1.16.3", "nenkai": "1.7.3",
+        }
+        transaction_id = f"fftic-{uuid.uuid4().hex}"
+        current_users = [{
+            "mod_id": item["mod_id"], "enabled": item["enabled"],
+            "priority": item["priority"], "classification": item["classification"],
+            "content_identity": item["content_manifest_sha256"],
+        } for item in manifest["user_packages"]]
+        prior_observations = tuple(
+            PacObservation(**item) for item in (old["generated_pac_observations"] if old else ()))
+        pac_baseline = capture_pac_baseline(
+            self.inputs.game_root, prior_observations=prior_observations)
+        activation_id = self._operation_token.activation_id if self._operation_token else None
+        if operation == "repair" and old and old.get("generated_pac_baseline"):
+            baseline_data = old["generated_pac_baseline"]
+            generated_observations = old["generated_pac_observations"]
+        else:
+            if not activation_id:
+                raise WorkflowError("PAC baseline lacks the generation activation identity")
+            baseline_paths = []
+            for item in pac_baseline:
+                backup_path = None
+                if item.state == PacOwnershipState.OWNED_EXACT:
+                    source = self.inputs.game_root / item.relative_path
+                    backup = (self.inputs.backup_root / "pac-baselines" /
+                              activation_id / item.relative_path.replace("/", "_"))
+                    if os.path.lexists(backup):
+                        raise WorkflowError(f"PAC baseline backup target is occupied: {backup}")
+                    self._ensure_stopped()
+                    self._atomic_copy(source, backup, item.sha256)
+                    if self._operation_token is not None:
+                        self._operation_token.pac_backup_files[backup] = None
+                        self._operation_token.mutated_files.add(backup)
+                    backup_path = str(backup)
+                baseline_paths.append({
+                    "relative_path": item.relative_path,
+                    "state": item.state.value,
+                    "sha256": item.sha256,
+                    "backup_path": backup_path,
+                })
+            baseline_data = {
+                "generation_id": generation.generation_id,
+                "profile_fingerprint": profile_fingerprint(current_users),
+                "activation_id": activation_id,
+                "transaction_id": transaction_id,
+                "compatibility_fingerprint": hashlib.sha256(json.dumps(
+                    compatibility_tuple, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")).hexdigest(),
+                "paths": baseline_paths,
+                "prior_log_hashes": sorted({
+                    file_sha256(path) for path in (
+                        self.inputs.prefix / "drive_c/users/steamuser/AppData/Roaming/"
+                        "Reloaded-Mod-Loader-II/Logs").glob("*.txt")
+                    if path.is_file() and not path.is_symlink()}),
+            }
+            generated_observations = []
         data = {
-            "schema_version": 1,
-            "transaction_id": f"fftic-{uuid.uuid4().hex}",
+            "schema_version": 2,
+            "transaction_id": transaction_id,
             "created_at": old["created_at"] if old else now,
             "updated_at": now,
             "steam_app_id": "1004640",
@@ -758,12 +872,7 @@ class FfticLifecycleComposition:
                                 "runner_identity": runner},
             "executable_hashes": dict(installation.detection.executable_hashes),
             "evidence_authority": installation.authority,
-            "compatibility_tuple": {
-                "steam_build": "24304444", "ui_version": "v1.5.2",
-                "proton_runner": runner,
-                "reloaded": "1.31.0", "sigscan": "1.2.14",
-                "shared_hooks": "1.16.3", "nenkai": "1.7.3",
-            },
+            "compatibility_tuple": compatibility_tuple,
             "active_generation_identity": {
                 "generation_id": generation.generation_id,
                 "root": str(generation.root.resolve()),
@@ -785,11 +894,7 @@ class FfticLifecycleComposition:
                 "classic_app": app_hashes["Apps/fft_classic.exe/AppConfig.json"],
                 "enhanced_app": app_hashes["Apps/fft_enhanced.exe/AppConfig.json"],
             },
-            "user_packages": [{
-                "mod_id": item["mod_id"], "enabled": item["enabled"],
-                "priority": item["priority"], "classification": item["classification"],
-                "content_identity": item["content_manifest_sha256"],
-            } for item in manifest["user_packages"]],
+            "user_packages": current_users,
             "owned_game_targets": [
                 ownership("version.dll", INTERNAL_FILES["version-dll"].sha256),
                 ownership("Reloaded.Mod.Loader.Bootstrapper.asi",
@@ -808,7 +913,8 @@ class FfticLifecycleComposition:
                 "observed_sha256": hashlib.sha256(
                     steam_options.original.encode("utf-8")).hexdigest(),
             },
-            "generated_pac_observations": old["generated_pac_observations"] if old else [],
+            "generated_pac_baseline": baseline_data,
+            "generated_pac_observations": generated_observations,
             "last_successful_operation": operation,
             "incomplete_operation": None,
             "recovery_instructions": [
@@ -818,6 +924,7 @@ class FfticLifecycleComposition:
 
     def _write_receipt(self, token: _Baseline, generation: GenerationResult,
                        operation: str) -> None:
+        self._ensure_stopped()
         old = read_receipt(self.inputs.receipts_root)
         write_receipt(self.inputs.receipts_root,
                       self._receipt_data(generation, operation, old))
@@ -920,6 +1027,151 @@ class FfticLifecycleComposition:
         self._cancelled(cancel)
         self._write_receipt(token, generation, operation)
 
+    def _dynamic_pac_evidence(self, receipt: Receipt) -> tuple[PacLaunchEvidence, ...]:
+        supplied = tuple(self.inputs.pac_launch_evidence)
+        if receipt.data["schema_version"] < 2:
+            return supplied
+        baseline = baseline_set_from_receipt(receipt.data["generated_pac_baseline"])
+        required = tuple(item["mod_id"] for item in receipt.data["managed_packages"])
+        required += tuple(item["mod_id"] for item in receipt.data["user_packages"]
+                          if item["enabled"])
+        observed = inspect_matching_launch_log(
+            self.inputs.prefix / "drive_c/users/steamuser/AppData/Roaming/"
+            "Reloaded-Mod-Loader-II/Logs",
+            baseline=baseline, required_mod_ids=required)
+        return supplied + ((observed,) if observed is not None else ())
+
+    def _verify_legacy_reconciliation_context(self, receipt: Receipt, root: Path,
+                                              manifest_hash: str) -> None:
+        """Correlate every non-normalized input before replacing a legacy generation."""
+        installation, verified = self._readiness()
+        required = (
+            verified.artifacts, verified.prefix, verified.prerequisites,
+            verified.bootstrap, verified.steam_options, verified.recovery,
+        )
+        fixture_ok = (
+            installation.authority.startswith("isolated-fixture:")
+            and verified.attested and verified.game == ReadinessAspect.INVALID)
+        production_ok = (
+            installation.authority == "reviewed-production"
+            and verified.attested and verified.game == ReadinessAspect.READY)
+        if not ((fixture_ok or production_ok)
+                and all(item == ReadinessAspect.READY for item in required)):
+            raise WorkflowError(
+                "Legacy runtime reconciliation found unrelated readiness drift: "
+                + "; ".join(verified.issues))
+
+        generation = receipt.data["active_generation_identity"]
+        try:
+            state = json.loads(self.inputs.active_state_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkflowError("Legacy active-generation state is unreadable") from exc
+        expected_state_fields = {
+            "schema_version", "active_generation", "generation_root",
+            "previous_generation", "manifest_sha256",
+        }
+        if (not isinstance(state, dict) or set(state) != expected_state_fields
+                or state["schema_version"] != 1
+                or state["active_generation"] != generation["generation_id"]
+                or state["generation_root"] != str(root)
+                or state["manifest_sha256"] != manifest_hash):
+            raise WorkflowError("Legacy active-generation state differs from its receipt")
+
+        manifest = json.loads((root / "amethyst-generation.json").read_text(encoding="utf-8"))
+        artifacts = {item["artifact_id"]: item for item in manifest["artifact_inputs"]}
+        managed = {item["mod_id"]: item for item in receipt.data["managed_packages"]}
+        if any(managed[mod_id]["content_identity"] !=
+               artifacts[MANAGED_ARTIFACTS[mod_id]]["content_identity"]
+               for mod_id in MANAGED_ORDER):
+            raise WorkflowError("Legacy managed package identity differs from its receipt")
+
+        expected_users = [{
+            "mod_id": item["mod_id"], "enabled": item["enabled"],
+            "priority": item["priority"], "classification": item["classification"],
+            "content_identity": item["content_manifest_sha256"],
+        } for item in manifest["user_packages"]]
+        current_users = [{
+            "mod_id": mod.mod_id, "enabled": mod.enabled,
+            "priority": mod.amethyst_priority, "classification": mod.classification.value,
+            "content_identity": manifest_digest(content_manifest(mod.package_location)),
+        } for mod in read_profile_mods(self.inputs.profile_dir, self.inputs.staging_root)]
+        if expected_users != receipt.data["user_packages"] or current_users != expected_users:
+            raise WorkflowError("Legacy generation, receipt, and current profile differ")
+
+        steam = resolve_steam_s_path(
+            steam_library=self.inputs.steam_library, app_manifest=self.inputs.app_manifest,
+            game_root=self.inputs.game_root, prefix=self.inputs.prefix)
+        hashes = manifest["configuration"]["hashes"]
+        configured = receipt.data["configuration_hashes"]
+        if (manifest["configuration"]["windows_game_path"] != steam.windows_game_path.value
+                or hashes["Apps/fft_classic.exe/AppConfig.json"] != configured["classic_app"]
+                or hashes["Apps/fft_enhanced.exe/AppConfig.json"] != configured["enhanced_app"]):
+            raise WorkflowError("Legacy generated configuration differs from its receipt")
+
+    def _reconcile_runtime_output(self, token: _Baseline, cancel) -> None:
+        if self.inputs.process_running is None:
+            raise WorkflowError(
+                "Runtime reconciliation requires a process-state verifier")
+        self._ensure_stopped()
+        receipt = token.receipt_record
+        if receipt is None:
+            raise WorkflowError("Runtime reconciliation requires an ownership receipt")
+        generation = receipt.data["active_generation_identity"]
+        root = Path(generation["root"])
+        try:
+            verify_private_generation(root, generation["generation_id"])
+        except Exception:
+            manifest_hash = verify_legacy_reloaded_normalization(
+                root, generation["generation_id"])
+            if manifest_hash != generation["manifest_sha256"]:
+                raise WorkflowError("Legacy generation manifest differs from its receipt")
+            self._verify_legacy_reconciliation_context(receipt, root, manifest_hash)
+            for relative, payload in token.pac_files.items():
+                if payload is None:
+                    continue
+                target = self._receipt_pac_path(relative)
+                self._quarantine_file(
+                    token, target, hashlib.sha256(payload).hexdigest())
+                self._cancelled(cancel)
+            new_generation, _paths = self._build(token, cancel, None)
+            self._install_bootstrap(token, new_generation)
+            self._activate(token, new_generation)
+            self._write_receipt(token, new_generation, "reconcile-runtime-normalization")
+            return
+
+        if receipt.data["schema_version"] < 2:
+            raise WorkflowError(
+                "Legacy PAC state requires the recoverable rebuild reconciliation first")
+        baseline_data = receipt.data["generated_pac_baseline"]
+        baseline = baseline_set_from_receipt(baseline_data)
+        evidence = self._dynamic_pac_evidence(receipt)
+        matching = next((item for item in evidence if (
+            item.generation_id == baseline.generation_id
+            and item.profile_fingerprint == baseline.profile_fingerprint
+            and item.transaction_id == baseline.transaction_id
+            and item.activation_id == baseline.activation_id
+            and item.compatibility_fingerprint == baseline.compatibility_fingerprint)), None)
+        if matching is None:
+            raise WorkflowError("No completed matching managed launch log was verified")
+        observations = capture_generated_pacs(
+            self.inputs.game_root, baseline=baseline.paths, evidence=matching)
+        if not observations:
+            raise WorkflowError("No adoptable generated PAC transition is present")
+        adopted = {item.relative_path for item in observations}
+        for item in baseline.paths:
+            path = self.inputs.game_root / item.relative_path
+            if os.path.lexists(path) and item.relative_path not in adopted:
+                raise WorkflowError(
+                    f"Unknown or unrelated PAC transition is preserved: {item.relative_path}")
+        updated = dict(receipt.data)
+        updated.update(
+            transaction_id=f"fftic-{uuid.uuid4().hex}", updated_at=self._now(),
+            generated_pac_observations=[asdict(item) for item in observations],
+            last_successful_operation="confirm-runtime-output")
+        self._ensure_stopped()
+        write_receipt(self.inputs.receipts_root, validate_receipt(updated))
+        token.mutated_files.add(self.inputs.receipts_root / "fftic-receipt.json")
+
     def _quarantine_file(self, token: _Baseline, target: Path, digest: str,
                          *, cleanup: bool = False) -> None:
         quarantined = self._transaction().remove_exact_owned(
@@ -976,28 +1228,50 @@ class FfticLifecycleComposition:
             token, self.inputs.prefix / "drive_c" / config["relative_path"], config)
         self._inject("remove:prefix-configuration", token.kind)
         self._cancelled(cancel)
-        launch_evidence = {
-            (item.generation_id, item.profile_fingerprint, item.launch_id,
-             item.transaction_id) for item in self.inputs.pac_launch_evidence
-        }
+        baseline = (baseline_set_from_receipt(receipt.data["generated_pac_baseline"])
+                    if receipt.data["schema_version"] >= 2 else None)
+        observed_paths = set()
         for item in receipt.data["generated_pac_observations"]:
+            observed_paths.add(item["relative_path"])
             target = self._receipt_pac_path(item["relative_path"])
             observation = PacObservation(**item)
-            correlated = (
-                item["generation_id"], item["profile_fingerprint"],
-                item["launch_id"], item["transaction_id"]) in launch_evidence
             state = pac_ownership(
                 self.inputs.game_root, item["relative_path"], observation)
+            correlated = bool(
+                baseline is not None
+                and item["generation_id"] == baseline.generation_id
+                and item["profile_fingerprint"] == baseline.profile_fingerprint
+                and item["transaction_id"] == baseline.transaction_id)
             if correlated and state == PacOwnershipState.OWNED_EXACT:
                 self._quarantine_file(token, target, item["sha256"])
+                if item["before_state"] == PacOwnershipState.OWNED_EXACT.value:
+                    before = next(value for value in baseline.paths
+                                  if value.relative_path == item["relative_path"])
+                    backup = self._bounded_path(
+                        before.backup_path, self.inputs.backup_root,
+                        "PAC baseline backup", kind="file")
+                    self._atomic_copy(backup, target, item["before_sha256"])
+                    token.mutated_files.add(target)
             elif state == PacOwnershipState.OWNED_EXACT:
                 raise RecoveryRequiredError(
-                    f"Generated PAC lacks exact launch correlation: {item['relative_path']}")
+                    f"Generated PAC lacks exact receipt correlation: {item['relative_path']}")
             elif state in {PacOwnershipState.DRIFT, PacOwnershipState.UNKNOWN}:
                 raise RecoveryRequiredError(
                     f"Generated PAC drift is preserved for recovery: {item['relative_path']}")
             self._inject(f"remove:pac:{item['relative_path']}", token.kind)
             self._cancelled(cancel)
+        if baseline is not None:
+            for item in baseline.paths:
+                if (item.relative_path in observed_paths
+                        or item.state != PacOwnershipState.OWNED_EXACT):
+                    continue
+                target = self._receipt_pac_path(item.relative_path)
+                if (target.is_symlink() or not target.is_file()
+                        or file_sha256(target) != item.sha256):
+                    raise RecoveryRequiredError(
+                        f"Generated PAC drift is preserved for recovery: {item.relative_path}")
+                self._quarantine_file(token, target, item.sha256)
+                self._cancelled(cancel)
         generation = receipt.data["active_generation_identity"]
         generation_root = self._bounded_path(
             generation["root"], self.inputs.generations_root,
@@ -1017,6 +1291,10 @@ class FfticLifecycleComposition:
         self._verify_removed(token, receipt_present=True, backups_present=True)
         for backup, payload in (token.backup_files or {}).items():
             self._quarantine_file(token, backup, hashlib.sha256(payload).hexdigest())
+        for backup, payload in (token.pac_backup_files or {}).items():
+            if os.path.lexists(backup):
+                expected = file_sha256(backup) if payload is None else hashlib.sha256(payload).hexdigest()
+                self._quarantine_file(token, backup, expected)
         self._inject("remove:backups", token.kind)
         self._verify_removed(token, receipt_present=True, backups_present=False)
         self._inject("remove:before-receipt", token.kind)
@@ -1038,10 +1316,11 @@ class FfticLifecycleComposition:
             self._current_runner(), self.inputs.active_state_file,
             self.inputs.profile_dir, self.inputs.staging_root,
             self.inputs.prerequisite_reader(self.inputs.prefix),
-            self._current_steam_options(), self.inputs.pac_launch_evidence))
+            self._current_steam_options(), self._dynamic_pac_evidence(receipt)))
 
     def _assert_readiness(self, prefix: str, *, allow_profile_drift: bool = False,
-                          allow_pac_disposition: bool = False) -> None:
+                          allow_pac_disposition: bool = False,
+                          allow_unknown_setup_baseline: bool = False) -> None:
         installation, verified = self._readiness()
         states = (verified.artifacts, verified.generation, verified.prefix,
                   verified.prerequisites, verified.bootstrap, verified.steam_options,
@@ -1050,7 +1329,15 @@ class FfticLifecycleComposition:
                     and all(issue.startswith("PAC observation")
                             for issue in verified.issues
                             if not issue.startswith("Current installation evidence")))
-        profile_ok = (allow_profile_drift or pac_only
+        unknown_baseline_only = (
+            allow_unknown_setup_baseline and verified.issues
+            and all(issue.startswith((
+                "Unknown preexisting PAC is preserved",
+                "Current installation evidence does not match the receipt"))
+                    for issue in verified.issues)
+            and any(issue.startswith("Unknown preexisting PAC is preserved")
+                    for issue in verified.issues))
+        profile_ok = (allow_profile_drift or pac_only or unknown_baseline_only
                       or verified.profile == ReadinessAspect.READY)
         fixture_ok = (installation.authority.startswith("isolated-fixture:")
                       and verified.attested and verified.game == ReadinessAspect.INVALID
@@ -1067,14 +1354,18 @@ class FfticLifecycleComposition:
         if token.kind == OperationKind.REMOVE:
             self._verify_removed(token, receipt_present=False, backups_present=False)
         else:
-            self._assert_readiness("Final correlated readiness failed")
+            self._assert_readiness(
+                "Final correlated readiness failed",
+                allow_unknown_setup_baseline=token.kind == OperationKind.SETUP)
 
     def _final_verify(self, token: _Baseline) -> None:
         self._inject("final-verifier", token.kind)
         if token.kind == OperationKind.REMOVE:
             self._verify_removed(token, receipt_present=False, backups_present=False)
         else:
-            self._assert_readiness("Final correlated C2 verifier did not attest readiness")
+            self._assert_readiness(
+                "Final correlated C2 verifier did not attest readiness",
+                allow_unknown_setup_baseline=token.kind == OperationKind.SETUP)
 
     def _verify_removed(self, token: _Baseline, *, receipt_present: bool,
                         backups_present: bool) -> None:
@@ -1099,8 +1390,21 @@ class FfticLifecycleComposition:
                   or file_sha256(target) != expected):
                 raise WorkflowError(f"Preexisting target was not restored exactly: {target}")
         for item in prior.data["generated_pac_observations"]:
-            if os.path.lexists(self._receipt_pac_path(item["relative_path"])):
+            target = self._receipt_pac_path(item["relative_path"])
+            expected = item["before_sha256"] if item["before_state"] == "owned exact" else None
+            if expected is None and os.path.lexists(target):
                 raise WorkflowError(f"Receipt-owned PAC remains: {item['relative_path']}")
+            if expected is not None and (target.is_symlink() or not target.is_file()
+                                         or file_sha256(target) != expected):
+                raise WorkflowError(f"Prior PAC was not restored: {item['relative_path']}")
+        if prior.data["schema_version"] >= 2:
+            observed = {item["relative_path"] for item in
+                        prior.data["generated_pac_observations"]}
+            for item in prior.data["generated_pac_baseline"]["paths"]:
+                if item["state"] == "owned exact" and item["relative_path"] not in observed:
+                    if os.path.lexists(self._receipt_pac_path(item["relative_path"])):
+                        raise WorkflowError(
+                            f"Baseline-owned PAC remains: {item['relative_path']}")
         generation = self._bounded_path(
             prior.data["active_generation_identity"]["root"],
             self.inputs.generations_root, "Receipt generation root")
@@ -1109,12 +1413,16 @@ class FfticLifecycleComposition:
         for backup in (token.backup_files or {}):
             if os.path.lexists(backup) != backups_present:
                 raise WorkflowError("Long-term backup disposition is incorrect")
+        for backup in (token.pac_backup_files or {}):
+            if os.path.lexists(backup) != backups_present:
+                raise WorkflowError("PAC baseline backup disposition is incorrect")
         prerequisites = self.inputs.prerequisite_reader(self.inputs.prefix)
         if any(item.state != PrerequisiteState.SUFFICIENT
                for item in (prerequisites.dotnet_desktop, prerequisites.vc_runtime)):
             raise WorkflowError("Shared prerequisites were not retained")
 
     def _cleanup(self, token: _Baseline) -> None:
+        retained_pac_backups = set()
         if token.kind != OperationKind.REMOVE and token.receipt_record is not None:
             old = token.receipt_record.data["active_generation_identity"]
             current = read_receipt(self.inputs.receipts_root)
@@ -1127,8 +1435,22 @@ class FfticLifecycleComposition:
                 destination = self._transaction().quarantine_owned_generation(
                     generation_root=root, generation_id=old["generation_id"],
                     quarantine_root=self.inputs.quarantine_root,
-                    transaction_id=f"cleanup-generation-{uuid.uuid4().hex}")
+                    transaction_id=f"cleanup-generation-{uuid.uuid4().hex}",
+                    allow_legacy_normalization=(
+                        token.kind == OperationKind.RECONCILE_RUNTIME_OUTPUT))
                 token.cleanup_moves.append((root, destination))
+            if current.data["schema_version"] >= 2:
+                retained_pac_backups = {
+                    Path(item["backup_path"])
+                    for item in current.data["generated_pac_baseline"]["paths"]
+                    if item["backup_path"] is not None
+                }
+        for backup, payload in (token.pac_backup_files or {}).items():
+            if backup in retained_pac_backups or not os.path.lexists(backup):
+                continue
+            digest = (hashlib.sha256(payload).hexdigest()
+                      if payload is not None else file_sha256(backup))
+            self._quarantine_file(token, backup, digest, cleanup=True)
         for backup, digest in token.transaction_backups or ():
             if os.path.lexists(backup):
                 self._quarantine_file(token, backup, digest, cleanup=True)
@@ -1197,6 +1519,9 @@ class FfticLifecycleComposition:
         for backup, payload in (token.backup_files or {}).items():
             if backup in token.mutated_files:
                 self._atomic_restore(backup, payload)
+        for backup, payload in (token.pac_backup_files or {}).items():
+            if backup in token.mutated_files:
+                self._atomic_restore(backup, payload)
         for backup, _digest in token.transaction_backups or ():
             if backup not in (token.backup_files or {}) and os.path.lexists(backup):
                 self._atomic_restore(backup, None)
@@ -1239,6 +1564,9 @@ class FfticLifecycleComposition:
         for backup, payload in (token.backup_files or {}).items():
             if self._read_optional(backup) != payload:
                 raise WorkflowError(f"Backup rollback did not restore {backup}")
+        for backup, payload in (token.pac_backup_files or {}).items():
+            if self._read_optional(backup) != payload:
+                raise WorkflowError(f"PAC backup rollback did not restore {backup}")
         current = ({item.name for item in self.inputs.generations_root.iterdir()
                     if item.is_dir() and not item.is_symlink()}
                    if self.inputs.generations_root.exists() else set())
@@ -1256,3 +1584,5 @@ class FfticLifecycleComposition:
     def synchronize(self, plan, cancel, progress): return self._run("synchronize", plan, cancel, progress)
     def update(self, plan, cancel, progress): return self._run("update", plan, cancel, progress)
     def remove(self, plan, cancel, progress): return self._run("remove", plan, cancel, progress)
+    def reconcile_runtime_output(self, plan, cancel, progress):
+        return self._run("reconcile_runtime_output", plan, cancel, progress)

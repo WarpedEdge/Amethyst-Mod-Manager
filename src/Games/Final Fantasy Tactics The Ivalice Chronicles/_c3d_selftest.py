@@ -457,6 +457,40 @@ def test_repair_gating_covers_every_managed_component() -> None:
         assert OperationKind.REPAIR.value in actions, missing_key
 
 
+def test_reconciliation_is_narrowly_gated_from_genuine_recovery() -> None:
+    foundation = tuple(
+        _row(key, "Configured" if key == "steam_options" else
+             "Runtime output confirmation required" if key == "recovery" else "Ready")
+        for key in ("game", "steam_prefix", "runner", "dotnet", "vc",
+                    "steam_options", "recovery", "profile"))
+    legacy_components = tuple(
+        _row(key, "Runtime reconciliation required")
+        for key in ("runtime", "nenkai", "sigscan", "hooks"))
+    protected = tuple(_row(key) for key in ("bootstrap", "prefix_config"))
+    pending = foundation + legacy_components + protected + (
+        _row("reconciliation", "Runtime rebuild required"),)
+    actions, _reasons = _action_availability(
+        pending, receipt_present=True, verification=None, unsupported=())
+    assert actions == (OperationKind.RECONCILE_RUNTIME_OUTPUT.value,)
+
+    output_pending = foundation + tuple(
+        _row(key) for key in (
+            "runtime", "nenkai", "sigscan", "hooks", "bootstrap", "prefix_config")) + (
+        _row("reconciliation", "Runtime output confirmation required"),)
+    actions, _reasons = _action_availability(
+        output_pending, receipt_present=True, verification=None, unsupported=())
+    assert actions == (OperationKind.RECONCILE_RUNTIME_OUTPUT.value,)
+
+    conflict = tuple(_row(
+        row.key, "Recovery required" if row.key == "recovery" else
+        "Conflict" if row.key == "bootstrap" else row.state)
+        for row in pending)
+    actions, _reasons = _action_availability(
+        conflict, receipt_present=True, verification=None, unsupported=())
+    assert OperationKind.RECONCILE_RUNTIME_OUTPUT.value not in actions
+    assert OperationKind.SETUP.value not in actions
+
+
 def test_panel_enables_only_current_actions() -> None:
     from PySide6.QtWidgets import QApplication
     from gui_qt.fftic_status import FfticStatusPanel
@@ -473,6 +507,7 @@ def test_panel_enables_only_current_actions() -> None:
     assert not panel._action_buttons["synchronize"].isEnabled()
     assert not panel._action_buttons["update"].isEnabled()
     assert not panel._action_buttons["remove"].isEnabled()
+    assert not panel._action_buttons["reconcile_runtime_output"].isEnabled()
     assert "blocked update" in panel._action_buttons["update"].toolTip()
     panel.set_operation(True)
     assert not any(button.isEnabled() for button in panel._action_buttons.values())
@@ -501,6 +536,7 @@ def main() -> None:
         test_host_unavailable_does_not_block_noninstaller_actions,
         test_retryable_and_genuine_recovery_journal_status,
         test_repair_gating_covers_every_managed_component,
+        test_reconciliation_is_narrowly_gated_from_genuine_recovery,
         test_panel_enables_only_current_actions,
         test_setup_confirmation_keeps_steam_manual_and_shared_runtimes,
     )

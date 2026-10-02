@@ -16,9 +16,11 @@ try:
     from .fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
-    from .fftic_generation import verify_private_generation
+    from .fftic_generation import (
+        verify_legacy_reloaded_normalization, verify_private_generation,
+    )
     from .fftic_packages import PackageClassification, inspect_package
-    from .fftic_pac import PacLaunchEvidence
+    from .fftic_pac import baseline_set_from_receipt, inspect_matching_launch_log
     from .fftic_prerequisites import (
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
@@ -38,9 +40,11 @@ except ImportError:
     from fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
-    from fftic_generation import verify_private_generation
+    from fftic_generation import (
+        verify_legacy_reloaded_normalization, verify_private_generation,
+    )
     from fftic_packages import PackageClassification, inspect_package
-    from fftic_pac import PacLaunchEvidence
+    from fftic_pac import baseline_set_from_receipt, inspect_matching_launch_log
     from fftic_prerequisites import (
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
@@ -76,6 +80,7 @@ class OperationKind(str, Enum):
     SYNCHRONIZE = "synchronize"
     UPDATE = "update"
     REMOVE = "remove"
+    RECONCILE_RUNTIME_OUTPUT = "reconcile_runtime_output"
 
 
 @dataclass(frozen=True)
@@ -258,6 +263,29 @@ def _action_availability(
     no_unsupported = not unsupported
     actions: list[str] = []
 
+    reconciliation = by_key.get("reconciliation")
+    reconciliation_state = reconciliation.state if reconciliation is not None else ""
+    expected_component_state = (
+        "Runtime reconciliation required"
+        if reconciliation_state == "Runtime rebuild required" else
+        "Ready" if reconciliation_state == "Runtime output confirmation required" else "")
+    protected_reconciliation_state = bool(
+        receipt_present and no_unsupported and expected_component_state
+        and all(by_key.get(key) is not None and by_key[key].state == state
+                for key, state in (
+                    ("game", "Ready"), ("steam_prefix", "Ready"),
+                    ("runner", "Ready"), ("dotnet", "Ready"), ("vc", "Ready"),
+                    ("steam_options", "Configured"), ("bootstrap", "Ready"),
+                    ("prefix_config", "Ready"), ("profile", "Ready"),
+                    ("recovery", "Runtime output confirmation required")))
+        and all(by_key.get(key) is not None
+                and by_key[key].state == expected_component_state
+                for key in ("runtime", "nenkai", "sigscan", "hooks")))
+    if protected_reconciliation_state:
+        actions.append(OperationKind.RECONCILE_RUNTIME_OUTPUT.value)
+        reasons[OperationKind.RECONCILE_RUNTIME_OUTPUT.value] = ""
+        return tuple(actions), tuple((kind.value, reasons[kind.value]) for kind in OperationKind)
+
     if not prerequisites_setup_safe:
         reasons[OperationKind.SETUP.value] = _PREREQUISITE_RUNNER_BLOCKER
         reasons[OperationKind.REPAIR.value] = _PREREQUISITE_RUNNER_BLOCKER
@@ -294,7 +322,10 @@ def _action_availability(
             verification.prefix, verification.prerequisites, verification.bootstrap,
             verification.steam_options, verification.recovery,
         )
-        if (receipt_present and no_unsupported
+        profile_reconcilable = not any(issue.startswith((
+            "PAC ", "Unknown preexisting PAC"))
+            for issue in getattr(verification, "issues", ()))
+        if (receipt_present and no_unsupported and profile_reconcilable
                 and all(value == ReadinessAspect.READY for value in protected)
                 and verification.profile != ReadinessAspect.READY):
             actions.append(OperationKind.SYNCHRONIZE.value)
@@ -580,7 +611,7 @@ class DefaultStatusInspector:
             "hooks": ARTIFACTS["shared-hooks"].version,
         }
         for key, label in (("runtime", "Reloaded-II runtime generation"),
-                           ("nenkai", "Nenkai loader"),
+                           ("nenkai", "FFT: The Ivalice Chronicles Mod Loader"),
                            ("sigscan", "SigScan"),
                            ("hooks", "Shared Hooks")):
             component_rows[key] = _row(
@@ -591,6 +622,7 @@ class DefaultStatusInspector:
         generation_id = ""
         generation_root = None
         generation_error = ""
+        normalization_pending = False
         if active_state is not None and os.path.lexists(active_state):
             try:
                 self._cancelled(cancel)
@@ -602,7 +634,7 @@ class DefaultStatusInspector:
                 if digest != data["manifest_sha256"]:
                     raise ValueError("active generation manifest identity differs")
                 for key, label in (("runtime", "Reloaded-II runtime generation"),
-                                   ("nenkai", "Nenkai loader"),
+                                   ("nenkai", "FFT: The Ivalice Chronicles Mod Loader"),
                                    ("sigscan", "SigScan"),
                                    ("hooks", "Shared Hooks")):
                     component_rows[key] = _row(
@@ -613,11 +645,26 @@ class DefaultStatusInspector:
             except InspectionCancelled:
                 raise
             except Exception as exc:
-                generation_error = str(exc)
-                component_rows["runtime"] = _row(
-                    "runtime", "Reloaded-II runtime generation", "Conflict",
-                    StatusSeverity.ERROR, "The active generation is incomplete or changed.",
-                    generation_error)
+                try:
+                    digest = verify_legacy_reloaded_normalization(
+                        generation_root, generation_id)
+                    if digest != data["manifest_sha256"]:
+                        raise ValueError("active generation manifest identity differs")
+                    normalization_pending = True
+                    for key, label in (("runtime", "Reloaded-II runtime generation"),
+                                       ("nenkai", "FFT: The Ivalice Chronicles Mod Loader"),
+                                       ("sigscan", "SigScan"),
+                                       ("hooks", "Shared Hooks")):
+                        component_rows[key] = _row(
+                            key, label, "Runtime reconciliation required",
+                            StatusSeverity.WARNING,
+                            "Reloaded performed the exact known three-file metadata normalization.")
+                except Exception:
+                    generation_error = str(exc)
+                    component_rows["runtime"] = _row(
+                        "runtime", "Reloaded-II runtime generation", "Conflict",
+                        StatusSeverity.ERROR, "The active generation is incomplete or changed.",
+                        generation_error)
 
         def owned_file_row(key, label, path, pin_id):
             self._cancelled(cancel)
@@ -681,10 +728,20 @@ class DefaultStatusInspector:
                 and active_state is not None):
             try:
                 self._cancelled(cancel)
-                pac_evidence = tuple(PacLaunchEvidence(
-                    item["generation_id"], item["profile_fingerprint"],
-                    item["launch_id"], item["transaction_id"])
-                    for item in receipt.data["generated_pac_observations"])
+                pac_evidence = ()
+                if receipt.data["schema_version"] >= 2:
+                    baseline = baseline_set_from_receipt(
+                        receipt.data["generated_pac_baseline"])
+                    log_root = (prefix / "drive_c/users/steamuser/AppData/Roaming/"
+                                "Reloaded-Mod-Loader-II/Logs")
+                    required_ids = tuple(
+                        item["mod_id"] for item in receipt.data["managed_packages"])
+                    required_ids += tuple(
+                        item["mod_id"] for item in receipt.data["user_packages"]
+                        if item["enabled"])
+                    launch = inspect_matching_launch_log(
+                        log_root, baseline=baseline, required_mod_ids=required_ids)
+                    pac_evidence = (launch,) if launch is not None else ()
                 verification = verify_launch_readiness(ReadinessEvidence(
                     receipt, installation, steam_path, manifest, runner,
                     active_state, context.profile_dir, context.staging_root,
@@ -739,8 +796,14 @@ class DefaultStatusInspector:
                 prefix_config_row = rejected(
                     prefix_config_row,
                     "The prefix bootstrap configuration is not verifier-attested.")
-        profile_ready = bool(verification and verification.attested and
-                             verification.profile == ReadinessAspect.READY and not unsupported)
+        pac_confirmation_pending = bool(
+            verification and verification.issues
+            and all(issue.startswith("PAC runtime output confirmation required")
+                    for issue in verification.issues))
+        profile_ready = bool(
+            verification and verification.attested and not unsupported
+            and (verification.profile == ReadinessAspect.READY
+                 or pac_confirmation_pending))
         profile_row = _row(
             "profile", "Active Amethyst profile synchronization",
             "Ready" if profile_ready else "Unsupported" if unsupported else
@@ -749,6 +812,18 @@ class DefaultStatusInspector:
             ("The active profile and staged content match the managed generation."
              if profile_ready else "The current profile is not verifier-attested as synchronized."),
             *((verification.issues if verification else ())))
+
+        reconciliation_state = (
+            "Runtime rebuild required" if normalization_pending else
+            "Runtime output confirmation required" if pac_confirmation_pending else "Ready")
+        reconciliation_row = _row(
+            "reconciliation", "Post-launch runtime reconciliation", reconciliation_state,
+            StatusSeverity.WARNING if reconciliation_state != "Ready" else StatusSeverity.READY,
+            ("Confirm the recoverable managed-runtime reconciliation plan."
+             if normalization_pending else
+             "Confirm adoption of only the baseline-correlated generated PAC transition."
+             if pac_confirmation_pending else
+             "No pending managed runtime output requires confirmation."))
 
         journal_requires_recovery, journal_retry, journal_error = (
             _journal_recovery_status(root))
@@ -759,8 +834,12 @@ class DefaultStatusInspector:
             (verification and verification.recovery != ReadinessAspect.READY) or
             journal_requires_recovery)
         recovery_state = ("Recovery required" if recovery_required else
+                          "Runtime output confirmation required"
+                          if normalization_pending or pac_confirmation_pending else
                           "Retry available" if journal_retry else "Ready")
         recovery_severity = (StatusSeverity.ERROR if recovery_required else
+                             StatusSeverity.WARNING
+                             if normalization_pending or pac_confirmation_pending else
                              StatusSeverity.WARNING if journal_retry else
                              StatusSeverity.READY)
         recovery_row = _row(
@@ -768,17 +847,26 @@ class DefaultStatusInspector:
             recovery_state, recovery_severity,
             ("Preserve the managed files and review the diagnostics before retrying."
              if recovery_required else
+             "A known post-launch transition is awaiting explicit confirmation."
+             if normalization_pending or pac_confirmation_pending else
              "A prerequisite-only attempt left no managed FFTIC state; Setup can be retried."
              if journal_retry else "No incomplete managed operation is recorded."),
             receipt_error, generation_error, journal_error, journal_retry,
             *((receipt.data.get("recovery_instructions", ()) if receipt else ())))
 
         ready = bool(verification and verification.ready and not unsupported)
+        launch_pending = normalization_pending or pac_confirmation_pending
         launch_row = _row(
-            "launch", "Launch readiness", "Ready" if ready else "Setup required",
-            StatusSeverity.READY if ready else StatusSeverity.ERROR,
+            "launch", "Launch readiness", "Ready" if ready else
+            "Runtime output confirmation required" if launch_pending else
+            "Managed support needs attention" if receipt is not None else "Setup required",
+            StatusSeverity.READY if ready else
+            StatusSeverity.WARNING if launch_pending else StatusSeverity.ERROR,
             ("Verifier-attested readiness passed. Start FFTIC normally from Steam."
-             if ready else "Managed launch is blocked until every required state is verified."),
+             if ready else
+             "The managed installation exists; confirm the exact pending runtime transition."
+             if launch_pending else
+             "Managed launch is blocked until every required state is verified."),
             *((verification.issues if verification else
                ("No complete correlated ownership receipt is available.",))))
 
@@ -787,7 +875,7 @@ class DefaultStatusInspector:
             component_rows["runtime"], component_rows["nenkai"],
             component_rows["sigscan"], component_rows["hooks"],
             *prerequisite_rows, bootstrap_row, prefix_config_row, profile_row,
-            steam_row, recovery_row, launch_row, unsupported_row,
+            steam_row, reconciliation_row, recovery_row, launch_row, unsupported_row,
         )
         host_available, host_reason = prerequisite_host_capability(probe=False)
         available_actions, action_reasons = _action_availability(
@@ -952,6 +1040,11 @@ class FfticOrchestrator:
                 OperationStep(
                     "managed support", "restore receipt-owned files and retain shared runtimes",
                     "FFTIC game and prefix"),),
+            OperationKind.RECONCILE_RUNTIME_OUTPUT: (
+                OperationStep(
+                    "post-launch runtime output",
+                    "verify exact normalization/log/PAC evidence and reconcile recoverably",
+                    "active FFTIC generation and known generated PAC paths"),),
         }
         if status.unsupported_packages and kind in {
                 OperationKind.SETUP, OperationKind.SYNCHRONIZE}:

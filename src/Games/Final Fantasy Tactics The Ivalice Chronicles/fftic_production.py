@@ -128,6 +128,19 @@ def create_production_executor(
                     steam_build=build, pe_version=_pe_version(game_root)),
                 "reviewed-production")
 
+        def managed_processes_running():
+            from Utils.processes.game import matching_pids, prefix_markers
+            markers = prefix_markers(prefix)
+            markers.extend((
+                "SteamAppId=1004640", "SteamGameId=1004640",
+                "STEAM_COMPAT_APP_ID=1004640",
+            ))
+            matches = matching_pids(markers)
+            if matches is None:
+                raise ValueError(
+                    "Could not verify that FFTIC, Proton, Wine, and Reloaded are stopped")
+            return bool(matches)
+
         def acquire_reviewed(cancel):
             prerequisites = inspect_prefix_prerequisites(prefix)
             prerequisite_health = {
@@ -237,6 +250,7 @@ def create_production_executor(
             process_runner=FfticPrerequisiteRunner(),
             setup_candidates=None,
             artifact_acquirer=acquire_reviewed,
+            process_running=managed_processes_running,
         )
         lifecycle = FfticLifecycleComposition(
             inputs, plan_validator=plan_validator)

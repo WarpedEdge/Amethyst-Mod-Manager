@@ -46,6 +46,7 @@ from fftic_extraction import (  # noqa: E402
 )
 from fftic_generation import (  # noqa: E402
     MANAGED_ARTIFACTS, GenerationError, build_private_generation, content_manifest, manifest_digest,
+    is_exact_reloaded_semantic_transition, normalized_managed_mod_config,
     read_profile_mods, verify_private_generation,
 )
 from fftic_lifecycle import LifecycleState, compose_lifecycle_status  # noqa: E402
@@ -449,6 +450,38 @@ def test_generation_and_profile_sync() -> None:
     assert verify_private_generation(first.root, first.generation_id) == first.manifest_sha256
     assert (first.root / "portable.txt").is_file()
     assert not (first.root / "ReloadedPortable.txt").exists()
+    serializer_defaults = {
+        "fftivc.utility.modloader": {},
+        "Reloaded.Memory.SigScan.ReloadedII": {
+            "Tags": [], "IgnoreRegexes": [".*\\.json"],
+            "IncludeRegexes": ["\\.deps\\.json", "\\.runtimeconfig\\.json", "ModConfig\\.json"],
+        },
+        "reloaded.sharedlib.hooks": {
+            "Tags": [], "IgnoreRegexes": [".*\\.json"],
+            "IncludeRegexes": ["\\.deps\\.json", "\\.runtimeconfig\\.json", "ModConfig\\.json"],
+            "ProjectUrl": "",
+        },
+    }
+    for identity, artifact_id in MANAGED_ARTIFACTS.items():
+        original_bytes = (verified_inputs[artifact_id].root / "ModConfig.json").read_bytes()
+        original = json.loads(original_bytes)
+        stable_bytes = (first.root / "Mods" / identity / "ModConfig.json").read_bytes()
+        stable = json.loads(stable_bytes)
+        assert stable["CanUnload"] is False and stable["HasExports"] is True
+        assert stable == json.loads(normalized_managed_mod_config(original_bytes, identity))
+        legacy = dict(original)
+        legacy.update(CanUnload=False, HasExports=True)
+        for key, value in serializer_defaults[identity].items():
+            legacy.setdefault(key, value)
+        legacy_bytes = json.dumps(legacy).encode()
+        assert is_exact_reloaded_semantic_transition(
+            original_bytes, legacy_bytes, identity)
+        wrong = dict(legacy, HasExports=False)
+        assert not is_exact_reloaded_semantic_transition(
+            original_bytes, json.dumps(wrong).encode(), identity)
+        extra = dict(legacy, UnexpectedField=True)
+        assert not is_exact_reloaded_semantic_transition(
+            original_bytes, json.dumps(extra).encode(), identity)
     enhanced = json.loads((first.root / "Apps" / ENHANCED_APP_ID / "AppConfig.json").read_text())
     assert enhanced["EnabledMods"][-2:] == ["test.low", "test.high"]
     assert "test.disabled" not in enhanced["EnabledMods"]
@@ -1280,7 +1313,9 @@ def test_pac_prerequisites_and_lifecycle() -> None:
     pac.parent.mkdir(parents=True, exist_ok=True)
     pac.write_bytes(b"generated")
     assert pac_ownership(game, "data/enhanced/modded.pac", None) == PacOwnershipState.UNKNOWN
-    evidence = PacLaunchEvidence("generation", "profile", "launch-1", "transaction-1")
+    evidence = PacLaunchEvidence(
+        "generation", "profile", "launch-1", "transaction-1",
+        "activation-1", "a" * 64, "b" * 64)
     preexisting = capture_pac_baseline(game)
     assert not capture_generated_pacs(game, baseline=preexisting, evidence=evidence)
     pac.unlink()
@@ -1293,7 +1328,9 @@ def test_pac_prerequisites_and_lifecycle() -> None:
     pac.write_bytes(b"regenerated")
     replaced = capture_generated_pacs(
         game, baseline=owned_baseline,
-        evidence=PacLaunchEvidence("generation-2", "profile-2", "launch-2", "transaction-2"))
+        evidence=PacLaunchEvidence(
+            "generation-2", "profile-2", "launch-2", "transaction-2",
+            "activation-2", "c" * 64, "d" * 64))
     assert len(replaced) == 1 and replaced[0].before_state == PacOwnershipState.OWNED_EXACT.value
     pac.write_bytes(b"drift")
     assert pac_ownership(game, replaced[0].relative_path, replaced[0]) == PacOwnershipState.DRIFT

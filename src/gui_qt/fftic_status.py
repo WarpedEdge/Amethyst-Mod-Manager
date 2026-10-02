@@ -95,6 +95,7 @@ class FfticStatusPanel(QFrame):
             ("synchronize", self.tr("Synchronize profile")),
             ("update", self.tr("Update managed runtime")),
             ("remove", self.tr("Remove managed support")),
+            ("reconcile_runtime_output", self.tr("Confirm runtime output")),
         )):
             button = QPushButton(label)
             button.setObjectName("FormButton")

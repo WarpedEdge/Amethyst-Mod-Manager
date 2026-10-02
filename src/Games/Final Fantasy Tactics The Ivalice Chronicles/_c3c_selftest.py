@@ -28,7 +28,7 @@ from fftic_prerequisites import (
     classify_prerequisite,
 )
 from fftic_pac import PacLaunchEvidence
-from fftic_readiness import SUPPORTED_PROTON_RUNNER, profile_fingerprint
+from fftic_readiness import ReadinessAspect, SUPPORTED_PROTON_RUNNER, profile_fingerprint
 from fftic_receipts import (
     PREFIX_CONFIGURATION_PATH, read_receipt, serialize_receipt,
 )
@@ -237,6 +237,15 @@ def test_complete_setup_repair_synchronize_update_and_remove() -> None:
     assert result.state == OperationState.SUCCEEDED
     receipt = read_receipt(fixture.inputs.receipts_root)
     assert receipt is not None
+    assert receipt.data["schema_version"] == 2
+    pac_baseline = receipt.data["generated_pac_baseline"]
+    assert pac_baseline["generation_id"] == receipt.data["active_generation_identity"]["generation_id"]
+    assert pac_baseline["profile_fingerprint"] == profile_fingerprint(
+        receipt.data["user_packages"])
+    assert pac_baseline["activation_id"].startswith("activate-")
+    assert len(pac_baseline["paths"]) == 4
+    assert all(item["state"] == "absent" and item["sha256"] is None
+               and item["backup_path"] is None for item in pac_baseline["paths"])
     first_generation = receipt.data["active_generation_identity"]["generation_id"]
     generation_root = Path(receipt.data["active_generation_identity"]["root"])
     enhanced = json.loads((generation_root / f"Apps/{ENHANCED_APP_ID}/AppConfig.json").read_text())
@@ -635,7 +644,11 @@ def _add_pac(fixture: Fixture, *, present: bool, correlated: bool,
     receipt = read_receipt(fixture.inputs.receipts_root)
     generation = receipt.data["active_generation_identity"]["generation_id"]
     fingerprint = profile_fingerprint(receipt.data["user_packages"])
-    evidence = PacLaunchEvidence(generation, fingerprint, "launch", "pac-transaction")
+    baseline = receipt.data["generated_pac_baseline"]
+    launch_id = "a" * 64
+    evidence = PacLaunchEvidence(
+        generation, fingerprint, launch_id, baseline["transaction_id"],
+        baseline["activation_id"], baseline["compatibility_fingerprint"], launch_id)
     target = fixture.game / "data/classic/modded.pac"
     owned = b"owned generated pac"
     if present:
@@ -646,7 +659,7 @@ def _add_pac(fixture: Fixture, *, present: bool, correlated: bool,
             "relative_path": "data/classic/modded.pac",
             "sha256": hashlib.sha256(owned).hexdigest(),
             "generation_id": generation, "profile_fingerprint": fingerprint,
-            "launch_id": "launch", "transaction_id": "pac-transaction",
+            "launch_id": launch_id, "transaction_id": baseline["transaction_id"],
             "before_state": "absent", "before_sha256": None,
         }]))
     fixture.recompose(pac_launch_evidence=(evidence,) if correlated else ())
@@ -656,7 +669,7 @@ def _add_pac(fixture: Fixture, *, present: bool, correlated: bool,
 def test_pac_removal_dispositions() -> None:
     exact = Fixture("pac-exact")
     exact.run(OperationKind.SETUP)
-    target = _add_pac(exact, present=True, correlated=True)
+    target = _add_pac(exact, present=True, correlated=False)
     exact.run(OperationKind.REMOVE)
     assert not target.exists() and read_receipt(exact.inputs.receipts_root) is None
 
@@ -666,8 +679,7 @@ def test_pac_removal_dispositions() -> None:
     absent.run(OperationKind.REMOVE)
     assert read_receipt(absent.inputs.receipts_root) is None
 
-    for name, correlated, drift in (("uncorrelated", False, False),
-                                    ("drift", True, True)):
+    for name, correlated, drift in (("drift", True, True),):
         fixture = Fixture("pac-" + name)
         fixture.run(OperationKind.SETUP)
         target = _add_pac(fixture, present=True, correlated=correlated, drift=drift)
@@ -681,6 +693,188 @@ def test_pac_removal_dispositions() -> None:
             raise AssertionError(f"{name} PAC removal did not require recovery")
         assert target.read_bytes() == payload
         assert (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes() == receipt_before
+
+
+def test_runtime_output_confirmation_uses_bound_log_and_baseline() -> None:
+    fixture = Fixture("pac-confirm")
+    fixture.run(OperationKind.SETUP)
+    fixture.recompose(process_running=lambda: False)
+    receipt = read_receipt(fixture.inputs.receipts_root)
+    generation = receipt.data["active_generation_identity"]["generation_id"]
+    target = fixture.game / "data/enhanced/modded.pac"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"managed runtime output")
+    log_root = (fixture.prefix / "drive_c/users/steamuser/AppData/Roaming/"
+                "Reloaded-Mod-Loader-II/Logs")
+    log_root.mkdir(parents=True)
+    identities = [item["mod_id"] for item in receipt.data["managed_packages"]]
+    identities += [item["mod_id"] for item in receipt.data["user_packages"]
+                   if item["enabled"]]
+    wrong_lines = []
+    for identity in identities:
+        wrong_lines.extend((
+            f"[Reloaded] - AppId   : {identity}",
+            ("[Reloaded] - Location: C:\\Amethyst\\FFTIC\\generations\\"
+             f"wrong-generation\\Mods\\{identity}\\ModConfig.json"),
+        ))
+    wrong_lines.extend((
+        "[fftivc.utility.modloader] FFTIVC Mod loader initialized with 1 pack(s).",
+        "[fftivc.utility.modloader] Game successfully loaded modded pack.",
+    ))
+    (log_root / "wrong.txt").write_text("\n".join(wrong_lines), encoding="utf-8")
+    receipt_before = (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes()
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except WorkflowError as exc:
+        assert "matching managed launch log" in str(exc)
+    else:
+        raise AssertionError("Mismatched generation log adopted PAC output")
+    assert target.read_bytes() == b"managed runtime output"
+    assert (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes() == receipt_before
+
+    lines = []
+    for identity in identities:
+        lines.extend((
+            f"[Reloaded] - AppId   : {identity}",
+            ("[Reloaded] - Location: C:\\Amethyst\\FFTIC\\generations\\"
+             f"{generation}\\Mods\\{identity}\\ModConfig.json"),
+        ))
+    lines.extend((
+        "[fftivc.utility.modloader] FFTIVC Mod loader initialized with 1 pack(s).",
+        "[fftivc.utility.modloader] Game successfully loaded modded pack.",
+    ))
+    (log_root / "matching.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    fixture.recompose(process_running=lambda: True)
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except WorkflowError as exc:
+        assert "Close FFTIC" in str(exc)
+    else:
+        raise AssertionError("Runtime reconciliation ran while FFTIC was reported active")
+    assert target.read_bytes() == b"managed runtime output"
+    fixture.recompose(process_running=lambda: False)
+
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    adopted = read_receipt(fixture.inputs.receipts_root)
+    observations = adopted.data["generated_pac_observations"]
+    assert len(observations) == 1
+    assert observations[0]["relative_path"] == "data/enhanced/modded.pac"
+    assert observations[0]["before_state"] == "absent"
+    assert observations[0]["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+
+    _write_matching_log(fixture, adopted, "later-matching.txt")
+    (log_root / "matching.txt").unlink()
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+    fixture.composition._assert_readiness("Adopted PAC must remain ready after launch B")
+    for log in log_root.glob("*.txt"):
+        log.unlink()
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+    fixture.composition._assert_readiness("Adopted PAC must survive log rotation")
+
+    target.write_bytes(b"later drift")
+    try:
+        fixture.run(OperationKind.REMOVE)
+    except RecoveryRequiredError:
+        pass
+    else:
+        raise AssertionError("Drifted adopted PAC was removed")
+    assert target.read_bytes() == b"later drift"
+
+
+def test_unknown_preexisting_pac_is_persisted_and_blocks_removal() -> None:
+    fixture = Fixture("pac-unknown")
+    target = fixture.game / "data/enhanced/modded.en.pac"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"unknown preexisting bytes")
+    fixture.run(OperationKind.SETUP)
+    receipt = read_receipt(fixture.inputs.receipts_root)
+    record = next(item for item in receipt.data["generated_pac_baseline"]["paths"]
+                  if item["relative_path"] == "data/enhanced/modded.en.pac")
+    assert record["state"] == "unknown"
+    assert record["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert record["backup_path"] is None
+    try:
+        fixture.run(OperationKind.REMOVE)
+    except RecoveryRequiredError:
+        pass
+    else:
+        raise AssertionError("Unknown preexisting PAC did not block removal")
+    assert target.read_bytes() == b"unknown preexisting bytes"
+    assert read_receipt(fixture.inputs.receipts_root) is not None
+
+
+def _write_matching_log(fixture: Fixture, receipt, name: str) -> None:
+    generation = receipt.data["active_generation_identity"]["generation_id"]
+    identities = [item["mod_id"] for item in receipt.data["managed_packages"]]
+    identities += [item["mod_id"] for item in receipt.data["user_packages"]
+                   if item["enabled"]]
+    lines = []
+    for identity in identities:
+        lines.extend((
+            f"[Reloaded] - AppId   : {identity}",
+            ("[Reloaded] - Location: C:\\Amethyst\\FFTIC\\generations\\"
+             f"{generation}\\Mods\\{identity}\\ModConfig.json"),
+        ))
+    lines.extend((
+        "[fftivc.utility.modloader] FFTIVC Mod loader initialized with 1 pack(s).",
+        "[fftivc.utility.modloader] Game successfully loaded modded pack.",
+        f"[fixture] completed launch {name}",
+    ))
+    root = (fixture.prefix / "drive_c/users/steamuser/AppData/Roaming/"
+            "Reloaded-Mod-Loader-II/Logs")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_prior_exact_owned_pac_transition_restores_before_state() -> None:
+    fixture = Fixture("pac-prior-owned")
+    fixture.run(OperationKind.SETUP)
+    fixture.recompose(process_running=lambda: False)
+    target = fixture.game / "data/enhanced/modded.pac"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    before = b"first owned output"
+    target.write_bytes(before)
+    receipt = read_receipt(fixture.inputs.receipts_root)
+    _write_matching_log(fixture, receipt, "first.txt")
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+
+    (fixture.profile / "modlist.txt").write_text(
+        "-High\n+Low\n-Disabled\n", encoding="utf-8")
+    fixture.run(OperationKind.SYNCHRONIZE)
+    synchronized = read_receipt(fixture.inputs.receipts_root)
+    baseline = next(item for item in synchronized.data["generated_pac_baseline"]["paths"]
+                    if item["relative_path"] == "data/enhanced/modded.pac")
+    assert baseline["state"] == "owned exact"
+    assert baseline["sha256"] == hashlib.sha256(before).hexdigest()
+    assert Path(baseline["backup_path"]).read_bytes() == before
+
+    target.write_bytes(b"second owned output")
+    _write_matching_log(fixture, synchronized, "second.txt")
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    adopted = read_receipt(fixture.inputs.receipts_root)
+    observation = adopted.data["generated_pac_observations"][0]
+    assert observation["before_state"] == "owned exact"
+    assert observation["before_sha256"] == hashlib.sha256(before).hexdigest()
+    log_root = (fixture.prefix / "drive_c/users/steamuser/AppData/Roaming/"
+                "Reloaded-Mod-Loader-II/Logs")
+    _write_matching_log(fixture, adopted, "third.txt")
+    for log in log_root.glob("*.txt"):
+        if log.name != "third.txt":
+            log.unlink()
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+    fixture.composition._assert_readiness("Prior-owned PAC must remain removable")
+    for log in log_root.glob("*.txt"):
+        log.unlink()
+    fixture.run(OperationKind.REMOVE)
+    assert target.read_bytes() == before
+    assert read_receipt(fixture.inputs.receipts_root) is None
 
 
 def test_preexisting_backup_survives_failed_removal() -> None:
@@ -838,6 +1032,9 @@ def main() -> None:
         test_current_evidence_mutation_fails_closed,
         test_hostile_receipt_paths_never_touch_external_targets,
         test_pac_removal_dispositions,
+        test_runtime_output_confirmation_uses_bound_log_and_baseline,
+        test_unknown_preexisting_pac_is_persisted_and_blocks_removal,
+        test_prior_exact_owned_pac_transition_restores_before_state,
         test_preexisting_backup_survives_failed_removal,
         test_cleanup_and_cross_operation_failure_boundaries,
         test_removal_failure_boundaries_restore_exact_owned_state,

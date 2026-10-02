@@ -229,6 +229,7 @@ class LifecycleOperations(Protocol):
     def synchronize(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def update(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def remove(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
+    def reconcile_runtime_output(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
 
 
 @dataclass(frozen=True)
@@ -396,6 +397,9 @@ class StagedLifecycleOperations:
     def remove(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
 
+    def reconcile_runtime_output(self, plan, cancel, progress):
+        return self._run(plan, cancel, progress)
+
 
 class MutationCoordinator:
     """One writer or any number of readers, shared by status and mutations."""
@@ -466,6 +470,8 @@ class ManagedLifecycleExecutor:
                 OperationKind.SYNCHRONIZE: self._operations.synchronize,
                 OperationKind.UPDATE: self._operations.update,
                 OperationKind.REMOVE: self._operations.remove,
+                OperationKind.RECONCILE_RUNTIME_OUTPUT:
+                    self._operations.reconcile_runtime_output,
             }[plan.kind]
             if progress is not None:
                 progress(ProgressUpdate(0, max(1, len(plan.steps)),

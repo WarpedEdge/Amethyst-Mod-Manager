@@ -56,6 +56,36 @@ MANAGED_ARTIFACTS = {
     "reloaded.sharedlib.hooks": "shared-hooks",
     "fftivc.utility.modloader": "nenkai-loader",
 }
+MANAGED_MOD_CONFIG_VALUES = {
+    identity: {"CanUnload": False, "HasExports": True}
+    for identity in MANAGED_ARTIFACTS
+}
+_LEGACY_RELOADED_NORMALIZATION = {
+    "Mods/fftivc.utility.modloader/ModConfig.json": (
+        "c0fd45d11363e51da689845fb35bbd3675b1452bcb210cf2b8236aae39a2d90c",
+        "f46aad9d10995141ec3d5f298096fa25580b3e45c8a2ba9395f54e39e2d458c3",
+    ),
+    "Mods/Reloaded.Memory.SigScan.ReloadedII/ModConfig.json": (
+        "5105a83e54b339e07b16c2b59de08a133db12a813c825b492259517d773b463e",
+        "dee6033f306b279347054ca31deb2b6154e3ed9a2d4b11a5ad01234f520230b0",
+    ),
+    "Mods/reloaded.sharedlib.hooks/ModConfig.json": (
+        "a0204b7eaea3a0b1faa086ab38f349a014782d41f2608c9989cd0075fe74f4a1",
+        "ed086fa604a40472596638f549a541ed02b254f4b62afb33e88c371dee719cfd",
+    ),
+}
+_LEGACY_SERIALIZER_DEFAULTS = {
+    "fftivc.utility.modloader": {},
+    "Reloaded.Memory.SigScan.ReloadedII": {
+        "Tags": [], "IgnoreRegexes": [".*\\.json"],
+        "IncludeRegexes": ["\\.deps\\.json", "\\.runtimeconfig\\.json", "ModConfig\\.json"],
+    },
+    "reloaded.sharedlib.hooks": {
+        "Tags": [], "IgnoreRegexes": [".*\\.json"],
+        "IncludeRegexes": ["\\.deps\\.json", "\\.runtimeconfig\\.json", "ModConfig\\.json"],
+        "ProjectUrl": "",
+    },
+}
 MANIFEST_FIELDS = {
     "schema_version", "generation_id", "components", "compatibility_set",
     "artifact_inputs", "managed_packages", "user_packages", "configuration", "files",
@@ -174,6 +204,99 @@ def _managed_identity(package: Path) -> str:
     return identity
 
 
+def normalized_managed_mod_config(payload: bytes, expected_identity: str) -> bytes:
+    """Add only Reloaded's two deterministic managed export fields."""
+    if expected_identity not in MANAGED_MOD_CONFIG_VALUES:
+        raise GenerationError(f"Managed ModConfig normalization is not allowed for {expected_identity}")
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise GenerationError(f"Managed ModConfig is invalid for {expected_identity}: {exc}") from exc
+    if (not isinstance(data, dict) or data.get("ModId") != expected_identity):
+        raise GenerationError(f"Managed ModConfig identity differs for {expected_identity}")
+    for field, expected in MANAGED_MOD_CONFIG_VALUES[expected_identity].items():
+        if field in data and data[field] not in {None, expected}:
+            raise GenerationError(
+                f"Managed ModConfig {expected_identity} has unexpected {field}={data[field]!r}")
+        data[field] = expected
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def is_exact_reloaded_semantic_transition(before: bytes, after: bytes,
+                                           expected_identity: str) -> bool:
+    """Recognize only Reloaded 1.31.0's observed managed metadata transition."""
+    if expected_identity not in _LEGACY_SERIALIZER_DEFAULTS:
+        return False
+    try:
+        original = json.loads(before.decode("utf-8"))
+        observed = json.loads(after.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return False
+    if (not isinstance(original, dict) or not isinstance(observed, dict)
+            or original.get("ModId") != expected_identity):
+        return False
+    expected = dict(original)
+    if expected.get("CanUnload") is not None or expected.get("HasExports") is not None:
+        return False
+    expected.update(CanUnload=False, HasExports=True)
+    for key, value in _LEGACY_SERIALIZER_DEFAULTS[expected_identity].items():
+        if key not in expected:
+            expected[key] = value
+    return observed == expected
+
+
+def _normalized_artifact_input(evidence: VerifiedArtifactTree) -> dict:
+    files = [{"path": item.path, "size": item.size, "sha256": item.sha256}
+             for item in evidence.files]
+    managed = next((identity for identity, artifact_id in MANAGED_ARTIFACTS.items()
+                    if artifact_id == evidence.pin.artifact_id), None)
+    if managed is not None:
+        record = next((item for item in files if item["path"] == "ModConfig.json"), None)
+        if record is None:
+            raise GenerationError(f"Managed package {managed} lacks ModConfig.json evidence")
+        payload = normalized_managed_mod_config(
+            (evidence.root / "ModConfig.json").read_bytes(), managed)
+        record.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    return {
+        "artifact_id": evidence.pin.artifact_id,
+        "archive_size": evidence.pin.size,
+        "archive_sha256": evidence.pin.sha256,
+        "content_identity": _artifact_tree_digest(files),
+        "files": files,
+    }
+
+
+def verify_legacy_reloaded_normalization(root: Path,
+                                         expected_generation_id: str | None = None) -> str:
+    """Accept only the exact three-file normalization observed in production."""
+    root = Path(root)
+    manifest_path = root / "amethyst-generation.json"
+    if root.is_symlink() or not root.is_dir() or manifest_path.is_symlink():
+        raise GenerationError("Legacy generation root or manifest is missing or linked")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GenerationError(f"Legacy generation manifest is unreadable: {exc}") from exc
+    manifest = _exact_dict(manifest, MANIFEST_FIELDS, "manifest")
+    if (expected_generation_id is not None
+            and manifest.get("generation_id") != expected_generation_id):
+        raise GenerationError("Legacy generation identity differs")
+    expected = {item["path"]: item for item in _valid_file_records(manifest["files"])}
+    observed = {item["path"]: item for item in content_manifest(
+        root, exclude=("amethyst-generation.json",))}
+    if set(expected) != set(observed):
+        raise GenerationError("Legacy generation contains missing or added files")
+    changed = {path for path in expected if expected[path] != observed[path]}
+    if changed != set(_LEGACY_RELOADED_NORMALIZATION):
+        raise GenerationError("Generation drift is not the exact Reloaded normalization set")
+    for relative, (before_hash, after_hash) in _LEGACY_RELOADED_NORMALIZATION.items():
+        if (expected[relative]["sha256"] != before_hash
+                or observed[relative]["sha256"] != after_hash):
+            raise GenerationError(f"Unexpected Reloaded normalization at {relative}")
+    return verify_private_generation(
+        root, expected_generation_id, _allow_legacy_normalization=True)
+
+
 def generation_identity(*, artifact_inputs: tuple[dict, ...], user_records: tuple[dict, ...],
                         windows_game_path: str) -> str:
     compatibility = {
@@ -217,7 +340,8 @@ def _valid_file_records(value: object) -> tuple[dict, ...]:
     return tuple(result)
 
 
-def verify_private_generation(root: Path, expected_generation_id: str | None = None) -> str:
+def verify_private_generation(root: Path, expected_generation_id: str | None = None,
+                              *, _allow_legacy_normalization: bool = False) -> str:
     """Verify an already-published generation from its complete file manifest."""
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
@@ -266,9 +390,17 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
             identity for identity, mapped in MANAGED_ARTIFACTS.items() if mapped == artifact_id)
         for record in artifact_files:
             target = base / record["path"]
-            if (target.is_symlink() or not target.is_file()
-                    or target.stat().st_size != record["size"]
-                    or _sha256(target) != record["sha256"]):
+            exact = (not target.is_symlink() and target.is_file()
+                     and target.stat().st_size == record["size"]
+                     and _sha256(target) == record["sha256"])
+            relative = target.relative_to(root).as_posix()
+            transition = _LEGACY_RELOADED_NORMALIZATION.get(relative)
+            legacy_exact = bool(
+                _allow_legacy_normalization and transition
+                and record["sha256"] == transition[0]
+                and target.is_file() and not target.is_symlink()
+                and _sha256(target) == transition[1])
+            if not exact and not legacy_exact:
                 raise GenerationError(f"Generation artifact content is incomplete: {artifact_id}")
         artifact_ids.append(artifact_id)
     if set(artifact_ids) != expected_artifact_ids or len(artifact_ids) != len(set(artifact_ids)):
@@ -332,7 +464,19 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
     expected = _valid_file_records(manifest["files"])
     observed = content_manifest(root, exclude=("amethyst-generation.json",))
     if tuple(expected) != observed:
-        raise GenerationError(f"Generation content drift or incompleteness detected: {root}")
+        if not _allow_legacy_normalization:
+            raise GenerationError(f"Generation content drift or incompleteness detected: {root}")
+        expected_by_path = {item["path"]: item for item in expected}
+        observed_by_path = {item["path"]: item for item in observed}
+        changed = {path for path in expected_by_path
+                   if expected_by_path.get(path) != observed_by_path.get(path)}
+        if (set(expected_by_path) != set(observed_by_path)
+                or changed != set(_LEGACY_RELOADED_NORMALIZATION)
+                or any(expected_by_path[path]["sha256"] != hashes[0]
+                       or observed_by_path[path]["sha256"] != hashes[1]
+                       for path, hashes in _LEGACY_RELOADED_NORMALIZATION.items())):
+            raise GenerationError(
+                f"Generation drift is not the exact Reloaded normalization: {root}")
     if (root / "ReloadedPortable.txt").exists() or not (root / "portable.txt").is_file():
         raise GenerationError(f"Generation portable marker is invalid: {root}")
     for relative, expected_hash in configuration["hashes"].items():
@@ -378,14 +522,9 @@ def build_private_generation(
         identities[observed.casefold()] = observed
         canonical[expected] = package
 
-    artifact_inputs = tuple({
-        "artifact_id": artifact_id,
-        "archive_size": evidence.pin.size,
-        "archive_sha256": evidence.pin.sha256,
-        "content_identity": evidence.content_identity,
-        "files": [{"path": item.path, "size": item.size, "sha256": item.sha256}
-                  for item in evidence.files],
-    } for artifact_id, evidence in sorted(verified_inputs.items()))
+    artifact_inputs = tuple(
+        _normalized_artifact_input(evidence)
+        for _artifact_id, evidence in sorted(verified_inputs.items()))
 
     user_records = tuple({
         "mod_id": mod.mod_id,
@@ -456,6 +595,8 @@ def build_private_generation(
                 raise GenerationError(f"Reloaded archive unexpectedly contains managed package {identity}")
             _copy_tree_exact(canonical[identity], target, cancel)
             _verify_copied_evidence(target, verified_inputs[MANAGED_ARTIFACTS[identity]])
+            config = target / "ModConfig.json"
+            config.write_bytes(normalized_managed_mod_config(config.read_bytes(), identity))
             managed_locations[identity] = target.resolve()
         snapshots: list[UserMod] = []
         (stage / "User" / "Mods").mkdir(parents=True, exist_ok=True)

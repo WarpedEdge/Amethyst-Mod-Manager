@@ -16,7 +16,10 @@ try:
         MANAGED_ARTIFACTS, content_manifest, manifest_digest,
         read_profile_mods, verify_private_generation,
     )
-    from .fftic_pac import PacLaunchEvidence, pac_ownership, PacObservation, PacOwnershipState
+    from .fftic_pac import (
+        PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
+        PacObservation, PacOwnershipState,
+    )
     from .fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from .fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
     from .fftic_reloaded_config import MANAGED_ORDER, generate_bootstrap_configuration
@@ -33,7 +36,10 @@ except ImportError:
         MANAGED_ARTIFACTS, content_manifest, manifest_digest,
         read_profile_mods, verify_private_generation,
     )
-    from fftic_pac import PacLaunchEvidence, pac_ownership, PacObservation, PacOwnershipState
+    from fftic_pac import (
+        PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
+        PacObservation, PacOwnershipState,
+    )
     from fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
     from fftic_reloaded_config import MANAGED_ORDER, generate_bootstrap_configuration
@@ -325,18 +331,40 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
         reject("steam_options", "Current Steam Launch Options differ from the receipt")
 
     expected_profile = profile_fingerprint(receipt["user_packages"])
-    launches = {(item.generation_id, item.profile_fingerprint, item.launch_id,
-                 item.transaction_id) for item in evidence.pac_launch_evidence}
+    compatibility_fingerprint = hashlib.sha256(json.dumps(
+        receipt["compatibility_tuple"], sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+    baseline = (baseline_set_from_receipt(receipt["generated_pac_baseline"])
+                if receipt["schema_version"] >= 2 else None)
+    if baseline is not None and (
+            baseline.generation_id != generation_identity["generation_id"]
+            or baseline.profile_fingerprint != expected_profile
+            or baseline.compatibility_fingerprint != compatibility_fingerprint):
+        reject("profile", "PAC baseline is not bound to the current generation and profile")
     for item in receipt["generated_pac_observations"]:
-        identity = (item["generation_id"], item["profile_fingerprint"],
-                    item["launch_id"], item["transaction_id"])
         observation = PacObservation(**item)
         if (item["generation_id"] != generation_identity["generation_id"]
                 or item["profile_fingerprint"] != expected_profile
-                or identity not in launches
+                or baseline is None
+                or item["transaction_id"] != baseline.transaction_id
                 or pac_ownership(evidence.steam_path.game_root, item["relative_path"], observation)
                 != PacOwnershipState.OWNED_EXACT):
-            reject("profile", f"PAC observation is not owned by current launch evidence: {item['relative_path']}")
+            reject("profile", f"PAC observation is not exact receipt-owned output: {item['relative_path']}")
+    if baseline is not None and not receipt["generated_pac_observations"]:
+        for item in baseline.paths:
+            path = evidence.steam_path.game_root / item.relative_path
+            if item.state == PacOwnershipState.ABSENT and os.path.lexists(path):
+                reject("profile", f"PAC runtime output confirmation required: {item.relative_path}")
+            elif item.state == PacOwnershipState.OWNED_EXACT:
+                if (path.is_symlink() or not path.is_file()
+                        or file_sha256(path) != item.sha256):
+                    reject("profile", f"PAC runtime output confirmation required: {item.relative_path}")
+                backup = Path(item.backup_path) if item.backup_path else None
+                if (backup is None or backup.is_symlink() or not backup.is_file()
+                        or file_sha256(backup) != item.sha256):
+                    reject("profile", f"PAC baseline backup is missing or changed: {item.relative_path}")
+            elif item.state == PacOwnershipState.UNKNOWN:
+                reject("profile", f"Unknown preexisting PAC is preserved: {item.relative_path}")
     if receipt["incomplete_operation"] is not None:
         reject("recovery", "Receipt records an incomplete operation")
 

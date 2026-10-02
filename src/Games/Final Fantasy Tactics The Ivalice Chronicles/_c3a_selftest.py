@@ -49,7 +49,8 @@ def _rows(*, ready=False, steam="Configured", unsupported=False,
         ("steam_prefix", "Steam library and prefix", "Ready" if ready else "Setup required"),
         ("runner", "Proton runner", "Ready" if ready else "Unsupported"),
         ("runtime", "Reloaded-II runtime generation", "Ready" if ready else "Not installed"),
-        ("nenkai", "Nenkai loader", "Ready" if ready else "Not installed"),
+        ("nenkai", "FFT: The Ivalice Chronicles Mod Loader",
+         "Ready" if ready else "Not installed"),
         ("sigscan", "SigScan", "Ready" if ready else "Update required"),
         ("hooks", "Shared Hooks", "Ready" if ready else "Different"),
         ("dotnet", ".NET Desktop Runtime", "Ready" if ready else "Not installed"),
@@ -249,7 +250,8 @@ def test_plan_execution_cancellation_and_progress() -> None:
     controller = FfticOrchestrator(_Inspector(), executor)
     controller.refresh(_context())
     plans = {kind: controller.plan(kind) for kind in OperationKind}
-    assert plans[OperationKind.SETUP].steps[0].component == "managed runtime"
+    assert any(step.component == "managed runtime"
+               for step in plans[OperationKind.SETUP].steps)
     assert plans[OperationKind.REMOVE].steps[0].action.startswith("restore receipt-owned")
     selected = plans[OperationKind.UPDATE]
     assert controller.execute(selected, cancel, progress.append) == "ok"

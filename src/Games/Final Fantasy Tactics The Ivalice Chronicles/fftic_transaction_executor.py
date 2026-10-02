@@ -353,18 +353,28 @@ class FfticTransactionExecutor:
 
     def quarantine_owned_generation(self, *, generation_root: Path,
                                     generation_id: str, quarantine_root: Path,
-                                    transaction_id: str) -> Path:
+                                    transaction_id: str,
+                                    allow_legacy_normalization: bool = False) -> Path:
         """Move one fully verified generation to quarantine without deleting it."""
         try:
-            from .fftic_generation import verify_private_generation
+            from .fftic_generation import (
+                verify_legacy_reloaded_normalization, verify_private_generation,
+            )
         except ImportError:
-            from fftic_generation import verify_private_generation
+            from fftic_generation import (
+                verify_legacy_reloaded_normalization, verify_private_generation,
+            )
         with self._lock():
             if self.process_running():
                 raise TransactionError("FFTIC or Reloaded is running")
             generation_root = self._contained(generation_root)
             quarantine_root = self._contained(quarantine_root)
-            verify_private_generation(generation_root, generation_id)
+            try:
+                verify_private_generation(generation_root, generation_id)
+            except Exception:
+                if not allow_legacy_normalization:
+                    raise
+                verify_legacy_reloaded_normalization(generation_root, generation_id)
             quarantine_parent = quarantine_root if quarantine_root.exists() else quarantine_root.parent
             if generation_root.stat().st_dev != quarantine_parent.stat().st_dev:
                 raise TransactionError("Generation quarantine must be on the same filesystem")

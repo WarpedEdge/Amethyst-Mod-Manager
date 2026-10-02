@@ -21,7 +21,7 @@ except ImportError:
     from fftic_reloaded_config import MANAGED_ORDER
     from fftic_steam_requirements import REQUIRED_OPTIONS_SHA256
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PREFIX_CONFIGURATION_PATH = (
@@ -35,6 +35,7 @@ _REQUIRED = {
     "shared_prerequisites", "steam_launch_options", "generated_pac_observations",
     "last_successful_operation", "incomplete_operation", "recovery_instructions",
 }
+_V2_REQUIRED = _REQUIRED | {"generated_pac_baseline"}
 
 
 class ReceiptError(RuntimeError):
@@ -104,11 +105,13 @@ def _absolute_path(value: object, label: str) -> str:
 def validate_receipt(data: object) -> dict:
     if not isinstance(data, dict):
         raise ReceiptCorruptError("FFTIC receipt root must be an object")
-    missing = sorted(_REQUIRED - set(data))
-    extra = sorted(set(data) - _REQUIRED)
+    schema = data.get("schema_version")
+    required = _REQUIRED if schema == 1 else _V2_REQUIRED if schema == SCHEMA_VERSION else set()
+    missing = sorted(required - set(data))
+    extra = sorted(set(data) - required)
     if missing or extra:
         raise ReceiptCorruptError(f"FFTIC receipt fields differ (missing={missing}, extra={extra})")
-    if data["schema_version"] != SCHEMA_VERSION:
+    if schema not in {1, SCHEMA_VERSION}:
         raise ReceiptCorruptError(f"Unsupported FFTIC receipt schema {data['schema_version']!r}")
     if data["steam_app_id"] != "1004640":
         raise ReceiptCorruptError("FFTIC receipt has the wrong Steam app ID")
@@ -340,6 +343,59 @@ def validate_receipt(data: object) -> dict:
         if ((item["before_state"] == "absent" and item["before_sha256"] is not None)
                 or (item["before_state"] == "owned exact" and item["before_sha256"] is None)):
             _fail(f"generated_pac_observations[{index}].before_sha256")
+    if schema == SCHEMA_VERSION:
+        baseline = _exact(data["generated_pac_baseline"], {
+            "generation_id", "profile_fingerprint", "activation_id", "transaction_id",
+            "compatibility_fingerprint", "paths", "prior_log_hashes",
+        }, "generated_pac_baseline")
+        _identifier(baseline["generation_id"], "generated_pac_baseline.generation_id")
+        _hash(baseline["profile_fingerprint"], "generated_pac_baseline.profile_fingerprint")
+        _identifier(baseline["activation_id"], "generated_pac_baseline.activation_id")
+        _identifier(baseline["transaction_id"], "generated_pac_baseline.transaction_id")
+        _hash(baseline["compatibility_fingerprint"],
+              "generated_pac_baseline.compatibility_fingerprint")
+        prior_logs = baseline["prior_log_hashes"]
+        if (not isinstance(prior_logs, list) or len(prior_logs) != len(set(prior_logs))
+                or prior_logs != sorted(prior_logs)):
+            _fail("generated_pac_baseline.prior_log_hashes")
+        for index, value in enumerate(prior_logs):
+            _hash(value, f"generated_pac_baseline.prior_log_hashes[{index}]")
+        if baseline["generation_id"] != generation["generation_id"]:
+            _fail("generated_pac_baseline binding")
+        paths = baseline["paths"]
+        if not isinstance(paths, list) or len(paths) != len(allowed_pacs):
+            _fail("generated_pac_baseline.paths")
+        seen_baseline = set()
+        for index, item in enumerate(paths):
+            item = _exact(item, {"relative_path", "state", "sha256", "backup_path"},
+                          f"generated_pac_baseline.paths[{index}]")
+            relative = _path(
+                item["relative_path"], f"generated_pac_baseline.paths[{index}].relative_path")
+            if (relative not in allowed_pacs or relative in seen_baseline
+                    or item["state"] not in {"absent", "unknown", "owned exact"}):
+                _fail(f"generated_pac_baseline.paths[{index}]")
+            seen_baseline.add(relative)
+            if item["sha256"] is not None:
+                _hash(item["sha256"], f"generated_pac_baseline.paths[{index}].sha256")
+            if item["backup_path"] is not None:
+                _absolute_path(
+                    item["backup_path"],
+                    f"generated_pac_baseline.paths[{index}].backup_path")
+            if ((item["state"] == "absent" and item["sha256"] is not None)
+                    or (item["state"] == "owned exact" and
+                        (item["sha256"] is None or item["backup_path"] is None))
+                    or (item["state"] != "owned exact" and
+                        item["backup_path"] is not None)):
+                _fail(f"generated_pac_baseline.paths[{index}].sha256")
+        if seen_baseline != allowed_pacs:
+            _fail("generated_pac_baseline.paths identities")
+        for index, item in enumerate(pacs):
+            if (item["generation_id"] != baseline["generation_id"]
+                    or item["profile_fingerprint"] != baseline["profile_fingerprint"]
+                    or item["transaction_id"] != baseline["transaction_id"]
+                    or item["launch_id"] != item["launch_id"].casefold()
+                    or not _HASH.fullmatch(item["launch_id"])):
+                _fail(f"generated_pac_observations[{index}] baseline binding")
     _identifier(data["last_successful_operation"], "last_successful_operation")
     incomplete = data["incomplete_operation"]
     if incomplete is not None:
