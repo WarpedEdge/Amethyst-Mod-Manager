@@ -812,8 +812,11 @@ class FfticLifecycleComposition:
         } for item in manifest["user_packages"]]
         prior_observations = tuple(
             PacObservation(**item) for item in (old["generated_pac_observations"] if old else ()))
+        prior_baseline = (baseline_set_from_receipt(old["generated_pac_baseline"]).paths
+                          if old and old["schema_version"] >= 2 else ())
         pac_baseline = capture_pac_baseline(
-            self.inputs.game_root, prior_observations=prior_observations)
+            self.inputs.game_root, prior_observations=prior_observations,
+            prior_baseline=prior_baseline)
         activation_id = self._operation_token.activation_id if self._operation_token else None
         if operation == "repair" and old and old.get("generated_pac_baseline"):
             baseline_data = old["generated_pac_baseline"]

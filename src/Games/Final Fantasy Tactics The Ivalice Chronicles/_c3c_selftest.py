@@ -877,6 +877,65 @@ def test_prior_exact_owned_pac_transition_restores_before_state() -> None:
     assert read_receipt(fixture.inputs.receipts_root) is None
 
 
+def test_consecutive_synchronization_retains_exact_pac_ownership() -> None:
+    fixture = Fixture("pac-consecutive-sync")
+    fixture.run(OperationKind.SETUP)
+    fixture.recompose(process_running=lambda: False)
+    payloads = {
+        "data/enhanced/modded.pac": b"managed output",
+        "data/enhanced/modded.en.pac": b"managed English output",
+    }
+    for relative, payload in payloads.items():
+        target = fixture.game / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    _write_matching_log(fixture, read_receipt(fixture.inputs.receipts_root), "first.txt")
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+
+    (fixture.profile / "modlist.txt").write_text(
+        "-High\n-Low\n-Disabled\n", encoding="utf-8")
+    fixture.run(OperationKind.SYNCHRONIZE)
+    disabled = read_receipt(fixture.inputs.receipts_root)
+    assert disabled.data["generated_pac_observations"] == []
+    for item in disabled.data["generated_pac_baseline"]["paths"]:
+        if item["relative_path"] in payloads:
+            assert item["state"] == "owned exact"
+            assert Path(item["backup_path"]).read_bytes() == payloads[item["relative_path"]]
+
+    (fixture.profile / "modlist.txt").write_text(
+        "+High\n-Low\n-Disabled\n", encoding="utf-8")
+    before_failure = _owned_state(fixture)
+    fixture.recompose(failure_injector=lambda name, kind: (
+        (_ for _ in ()).throw(RuntimeError("injected after receipt"))
+        if name == "receipt" and kind == OperationKind.SYNCHRONIZE else None))
+    try:
+        fixture.run(OperationKind.SYNCHRONIZE)
+    except RuntimeError as exc:
+        assert "injected after receipt" in str(exc)
+    else:
+        raise AssertionError("Injected failed consecutive synchronization succeeded")
+    assert _owned_state(fixture) == before_failure
+    for relative, payload in payloads.items():
+        assert (fixture.game / relative).read_bytes() == payload
+    _installation, rolled_back = fixture.composition._readiness()
+    assert rolled_back.profile == ReadinessAspect.INVALID
+    assert rolled_back.recovery == ReadinessAspect.READY
+    assert not any("Unknown preexisting PAC" in issue for issue in rolled_back.issues)
+
+    fixture.recompose(failure_injector=None)
+    fixture.run(OperationKind.SYNCHRONIZE)
+    enabled = read_receipt(fixture.inputs.receipts_root)
+    assert enabled.data["generated_pac_observations"] == []
+    for item in enabled.data["generated_pac_baseline"]["paths"]:
+        if item["relative_path"] in payloads:
+            assert item["state"] == "owned exact"
+            assert Path(item["backup_path"]).read_bytes() == payloads[item["relative_path"]]
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == ReadinessAspect.READY
+    assert verified.recovery == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+
+
 def test_preexisting_backup_survives_failed_removal() -> None:
     def fail(name, kind):
         if kind == OperationKind.REMOVE and name == "remove:version.dll":
@@ -1035,6 +1094,7 @@ def main() -> None:
         test_runtime_output_confirmation_uses_bound_log_and_baseline,
         test_unknown_preexisting_pac_is_persisted_and_blocks_removal,
         test_prior_exact_owned_pac_transition_restores_before_state,
+        test_consecutive_synchronization_retains_exact_pac_ownership,
         test_preexisting_backup_survives_failed_removal,
         test_cleanup_and_cross_operation_failure_boundaries,
         test_removal_failure_boundaries_restore_exact_owned_state,

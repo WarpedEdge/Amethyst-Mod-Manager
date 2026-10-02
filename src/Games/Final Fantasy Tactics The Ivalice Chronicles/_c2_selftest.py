@@ -54,7 +54,7 @@ from fftic_packages import (  # noqa: E402
     CLASSIC_APP_ID, ENHANCED_APP_ID, PackageClassification,
 )
 from fftic_pac import (  # noqa: E402
-    PacLaunchEvidence, PacOwnershipState, capture_generated_pacs,
+    PacBaseline, PacLaunchEvidence, PacOwnershipState, capture_generated_pacs,
     capture_pac_baseline, pac_ownership,
 )
 from fftic_prerequisites import (  # noqa: E402
@@ -1333,6 +1333,34 @@ def test_pac_prerequisites_and_lifecycle() -> None:
     assert len(observations) == 1
     assert pac_ownership(game, observations[0].relative_path, observations[0]) == PacOwnershipState.OWNED_EXACT
     owned_baseline = capture_pac_baseline(game, prior_observations=observations)
+    backup = ROOT / "prior-owned-pac.backup"
+    backup.write_bytes(b"generated")
+    exact_prior = tuple(
+        PacBaseline(item.relative_path, item.state, item.sha256,
+                    str(backup) if item.relative_path == observations[0].relative_path else None)
+        for item in owned_baseline)
+    def retained_state(prior):
+        return next(item.state for item in capture_pac_baseline(game, prior_baseline=prior)
+                    if item.relative_path == observations[0].relative_path)
+    assert retained_state(exact_prior) == PacOwnershipState.OWNED_EXACT
+    backup.write_bytes(b"changed backup")
+    assert retained_state(exact_prior) == PacOwnershipState.UNKNOWN
+    backup.write_bytes(b"generated")
+    unbacked = tuple(PacBaseline(item.relative_path, item.state, item.sha256, None)
+                     for item in exact_prior)
+    assert retained_state(unbacked) == PacOwnershipState.UNKNOWN
+    unknown = tuple(PacBaseline(item.relative_path, PacOwnershipState.UNKNOWN,
+                                item.sha256, str(backup)) for item in exact_prior)
+    assert retained_state(unknown) == PacOwnershipState.UNKNOWN
+    unrelated = (PacBaseline("data/classic/modded.pac", PacOwnershipState.OWNED_EXACT,
+                             observations[0].sha256, str(backup)),)
+    assert retained_state(unrelated) == PacOwnershipState.UNKNOWN
+    conflicting_observation = (replace(observations[0], sha256="0" * 64),)
+    assert next(item.state for item in capture_pac_baseline(
+        game, prior_observations=conflicting_observation, prior_baseline=exact_prior)
+        if item.relative_path == observations[0].relative_path) == PacOwnershipState.UNKNOWN
+    pac.write_bytes(b"changed current PAC")
+    assert retained_state(exact_prior) == PacOwnershipState.UNKNOWN
     pac.write_bytes(b"regenerated")
     replaced = capture_generated_pacs(
         game, baseline=owned_baseline,

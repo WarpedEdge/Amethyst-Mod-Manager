@@ -80,8 +80,10 @@ def baseline_set_from_receipt(value: dict) -> PacBaselineSet:
 
 
 def capture_pac_baseline(game_root: Path, *,
-                         prior_observations: tuple[PacObservation, ...] = ()) -> tuple[PacBaseline, ...]:
+                         prior_observations: tuple[PacObservation, ...] = (),
+                         prior_baseline: tuple[PacBaseline, ...] = ()) -> tuple[PacBaseline, ...]:
     prior = {item.relative_path: item for item in prior_observations}
+    baselines = {item.relative_path: item for item in prior_baseline}
     result = []
     for relative in GENERATED_PAC_PATHS:
         path = Path(game_root) / relative
@@ -92,7 +94,15 @@ def capture_pac_baseline(game_root: Path, *,
         else:
             digest = file_sha256(path)
             recorded = prior.get(relative)
-            state = (PacOwnershipState.OWNED_EXACT if recorded and recorded.sha256 == digest
+            baseline = baselines.get(relative) if recorded is None else None
+            backup = Path(baseline.backup_path) if baseline and baseline.backup_path else None
+            exact_baseline = (baseline is not None
+                              and baseline.state == PacOwnershipState.OWNED_EXACT
+                              and baseline.sha256 == digest
+                              and backup is not None and not backup.is_symlink()
+                              and backup.is_file() and file_sha256(backup) == digest)
+            state = (PacOwnershipState.OWNED_EXACT
+                     if (recorded is not None and recorded.sha256 == digest) or exact_baseline
                      else PacOwnershipState.UNKNOWN)
             result.append(PacBaseline(relative, state, digest))
     return tuple(result)
