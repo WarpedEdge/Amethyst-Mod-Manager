@@ -61,7 +61,7 @@ def _rows(*, ready=False, steam="Configured", unsupported=False,
         ("steam_options", "Steam Launch Options", steam),
         ("recovery", "Incomplete operation or recovery", recovery),
         ("launch", "Launch readiness", "Ready" if ready else "Setup required"),
-        ("unsupported_mods", "Unsupported compiled/API mods",
+        ("unsupported_mods", "Unsupported or unsafe packages",
          "Unsupported" if unsupported else "Ready"),
     )
     result = []
@@ -206,17 +206,18 @@ def test_unsupported_package_detection_and_plan_block() -> None:
             "ModId": mod_id, "ModName": name, "ModAuthor": "Test",
             "ModVersion": "1.0", "ModDependencies": [], "OptionalDependencies": [],
             "SupportedAppId": ["fft_enhanced.exe"], "ModDll": "Runtime.dll",
+            "ModNativeDll64": "Native.dll",
         }), encoding="utf-8")
         (package / "Runtime.dll").write_bytes(b"fixture")
         (package / "FFTIVC" / "data").mkdir(parents=True, exist_ok=True)
         (package / "FFTIVC" / "data" / "fixture.bin").write_bytes(b"fixture")
     packages = _profile_packages(context)
     assert len(packages) == 2
-    assert packages[0].name == "Runtime Mod"
+    assert packages[0].name == "Runtime Mod (example.runtime)"
     assert packages[0].path == str(context.staging_root / "runtime-mod")
-    assert "Compiled/runtime code" in packages[0].reason
+    assert "unsupported native/external executable" in packages[0].reason
     assert packages[0].enabled and packages[0].state == "enabled"
-    assert packages[1].name == "Disabled Runtime Mod"
+    assert packages[1].name == "Disabled Runtime Mod (example.disabled)"
     assert not packages[1].enabled and packages[1].state == "disabled"
 
     controller = FfticOrchestrator(_Inspector(unsupported=True))
@@ -225,7 +226,7 @@ def test_unsupported_package_detection_and_plan_block() -> None:
     try:
         controller.plan(OperationKind.SYNCHRONIZE)
     except RuntimeError as exc:
-        assert "Unsupported compiled/API mods" in str(exc)
+        assert "Unsupported or unsafe packages" in str(exc)
     else:
         raise AssertionError("unsupported code package did not block synchronization")
 

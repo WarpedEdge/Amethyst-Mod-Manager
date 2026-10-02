@@ -106,10 +106,13 @@ def _json_bytes(value: dict) -> bytes:
 
 
 def _compatible(classification: PackageClassification, mode: Mode) -> bool:
-    return classification == PackageClassification.DUAL_MODE_CONTENT or (
-        mode == Mode.CLASSIC and classification == PackageClassification.CLASSIC_CONTENT
+    return classification in {PackageClassification.DUAL_MODE_CONTENT,
+                              PackageClassification.DUAL_MODE_MANAGED_CODE} or (
+        mode == Mode.CLASSIC and classification in {
+            PackageClassification.CLASSIC_CONTENT, PackageClassification.CLASSIC_MANAGED_CODE}
     ) or (
-        mode == Mode.ENHANCED and classification == PackageClassification.ENHANCED_CONTENT
+        mode == Mode.ENHANCED and classification in {
+            PackageClassification.ENHANCED_CONTENT, PackageClassification.ENHANCED_MANAGED_CODE}
     )
 
 

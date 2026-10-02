@@ -413,10 +413,10 @@ def _profile_packages(
             continue
         source = context.staging_root / entry.name
         result = inspect_package(source)
-        if result.classification == PackageClassification.UNSUPPORTED_CODE:
+        if not result.is_user_content:
             manifest = result.manifest
             unsupported.append(UnsupportedPackage(
-                manifest.name if manifest is not None else entry.name,
+                f"{manifest.name} ({manifest.mod_id})" if manifest is not None else entry.name,
                 str(source),
                 result.diagnostics[0] if result.diagnostics else result.classification.value,
                 entry.enabled))
@@ -580,12 +580,13 @@ class DefaultStatusInspector:
 
         unsupported = _profile_packages(context, cancel)
         unsupported_row = _row(
-            "unsupported_mods", "Unsupported compiled/API mods",
+            "unsupported_mods", "Unsupported or unsafe packages",
             "Unsupported" if unsupported else "Ready",
             StatusSeverity.ERROR if unsupported else StatusSeverity.READY,
-            ("Current support covers content mods through the managed Nenkai stack; "
-             "compiled/runtime packages block synchronization." if unsupported else
-             "No unsupported compiled/runtime package was detected in the active profile."),
+            ("Unsafe or unsupported packages block synchronization. "
+             "Amethyst runs user-selected managed code through Reloaded-II." if unsupported else
+             "Content and valid managed Reloaded code/API packages are supported; "
+             "Amethyst runs user-selected managed code through Reloaded-II."),
             *(f"{item.name} ({item.state}): {item.path} — {item.reason}"
               for item in unsupported))
         self._progress(progress, 3, 5, "Inspecting the active profile")
@@ -1049,7 +1050,7 @@ class FfticOrchestrator:
         if status.unsupported_packages and kind in {
                 OperationKind.SETUP, OperationKind.SYNCHRONIZE}:
             names = ", ".join(item.name for item in status.unsupported_packages)
-            raise RuntimeError(f"Unsupported compiled/API mods block this plan: {names}")
+            raise RuntimeError(f"Unsupported or unsafe packages block this plan: {names}")
         binding = self._binding(context, status, epoch)
         return OperationPlan(kind, context.profile_name, targets[kind], binding=binding)
 

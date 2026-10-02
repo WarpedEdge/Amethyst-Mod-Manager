@@ -224,7 +224,9 @@ def validate_receipt(data: object) -> dict:
             _fail(f"user_packages[{index}]")
         seen_users.add(identity)
         if item["classification"] not in {
-                "Classic content mod", "Enhanced content mod", "dual-mode content mod"}:
+                "Classic content mod", "Enhanced content mod", "dual-mode content mod",
+                "Classic managed Reloaded code/API mod", "Enhanced managed Reloaded code/API mod",
+                "dual-mode managed Reloaded code/API mod"}:
             _fail(f"user_packages[{index}].classification")
         _hash(item["content_identity"], f"user_packages[{index}].content_identity")
 

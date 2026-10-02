@@ -1048,6 +1048,14 @@ def test_receipts_and_transactions() -> None:
     receipts = ROOT / "receipts"
     payload = serialize_receipt(_receipt())
     assert payload == serialize_receipt(_receipt())
+    managed_code_receipt = _receipt()
+    managed_code_receipt["user_packages"] = [{
+        "mod_id": "ffttic.jobs.genericjobs", "enabled": True, "priority": 0,
+        "classification": "Enhanced managed Reloaded code/API mod",
+        "content_identity": "a" * 64,
+    }]
+    assert validate_receipt(managed_code_receipt)["user_packages"][0]["classification"] \
+        == "Enhanced managed Reloaded code/API mod"
     malformed = []
     for mutation in (
         lambda x: x.update(created_at="not-a-time"),

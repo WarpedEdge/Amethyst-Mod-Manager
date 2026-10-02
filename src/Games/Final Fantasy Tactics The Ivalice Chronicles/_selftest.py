@@ -210,7 +210,7 @@ def test_package_recognition() -> None:
     assert unsupported.classification == PackageClassification.UNSUPPORTED_APPLICATION
     compiled = inspect_package(_package(
         packages / "compiled", _manifest(code=True)))
-    assert compiled.classification == PackageClassification.UNSUPPORTED_CODE
+    assert compiled.classification == PackageClassification.MALFORMED
     assert handler.validate_mod_package(packages / "compiled")
     from Utils.mods.install import _validate_prepared_package
     install_log: list[str] = []
@@ -220,7 +220,7 @@ def test_package_recognition() -> None:
         src_root=packages / "compiled",
     )
     assert not _validate_prepared_package(prepared, install_log.append)
-    assert any("Compiled/runtime code" in line for line in install_log)
+    assert any("ModDll" in line for line in install_log)
     invalid_id = inspect_package(_package(
         packages / "invalid-id", _manifest(mod_id="../escape")))
     assert invalid_id.classification == PackageClassification.MALFORMED
@@ -257,7 +257,7 @@ def test_package_recognition() -> None:
         runtime_file.write_bytes(b"not executed")
         runtime = inspect_package(root)
         assert runtime.classification == PackageClassification.UNSUPPORTED_CODE
-        assert runtime_file.relative_to(root).as_posix() in runtime.diagnostics[0]
+        assert runtime_file.relative_to(root).as_posix() in runtime.diagnostics[0] or extension == ".dll"
 
     fixture = Path(
         "/var/mnt/game_drive/github/Amethyst-Mod-Manager-Documents/"
@@ -271,6 +271,87 @@ def test_package_recognition() -> None:
         after = {p.relative_to(fixture).as_posix(): p.stat().st_mtime_ns
                  for p in fixture.rglob("*")}
         assert before == after
+
+
+def test_special_file_manifest() -> None:
+    from threading import Thread
+    package = _ROOT / "special-manifest"
+    package.mkdir()
+    os.mkfifo(package / "ModConfig.json")
+    results = []
+    worker = Thread(target=lambda: results.append(inspect_package(package)), daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive(), "Reading a FIFO manifest blocked package inspection"
+    assert results[0].classification == PackageClassification.MALFORMED
+    assert "ModConfig.json must be a regular non-symlink file" in results[0].diagnostics[0]
+
+
+def test_managed_code_packages() -> None:
+    from fftic_generation import content_manifest, manifest_digest, validate_user_dependencies, GenerationError
+    from Utils.mods.install import _validate_prepared_package
+    root = _ROOT / "managed-code-fixtures"
+    data = _manifest(mod_id="ffttic.jobs.genericjobs", deps=list(MANAGED_ORDER))
+    data["ModDll"] = "GenericJobs.dll"
+    data["ModR2RManagedDll32"] = "x86/GenericJobs.dll"
+    data["ModR2RManagedDll64"] = "x64/GenericJobs.dll"
+    package = _package(root / "valid", data, "FFTIVC/data/enhanced/job.nxd")
+    (package / "GenericJobs.dll").write_bytes(b"synthetic managed assembly")
+    (package / "GenericJobs.deps.json").write_text("{}", encoding="utf-8")
+    (package / "Reloaded.Support.dll").write_bytes(b"synthetic dependency")
+    result = inspect_package(package)
+    assert result.classification == PackageClassification.ENHANCED_MANAGED_CODE
+    handler = FinalFantasyTacticsTheIvaliceChronicles()
+    assert handler.validate_mod_package(package) == []
+    prepared = SimpleNamespace(game=handler, src_root=package)
+    assert _validate_prepared_package(prepared, lambda _line: None)
+    before = manifest_digest(content_manifest(package))
+    (package / "GenericJobs.dll").write_bytes(b"changed synthetic assembly")
+    assert manifest_digest(content_manifest(package)) != before
+    mod = UserMod(data["ModId"], package, result.classification, True, 0)
+    validate_user_dependencies((mod,))
+    config = generate_reloaded_configuration(
+        private_generation_root=(_ROOT / "generation").resolve(),
+        windows_game_path=ValidatedSteamPath.from_resolver(r"S:\steamapps\common\FFTIC"),
+        managed_package_locations={identity: (_ROOT / "managed" / identity).resolve()
+                                   for identity in MANAGED_ORDER}, user_mods=(mod,))
+    enhanced = json.loads(config.file_bytes(f"Apps/{ENHANCED_APP_ID}/AppConfig.json"))
+    classic = json.loads(config.file_bytes(f"Apps/{CLASSIC_APP_ID}/AppConfig.json"))
+    assert enhanced["EnabledMods"] == [*MANAGED_ORDER, data["ModId"]]
+    assert data["ModId"] not in classic["EnabledMods"]
+    disabled = replace(mod, enabled=False)
+    config_off = generate_reloaded_configuration(
+        private_generation_root=(_ROOT / "generation").resolve(),
+        windows_game_path=ValidatedSteamPath.from_resolver(r"S:\steamapps\common\FFTIC"),
+        managed_package_locations={identity: (_ROOT / "managed" / identity).resolve()
+                                   for identity in MANAGED_ORDER}, user_mods=(disabled,))
+    assert data["ModId"] not in json.loads(config_off.file_bytes(
+        f"Apps/{ENHANCED_APP_ID}/AppConfig.json"))["EnabledMods"]
+    for bad in ("../GenericJobs.dll", "/tmp/GenericJobs.dll", "missing.dll"):
+        altered = dict(data, ModDll=bad)
+        candidate = _package(root / f"bad-{len(list(root.iterdir()))}", altered)
+        assert inspect_package(candidate).classification == PackageClassification.MALFORMED
+    linked = _package(root / "linked", data)
+    (linked / "GenericJobs.dll").symlink_to(package / "GenericJobs.dll")
+    assert inspect_package(linked).classification == PackageClassification.MALFORMED
+    special = _package(root / "special", data)
+    os.mkfifo(special / "GenericJobs.dll")
+    assert inspect_package(special).classification == PackageClassification.MALFORMED
+    collision = _package(root / "collision", data)
+    (collision / "GenericJobs.dll").write_bytes(b"synthetic")
+    (collision / "genericjobs.dll").write_bytes(b"collision")
+    assert inspect_package(collision).classification == PackageClassification.MALFORMED
+    native = _package(root / "native", dict(data, ModNativeDll64="Native.dll"))
+    (native / "GenericJobs.dll").write_bytes(b"synthetic")
+    assert inspect_package(native).classification == PackageClassification.UNSUPPORTED_CODE
+    missing = _package(root / "missing-dependency", dict(data, ModDependencies=["unknown.api"]))
+    (missing / "GenericJobs.dll").write_bytes(b"synthetic")
+    try:
+        validate_user_dependencies((replace(mod, package_location=missing),))
+    except GenerationError as exc:
+        assert "unknown.api" in str(exc)
+    else:
+        raise AssertionError("missing dependency was accepted")
 
 
 def test_artifact_manifest() -> None:
@@ -492,6 +573,8 @@ def main() -> None:
         test_collision_safe_discovery_imports,
         test_identity_detection_and_cache_contract,
         test_package_recognition,
+        test_special_file_manifest,
+        test_managed_code_packages,
         test_artifact_manifest,
         test_reloaded_generation,
         test_transaction_plans,

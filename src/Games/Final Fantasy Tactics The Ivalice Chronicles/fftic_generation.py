@@ -17,7 +17,7 @@ try:
     from .fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from .fftic_packages import PackageClassification, inspect_package
     from .fftic_reloaded_config import (
-        MANAGED_ORDER, UserMod, ValidatedSteamPath,
+        MANAGED_ORDER, Mode, UserMod, ValidatedSteamPath, _compatible,
         generate_reloaded_configuration,
     )
     from .fftic_extraction import (
@@ -28,7 +28,7 @@ except ImportError:
     from fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from fftic_packages import PackageClassification, inspect_package
     from fftic_reloaded_config import (
-        MANAGED_ORDER, UserMod, ValidatedSteamPath,
+        MANAGED_ORDER, Mode, UserMod, ValidatedSteamPath, _compatible,
         generate_reloaded_configuration,
     )
     from fftic_extraction import (
@@ -500,6 +500,7 @@ def build_private_generation(
 ) -> GenerationResult:
     """Build and atomically publish a complete immutable generation."""
     expected_ids = {"reloaded-ii", *MANAGED_ARTIFACTS.values()}
+    validate_user_dependencies(user_mods)
     if set(verified_inputs) != expected_ids:
         raise GenerationError("All and only the reviewed verified artifact trees are required")
     for artifact_id, evidence in verified_inputs.items():
@@ -692,4 +693,31 @@ def read_profile_mods(profile_dir: Path, staging_root: Path) -> tuple[UserMod, .
         seen[identity.casefold()] = entry.name
         result.append(UserMod(identity, package_resolved, inspected.classification,
                               entry.enabled, priority))
+    validate_user_dependencies(tuple(result))
     return tuple(result)
+
+
+def validate_user_dependencies(mods: tuple[UserMod, ...]) -> None:
+    """Require enabled dependencies in each applicable FFTIC application."""
+    by_id = {mod.mod_id.casefold(): mod for mod in mods}
+    if len(by_id) != len(mods):
+        raise GenerationError("Duplicate FFTIC user mod IDs")
+    internal = {identity.casefold() for identity in MANAGED_ORDER}
+    for mod in mods:
+        if not mod.enabled:
+            continue
+        inspected = inspect_package(mod.package_location)
+        if not inspected.is_user_content or inspected.manifest is None:
+            raise GenerationError(f"Mod {mod.mod_id} at {mod.package_location} is no longer valid")
+        for mode in (Mode.CLASSIC, Mode.ENHANCED):
+            if not _compatible(mod.classification, mode):
+                continue
+            for dependency in inspected.manifest.dependencies:
+                key = dependency.casefold()
+                target = by_id.get(key)
+                if key not in internal and (target is None or not target.enabled
+                        or not _compatible(target.classification, mode)):
+                    raise GenerationError(
+                        f"{inspected.manifest.name} ({mod.mod_id}) at {mod.package_location}: "
+                        f"required dependency {dependency!r} is missing, disabled, or "
+                        f"incompatible with {mode.value}.")
