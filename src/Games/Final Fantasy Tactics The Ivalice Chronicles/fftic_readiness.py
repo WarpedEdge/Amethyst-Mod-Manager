@@ -18,7 +18,7 @@ try:
     )
     from .fftic_pac import (
         PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
-        PacObservation, PacOwnershipState,
+        PacObservation, PacOwnershipState, exact_absent_output,
     )
     from .fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from .fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
@@ -38,7 +38,7 @@ except ImportError:
     )
     from fftic_pac import (
         PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
-        PacObservation, PacOwnershipState,
+        PacObservation, PacOwnershipState, exact_absent_output,
     )
     from fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
@@ -351,13 +351,17 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
                 != PacOwnershipState.OWNED_EXACT):
             reject("profile", f"PAC observation is not exact receipt-owned output: {item['relative_path']}")
     if baseline is not None and not receipt["generated_pac_observations"]:
+        confirmed_absent = receipt["last_successful_operation"] == "confirm-absent-runtime-output"
+        if confirmed_absent and not exact_absent_output(
+                evidence.steam_path.game_root, baseline, receipt["user_packages"]):
+            reject("profile", "Confirmed absent PAC output or its backup has changed")
         for item in baseline.paths:
             path = evidence.steam_path.game_root / item.relative_path
             if item.state == PacOwnershipState.ABSENT and os.path.lexists(path):
                 reject("profile", f"PAC runtime output confirmation required: {item.relative_path}")
             elif item.state == PacOwnershipState.OWNED_EXACT:
-                if (path.is_symlink() or not path.is_file()
-                        or file_sha256(path) != item.sha256):
+                if (not confirmed_absent and (path.is_symlink() or not path.is_file()
+                        or file_sha256(path) != item.sha256)):
                     reject("profile", f"PAC runtime output confirmation required: {item.relative_path}")
                 backup = Path(item.backup_path) if item.backup_path else None
                 if (backup is None or backup.is_symlink() or not backup.is_file()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from enum import Enum
 from pathlib import Path
 
@@ -130,6 +131,28 @@ def capture_generated_pacs(game_root: Path, *, baseline: tuple[PacBaseline, ...]
                 evidence.profile_fingerprint, evidence.launch_id,
                 evidence.transaction_id, prior.state.value, prior.sha256))
     return tuple(observations)
+
+
+def exact_absent_output(game_root: Path, baseline: PacBaselineSet,
+                        user_packages: list[dict]) -> bool:
+    """Accept no output only for an all-disabled profile with exact retained baselines."""
+    if (any(item["enabled"] for item in user_packages)
+            or len(baseline.paths) != len(GENERATED_PAC_PATHS)
+            or {item.relative_path for item in baseline.paths} != set(GENERATED_PAC_PATHS)
+            or not any(item.state == PacOwnershipState.OWNED_EXACT for item in baseline.paths)):
+        return False
+    for item in baseline.paths:
+        if os.path.lexists(Path(game_root) / item.relative_path):
+            return False
+        if item.state == PacOwnershipState.ABSENT:
+            continue
+        if item.state != PacOwnershipState.OWNED_EXACT or not item.backup_path:
+            return False
+        backup = Path(item.backup_path)
+        if (backup.is_symlink() or not backup.is_file()
+                or file_sha256(backup) != item.sha256):
+            return False
+    return True
 
 
 def inspect_matching_launch_log(

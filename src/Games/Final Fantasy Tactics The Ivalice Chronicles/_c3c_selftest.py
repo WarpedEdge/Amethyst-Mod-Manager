@@ -936,6 +936,177 @@ def test_consecutive_synchronization_retains_exact_pac_ownership() -> None:
     assert verified.issues == ("Current installation evidence does not match the receipt",)
 
 
+def test_all_disabled_absent_pac_confirmation_and_lifecycle() -> None:
+    def absent_fixture(name: str) -> tuple[Fixture, dict[str, bytes]]:
+        fixture = Fixture(name)
+        fixture.run(OperationKind.SETUP)
+        fixture.recompose(process_running=lambda: False)
+        payloads = {
+            "data/enhanced/modded.pac": b"prior managed output",
+            "data/enhanced/modded.en.pac": b"prior managed English output",
+        }
+        for relative, payload in payloads.items():
+            target = fixture.game / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        _write_matching_log(fixture, read_receipt(fixture.inputs.receipts_root), "first.txt")
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+        (fixture.profile / "modlist.txt").write_text(
+            "-High\n-Low\n-Disabled\n", encoding="utf-8")
+        fixture.run(OperationKind.SYNCHRONIZE)
+        for relative in payloads:
+            (fixture.game / relative).unlink()
+        return fixture, payloads
+
+    fixture, payloads = absent_fixture("all-disabled-absent")
+    original = _owned_state(fixture)
+    receipt = read_receipt(fixture.inputs.receipts_root)
+    assert receipt.data["generated_pac_observations"] == []
+    backups = [Path(item["backup_path"]) for item in
+               receipt.data["generated_pac_baseline"]["paths"]
+               if item["relative_path"] in payloads]
+    assert all(path.is_file() for path in backups)
+    _installation, pending = fixture.composition._readiness()
+    assert sum("PAC runtime output confirmation required" in issue
+               for issue in pending.issues) == 2
+
+    for backup in backups:
+        prior = backup.read_bytes()
+        backup.unlink()
+        try:
+            fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+        except WorkflowError:
+            pass
+        else:
+            raise AssertionError("Missing PAC backup allowed absent-output confirmation")
+        backup.write_bytes(prior)
+        backup.write_bytes(b"changed backup")
+        try:
+            fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+        except WorkflowError:
+            pass
+        else:
+            raise AssertionError("Changed PAC backup allowed absent-output confirmation")
+        backup.write_bytes(prior)
+    unknown = fixture.game / "data/enhanced/modded.pac"
+    unknown.write_bytes(b"unrelated PAC")
+    _write_matching_log(fixture, receipt, "unexpected-output.txt")
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except WorkflowError as exc:
+        assert "Unexpected PAC output" in str(exc)
+    else:
+        raise AssertionError("Unknown PAC allowed absent-output confirmation")
+    assert unknown.read_bytes() == b"unrelated PAC"
+    unknown.unlink()
+
+    def fail_after_receipt(name, kind):
+        if name == "final-verifier" and kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
+            raise RuntimeError("injected after absent-output receipt")
+    fixture.recompose(failure_injector=fail_after_receipt, process_running=lambda: False)
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Failed absent-output confirmation succeeded")
+    assert _owned_state(fixture) == original
+    _installation, rolled_back = fixture.composition._readiness()
+    assert rolled_back.recovery == ReadinessAspect.READY
+    assert sum("PAC runtime output confirmation required" in issue
+               for issue in rolled_back.issues) == 2
+    fixture.recompose(failure_injector=None, process_running=lambda: False)
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    confirmed = read_receipt(fixture.inputs.receipts_root)
+    assert confirmed.data["last_successful_operation"] == "confirm-absent-runtime-output"
+    assert confirmed.data["generated_pac_observations"] == []
+    assert all(path.is_file() for path in backups)
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == verified.recovery == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+    (fixture.game / "version.dll").unlink()
+    fixture.run(OperationKind.REPAIR)
+    repaired = read_receipt(fixture.inputs.receipts_root)
+    assert repaired.data["last_successful_operation"] == "confirm-absent-runtime-output"
+    assert all(path.is_file() for path in backups)
+
+    (fixture.profile / "modlist.txt").write_text(
+        "+High\n-Low\n-Disabled\n", encoding="utf-8")
+    fixture.run(OperationKind.SYNCHRONIZE)
+    enabled = read_receipt(fixture.inputs.receipts_root)
+    assert enabled.data["last_successful_operation"] == "synchronize"
+    assert all(item["state"] == "absent" for item in
+               enabled.data["generated_pac_baseline"]["paths"])
+    _installation, verified = fixture.composition._readiness()
+    assert verified.profile == verified.recovery == ReadinessAspect.READY
+    assert verified.issues == ("Current installation evidence does not match the receipt",)
+
+    enabled_receipt = (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes()
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except WorkflowError as exc:
+        assert "matching managed launch log" in str(exc)
+    else:
+        raise AssertionError("Enabled profile accepted absent-output confirmation")
+    assert (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes() == enabled_receipt
+
+    blocked, _payloads = absent_fixture("all-disabled-unknown-removal")
+    blocked.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    receipt_before_remove = (blocked.inputs.receipts_root / "fftic-receipt.json").read_bytes()
+    unknown = blocked.game / "data/enhanced/modded.pac"
+    unknown.write_bytes(b"unrelated after confirmation")
+    try:
+        blocked.run(OperationKind.REMOVE)
+    except RecoveryRequiredError:
+        pass
+    else:
+        raise AssertionError("Removal consumed an unrelated PAC after absent confirmation")
+    assert unknown.read_bytes() == b"unrelated after confirmation"
+    assert (blocked.inputs.receipts_root / "fftic-receipt.json").read_bytes() == receipt_before_remove
+
+    removable, _payloads = absent_fixture("all-disabled-absent-removal")
+    removable.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    before_failed_remove = _owned_state(removable)
+    def fail_remove(name, kind):
+        if name == "remove:version.dll" and kind == OperationKind.REMOVE:
+            raise RuntimeError("injected removal failure")
+    removable.recompose(failure_injector=fail_remove, process_running=lambda: False)
+    try:
+        removable.run(OperationKind.REMOVE)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Failed removal after absent confirmation succeeded")
+    assert _owned_state(removable) == before_failed_remove
+    removable.recompose(failure_injector=None, process_running=lambda: False)
+    removable.run(OperationKind.REMOVE)
+    assert read_receipt(removable.inputs.receipts_root) is None
+    assert not any((removable.game / relative).exists() for relative in _payloads)
+
+
+def test_enabled_mod_missing_exact_pac_still_requires_launch_evidence() -> None:
+    fixture = Fixture("enabled-missing-pac")
+    fixture.run(OperationKind.SETUP)
+    fixture.recompose(process_running=lambda: False)
+    target = fixture.game / "data/enhanced/modded.pac"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"prior managed output")
+    _write_matching_log(fixture, read_receipt(fixture.inputs.receipts_root), "first.txt")
+    fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    (fixture.profile / "modlist.txt").write_text(
+        "+High\n-Low\n-Disabled\n", encoding="utf-8")
+    fixture.run(OperationKind.SYNCHRONIZE)
+    target.unlink()
+    before = _owned_state(fixture)
+    try:
+        fixture.run(OperationKind.RECONCILE_RUNTIME_OUTPUT)
+    except WorkflowError as exc:
+        assert "matching managed launch log" in str(exc)
+    else:
+        raise AssertionError("Enabled mod accepted absent output without launch evidence")
+    assert _owned_state(fixture) == before
+
+
 def test_preexisting_backup_survives_failed_removal() -> None:
     def fail(name, kind):
         if kind == OperationKind.REMOVE and name == "remove:version.dll":
@@ -1095,6 +1266,8 @@ def main() -> None:
         test_unknown_preexisting_pac_is_persisted_and_blocks_removal,
         test_prior_exact_owned_pac_transition_restores_before_state,
         test_consecutive_synchronization_retains_exact_pac_ownership,
+        test_all_disabled_absent_pac_confirmation_and_lifecycle,
+        test_enabled_mod_missing_exact_pac_still_requires_launch_evidence,
         test_preexisting_backup_survives_failed_removal,
         test_cleanup_and_cross_operation_failure_boundaries,
         test_removal_failure_boundaries_restore_exact_owned_state,

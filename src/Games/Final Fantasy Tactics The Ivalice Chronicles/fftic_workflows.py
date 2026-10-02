@@ -41,7 +41,7 @@ try:
     from .fftic_pac import (
         PacLaunchEvidence, PacObservation, PacOwnershipState,
         baseline_set_from_receipt, capture_generated_pacs, capture_pac_baseline,
-        inspect_matching_launch_log,
+        exact_absent_output, inspect_matching_launch_log,
         pac_ownership,
     )
     from .fftic_prerequisites import (
@@ -86,7 +86,7 @@ except ImportError:
     from fftic_pac import (
         PacLaunchEvidence, PacObservation, PacOwnershipState,
         baseline_set_from_receipt, capture_generated_pacs, capture_pac_baseline,
-        inspect_matching_launch_log,
+        exact_absent_output, inspect_matching_launch_log,
         pac_ownership,
     )
     from fftic_prerequisites import (
@@ -918,7 +918,10 @@ class FfticLifecycleComposition:
             },
             "generated_pac_baseline": baseline_data,
             "generated_pac_observations": generated_observations,
-            "last_successful_operation": operation,
+            "last_successful_operation": (
+                "confirm-absent-runtime-output"
+                if operation == "repair" and old and old["last_successful_operation"]
+                == "confirm-absent-runtime-output" else operation),
             "incomplete_operation": None,
             "recovery_instructions": [
                 f"Review durable lifecycle evidence at {self.inputs.journal_file}."],
@@ -1015,6 +1018,11 @@ class FfticLifecycleComposition:
         receipt = token.receipt_record
         if receipt is None:
             raise WorkflowError(f"{operation.title()} requires an ownership receipt")
+        if receipt.data["last_successful_operation"] == "confirm-absent-runtime-output":
+            baseline = baseline_set_from_receipt(receipt.data["generated_pac_baseline"])
+            if not exact_absent_output(
+                    self.inputs.game_root, baseline, receipt.data["user_packages"]):
+                raise WorkflowError("Confirmed absent PAC output or its backup has changed")
         self._assert_readiness(
             f"{operation.title()} refuses drift outside the current profile",
             allow_profile_drift=True)
@@ -1147,6 +1155,20 @@ class FfticLifecycleComposition:
                 "Legacy PAC state requires the recoverable rebuild reconciliation first")
         baseline_data = receipt.data["generated_pac_baseline"]
         baseline = baseline_set_from_receipt(baseline_data)
+        if (not receipt.data["generated_pac_observations"]
+                and exact_absent_output(
+                    self.inputs.game_root, baseline, receipt.data["user_packages"])):
+            updated = dict(receipt.data)
+            updated.update(
+                transaction_id=f"fftic-{uuid.uuid4().hex}", updated_at=self._now(),
+                last_successful_operation="confirm-absent-runtime-output")
+            self._ensure_stopped()
+            write_receipt(self.inputs.receipts_root, validate_receipt(updated))
+            token.mutated_files.add(self.inputs.receipts_root / "fftic-receipt.json")
+            return
+        if not any(item["enabled"] for item in receipt.data["user_packages"]):
+            raise WorkflowError(
+                "Unexpected PAC output or invalid backup with all user mods disabled is preserved")
         evidence = self._dynamic_pac_evidence(receipt)
         matching = next((item for item in evidence if (
             item.generation_id == baseline.generation_id
@@ -1269,6 +1291,12 @@ class FfticLifecycleComposition:
                         or item.state != PacOwnershipState.OWNED_EXACT):
                     continue
                 target = self._receipt_pac_path(item.relative_path)
+                if (receipt.data["last_successful_operation"] ==
+                        "confirm-absent-runtime-output"):
+                    if not exact_absent_output(
+                            self.inputs.game_root, baseline, receipt.data["user_packages"]):
+                        raise RecoveryRequiredError("Confirmed absent PAC output has changed")
+                    continue
                 if (target.is_symlink() or not target.is_file()
                         or file_sha256(target) != item.sha256):
                     raise RecoveryRequiredError(
