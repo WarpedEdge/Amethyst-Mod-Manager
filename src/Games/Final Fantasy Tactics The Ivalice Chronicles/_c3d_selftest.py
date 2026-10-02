@@ -492,6 +492,7 @@ def test_reconciliation_is_narrowly_gated_from_genuine_recovery() -> None:
 
 
 def test_panel_enables_only_current_actions() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
     from gui_qt.fftic_status import FfticStatusPanel
 
@@ -513,6 +514,25 @@ def test_panel_enables_only_current_actions() -> None:
     assert not any(button.isEnabled() for button in panel._action_buttons.values())
     panel.set_operation(False)
     assert panel._action_buttons["setup"].isEnabled()
+
+    panel.set_status(FfticStatusViewModel(
+        FFTIC_GAME_ID, "FFTIC", (
+            _row("reconciliation", "Runtime rebuild required"),
+            _row("recovery", "Runtime output confirmation required"),
+        ), (), (), COPY_READY_OPTIONS, (), False, False, True, "",
+        "Confirm the recoverable runtime rebuild",
+        available_actions=(OperationKind.RECONCILE_RUNTIME_OUTPUT.value,),
+        action_unavailable_reasons=reasons))
+    panel.resize(900, panel.sizeHint().height())
+    panel.show()
+    app.processEvents()
+    reconcile = panel._action_buttons["reconcile_runtime_output"]
+    assert reconcile.isVisible() and panel._copy.isVisible()
+    assert not reconcile.geometry().intersects(panel._copy.geometry())
+    assert reconcile.isEnabled()
+    assert panel._copy.isEnabled()
+    panel._copy.click()
+    assert app.clipboard().text() == COPY_READY_OPTIONS
     panel.close()
     app.processEvents()
 

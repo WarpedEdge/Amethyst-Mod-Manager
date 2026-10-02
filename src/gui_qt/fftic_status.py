@@ -108,8 +108,9 @@ class FfticStatusPanel(QFrame):
         self._copy.setObjectName("FormButton")
         self._copy.setCursor(Qt.PointingHandCursor)
         self._copy.clicked.connect(self._copy_steam_options)
-        action_layout.addWidget(self._copy, 1, 2)
-        action_layout.setColumnStretch(3, 1)
+        action_layout.addWidget(self._copy, 2, 0, 1, 3)
+        for column in range(3):
+            action_layout.setColumnStretch(column, 1)
         outer.addWidget(actions)
 
         self._details = QFrame()
