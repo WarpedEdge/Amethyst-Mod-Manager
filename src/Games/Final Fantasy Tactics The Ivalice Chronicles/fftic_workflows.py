@@ -177,6 +177,7 @@ class WorkflowInputs:
     pac_launch_evidence: tuple[PacLaunchEvidence, ...] = ()
     process_running: Callable[[], bool] | None = None
     failure_injector: Callable[[str, OperationKind], None] | None = None
+    runner_script_reader: Callable[[], Path | None] | None = None
 
 
 @dataclass
@@ -289,8 +290,16 @@ class FfticLifecycleComposition:
     def _current_runner(self) -> str:
         runner = self.inputs.runner_reader()
         if not supported_runner(runner):
-            raise WorkflowError("Selected Proton runner is outside the supported Experimental 11.0 policy")
+            raise WorkflowError("Selected Proton runner is unresolved or outside the managed-tool policy")
         return runner
+
+    def _current_runner_script(self) -> str | None:
+        if self.inputs.runner_script_reader is None:
+            return None
+        script = self.inputs.runner_script_reader()
+        if script is None or not supported_runner(self._current_runner(), script):
+            raise WorkflowError("Selected Steam Proton script is missing, linked, or changed")
+        return str(Path(script).absolute())
 
     def _current_steam_options(self) -> SteamOptionsAnalysis:
         value = self.inputs.steam_options_reader()
@@ -312,8 +321,11 @@ class FfticLifecycleComposition:
             raise WorkflowError("Operation binding differs from the composed lifecycle roots")
         self._current_installation()
         runner = self._current_runner()
+        runner_script = self._current_runner_script()
         if getattr(binding, "runner_identity", "") and binding.runner_identity != runner:
             raise WorkflowError("Selected Proton runner changed since the operation plan")
+        if getattr(binding, "runner_script", "") and runner_script is not None and binding.runner_script != runner_script:
+            raise WorkflowError("Selected Proton script changed since the operation plan")
         self._current_steam_options()
         resolve_steam_s_path(
             steam_library=self.inputs.steam_library,
@@ -412,6 +424,7 @@ class FfticLifecycleComposition:
                                   kind: OperationKind | None = None) -> None:
         evidence = self._current_installation()
         runner = self._current_runner()
+        runner_script = self._current_runner_script()
         self._current_steam_options()
         steam = resolve_steam_s_path(
             steam_library=self.inputs.steam_library, app_manifest=self.inputs.app_manifest,
@@ -429,8 +442,10 @@ class FfticLifecycleComposition:
             raise RecoveryRequiredError(
                 "Receipt installation, prefix, runner, or executable identity is stale")
         if not supported_runner(prefix["runner_identity"]):
-            raise RecoveryRequiredError("Receipt runner is outside the supported Experimental 11.0 policy")
-        if (prefix["runner_identity"] != runner
+            raise RecoveryRequiredError("Receipt runner identity is malformed")
+        if ((prefix["runner_identity"] != runner
+             or ("runner_script" in prefix and runner_script is not None
+                 and prefix["runner_script"] != runner_script))
                 and kind not in {OperationKind.SYNCHRONIZE, OperationKind.REMOVE}):
             raise RecoveryRequiredError(
                 "Selected Proton runner changed; synchronize before launch-log reconciliation or repair")
@@ -815,6 +830,9 @@ class FfticLifecycleComposition:
             "reloaded": "1.31.0", "sigscan": "1.2.14",
             "shared_hooks": "1.16.3", "nenkai": "1.7.3",
         }
+        runner_script = self._current_runner_script()
+        if runner_script is not None:
+            compatibility_tuple["proton_script"] = runner_script
         transaction_id = f"fftic-{uuid.uuid4().hex}"
         current_users = [{
             "mod_id": item["mod_id"], "enabled": item["enabled"],
@@ -883,7 +901,8 @@ class FfticLifecycleComposition:
                 "installed_directory": steam.installed_directory,
             },
             "prefix_identity": {"path": str(steam.prefix),
-                                "runner_identity": runner},
+                                "runner_identity": runner,
+                                **({"runner_script": runner_script} if runner_script else {})},
             "executable_hashes": dict(installation.detection.executable_hashes),
             "evidence_authority": installation.authority,
             "compatibility_tuple": compatibility_tuple,
@@ -937,16 +956,19 @@ class FfticLifecycleComposition:
             "recovery_instructions": [
                 f"Review durable lifecycle evidence at {self.inputs.journal_file}."],
         }
-        if old and (old.get("runner_history") or old["prefix_identity"]["runner_identity"] != runner):
+        if old and (old.get("runner_history") or old["prefix_identity"]["runner_identity"] != runner
+                    or (runner_script is not None and old["prefix_identity"].get("runner_script") not in {None, runner_script})):
             history = list(old.get("runner_history", ()))
             previous_runner = old["prefix_identity"]["runner_identity"]
-            if previous_runner != runner:
+            if previous_runner != runner or (runner_script is not None and old["prefix_identity"].get("runner_script") not in {None, runner_script}):
                 if prior_bytes is None:
                     raise WorkflowError("Prior receipt bytes are unavailable for runner history")
                 history.append({
                     "transaction_id": old["transaction_id"],
                     "from_runner": previous_runner,
                     "to_runner": runner,
+                    **({"from_script": old["prefix_identity"]["runner_script"],
+                        "to_script": runner_script} if old["prefix_identity"].get("runner_script") and runner_script else {}),
                     "prior_receipt_sha256": hashlib.sha256(prior_bytes).hexdigest(),
                 })
             data["runner_history"] = history
@@ -1064,6 +1086,9 @@ class FfticLifecycleComposition:
         generation, _paths = self._build(token, cancel, candidates)
         if generation.generation_id == self._current_generation_id():
             if (receipt.data["prefix_identity"]["runner_identity"] == self._current_runner()
+                    and (self._current_runner_script() is None or
+                         receipt.data["prefix_identity"].get("runner_script") in
+                         {None, self._current_runner_script()})
                     or operation != "synchronize"):
                 raise WorkflowError(
                     f"{operation.title()} has no changed reviewed input to publish")
@@ -1440,7 +1465,8 @@ class FfticLifecycleComposition:
             self._current_runner(), self.inputs.active_state_file,
             self.inputs.profile_dir, self.inputs.staging_root,
             self.inputs.prerequisite_reader(self.inputs.prefix),
-            self._current_steam_options(), self._dynamic_pac_evidence(receipt)))
+            self._current_steam_options(), self._dynamic_pac_evidence(receipt),
+            self._current_runner_script()))
 
     def _assert_readiness(self, prefix: str, *, allow_profile_drift: bool = False,
                           allow_pac_disposition: bool = False,

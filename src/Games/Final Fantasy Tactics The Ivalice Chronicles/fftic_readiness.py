@@ -76,6 +76,7 @@ class ReadinessEvidence:
     prerequisites: PrefixPrerequisites
     steam_options: SteamOptionsAnalysis
     pac_launch_evidence: tuple[PacLaunchEvidence, ...] = ()
+    runner_script: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,10 +216,12 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
     if prefix["runner_identity"] != compatibility["proton_runner"]:
         reject("recovery", "Receipt runner fields disagree")
     if not supported_runner(prefix["runner_identity"]):
-        reject("recovery", "Receipt runner is outside the supported Experimental 11.0 policy")
+        reject("recovery", "Receipt runner identity is malformed")
     if not supported_runner(evidence.runner_identity):
-        reject("runner", "Selected Proton runner is outside the supported Experimental 11.0 policy")
-    elif evidence.runner_identity != prefix["runner_identity"]:
+        reject("runner", "Selected Proton runner is unresolved or malformed")
+    elif (evidence.runner_identity != prefix["runner_identity"]
+          or ("runner_script" in prefix and evidence.runner_script is not None
+              and evidence.runner_script != prefix["runner_script"])):
         reject("runner", "Selected Proton runner changed since the managed receipt; synchronize to record a new generation")
 
     generation_identity = receipt["active_generation_identity"]

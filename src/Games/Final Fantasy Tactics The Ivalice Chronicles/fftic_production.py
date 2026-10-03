@@ -72,7 +72,7 @@ def _canonical_steam_client_root(value) -> Path:
 
 def _supported_selected_runner(steam_id: str, prefix: Path) -> str:
     selection = resolve_proton_selection(steam_id, prefix)
-    if (selection.prefix_runtime != "11.0-100"
+    if (selection.proton_script is None
             or not supported_runner(selection.tool_identity, selection.proton_script)):
         return ""
     return selection.tool_identity
@@ -186,7 +186,8 @@ def create_production_executor(
             runner = selection.proton_script
             if selection.tool_identity != plan.runner_identity:
                 raise ValueError("The selected Proton identity changed before installation")
-            if not supported_runner(selection.tool_identity, selection.proton_script):
+            if (selection.proton_script is None
+                    or not supported_runner(selection.tool_identity, selection.proton_script)):
                 raise ValueError("The selected Proton tool is outside the supported Steam policy")
             if runner is None:
                 raise ValueError("The selected Proton installation could not be resolved")
@@ -254,6 +255,7 @@ def create_production_executor(
             steam_options_reader=lambda: analyze_steam_launch_options(
                 steam_launch_options(game.steam_id)),
             runner_reader=lambda: _supported_selected_runner(game.steam_id, prefix),
+            runner_script_reader=lambda: resolve_proton_selection(game.steam_id, prefix).proton_script,
             prerequisite_reader=inspect_prefix_prerequisites,
             process_request_factory=process_request,
             process_runner=FfticPrerequisiteRunner(

@@ -64,8 +64,7 @@ class FfticPrerequisiteRunner:
             return  # Isolated runner tests supply a synthetic request.
         selected = self._selection_reader()
         if (selected.proton_script != request.runner
-                or selected.tool_identity != request.runner_identity
-                or selected.prefix_runtime != "11.0-100"):
+                or selected.tool_identity != request.runner_identity):
             raise ManagedOperationError(
                 "Steam selected a different Proton tool since the installer plan")
 

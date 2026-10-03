@@ -249,7 +249,7 @@ def _action_availability(
     required = ("game", "steam_prefix", "runner", "steam_options", "recovery")
     foundation_ready = all(
         by_key.get(key) is not None
-        and by_key[key].state in {"Ready", "Configured", "Retry available"}
+        and by_key[key].state in {"Ready", "Configured", "Retry available", "Unverified"}
         for key in required)
     prerequisites_setup_safe = all(
         by_key.get(key) is not None
@@ -276,10 +276,12 @@ def _action_availability(
         and all(by_key.get(key) is not None and by_key[key].state == state
                 for key, state in (
                     ("game", "Ready"), ("steam_prefix", "Ready"),
-                    ("runner", "Ready"), ("dotnet", "Ready"), ("vc", "Ready"),
+                    ("dotnet", "Ready"), ("vc", "Ready"),
                     ("steam_options", "Configured"), ("bootstrap", "Ready"),
                     ("prefix_config", "Ready"), ("profile", "Ready"),
                     ("recovery", "Runtime output confirmation required")))
+        and by_key.get("runner") is not None
+        and by_key["runner"].state in {"Ready", "Unverified"}
         and all(by_key.get(key) is not None
                 and by_key[key].state == expected_component_state
                 for key in ("runtime", "nenkai", "sigscan", "hooks")))
@@ -333,13 +335,13 @@ def _action_availability(
             for issue in getattr(verification, "issues", ()))
         if (receipt_present and no_unsupported and profile_reconcilable
                 and by_key.get("runner") is not None
-                and by_key["runner"].state in {"Ready", "Different"}
+                and by_key["runner"].state in {"Ready", "Unverified", "Different"}
                 and all(value == ReadinessAspect.READY for value in protected)
                 and (verification.profile != ReadinessAspect.READY or runner_transition)):
             actions.append(OperationKind.SYNCHRONIZE.value)
         if (receipt_present and no_unsupported
                 and by_key.get("runner") is not None
-                and by_key["runner"].state in {"Ready", "Different"}
+                and by_key["runner"].state in {"Ready", "Unverified", "Different"}
                 and all(value == ReadinessAspect.READY for value in protected)
                 and (runner_state == ReadinessAspect.READY or runner_transition)
                 and verification.profile == ReadinessAspect.READY):
@@ -540,19 +542,41 @@ class DefaultStatusInspector:
         except Exception:
             proton = ProtonSelection(None, "", "")
         runner = proton.tool_identity
-        runner_supported = (supported_runner(runner, proton.proton_script)
-                            and proton.prefix_runtime == "11.0-100")
+        runner_supported = (proton.proton_script is not None
+                            and supported_runner(runner, proton.proton_script))
+        if not proton.steam_mapping:
+            runner_problem = (
+                "Steam has no readable per-game compatibility mapping. Select this game's "
+                "Proton tool in Steam Compatibility; the prefix's last-used runner "
+                "does not prove the current selection.")
+        elif (proton.steam_mapping == "proton_hotfix"
+              or proton.steam_mapping.endswith("_beta")):
+            runner_problem = (
+                "Steam Hotfix and Beta mappings have not been audited for their "
+                "exact tool layout and version format.")
+        elif not (proton.steam_mapping == "proton_experimental"
+                  or proton.steam_mapping.startswith("proton_")
+                  and proton.steam_mapping[7:].isdigit()):
+            runner_problem = (
+                "This custom compatibility mapping selects a user-provided executable "
+                "whose origin and prerequisite behavior have not been reviewed.")
+        else:
+            runner_problem = (
+                "The selected Steam-managed Proton script, version, or matching "
+                "appmanifest is missing, malformed, linked, or ambiguous.")
         runner_row = _row(
             "runner", "Proton runner",
-            "Ready" if runner_supported else "Unsupported",
-            StatusSeverity.READY if runner_supported else StatusSeverity.ERROR,
-            ("The selected Steam Proton Experimental 11.0 tool is within policy." if
+            "Unverified" if runner_supported else "Unsupported",
+            StatusSeverity.WARNING if runner_supported else StatusSeverity.ERROR,
+            ("The selected Steam Proton tool is safe to test; this game and mod "
+             "combination has not been verified in-game." if
              runner_supported else
-             "The selected tool or prefix runtime is unresolved or outside the supported policy."),
+             runner_problem),
             f"Selected runner: {runner or '<unresolved>'}",
             f"Selected script: {proton.proton_script or '<unresolved>'}",
+            f"Steam compatibility mapping: {proton.steam_mapping or '<unresolved>'}",
             f"Prefix runtime: {proton.prefix_runtime or '<unresolved>'}",
-            "Supported: Steam Proton Experimental 11.0 builds dated 20260924 or later; prefix runtime 11.0-100")
+            "Steam-managed official Proton releases and Experimental can be tested; Hotfix and unreviewed custom executables remain blocked.")
 
         self._cancelled(cancel)
         prerequisites = (inspect_prefix_prerequisites(prefix) if prefix is not None
@@ -762,7 +786,8 @@ class DefaultStatusInspector:
                 verification = verify_launch_readiness(ReadinessEvidence(
                     receipt, installation, steam_path, manifest, runner,
                     active_state, context.profile_dir, context.staging_root,
-                    prerequisites, steam_options, pac_evidence))
+                    prerequisites, steam_options, pac_evidence,
+                    str(proton.proton_script) if proton.proton_script else None))
                 self._cancelled(cancel)
             except InspectionCancelled:
                 raise
@@ -778,7 +803,7 @@ class DefaultStatusInspector:
             issues = verification.issues
 
             def rejected(row: StatusRow, summary: str) -> StatusRow:
-                if row.severity != StatusSeverity.READY:
+                if row.severity != StatusSeverity.READY and not (row.key == "runner" and row.state == "Unverified"):
                     return row
                 return _row(row.key, row.label, "Different",
                             StatusSeverity.ERROR, summary, *issues)
@@ -875,15 +900,15 @@ class DefaultStatusInspector:
             *((receipt.data.get("recovery_instructions", ()) if receipt else ())))
 
         ready = bool(verification and verification.ready and not unsupported
-                     and runner_row.state == "Ready")
+                     and runner_row.state in {"Ready", "Unverified"})
         launch_pending = normalization_pending or pac_confirmation_pending
         launch_row = _row(
-            "launch", "Launch readiness", "Ready" if ready else
+            "launch", "Launch readiness", "Ready to test" if ready else
             "Runtime output confirmation required" if launch_pending else
             "Managed support needs attention" if receipt is not None else "Setup required",
-            StatusSeverity.READY if ready else
+            StatusSeverity.WARNING if ready else
             StatusSeverity.WARNING if launch_pending else StatusSeverity.ERROR,
-            ("Verifier-attested readiness passed. Start FFTIC normally from Steam."
+            ("Managed state is ready for an unverified test. Start FFTIC normally from Steam."
              if ready else
              "The managed installation exists; confirm the exact pending runtime transition."
              if launch_pending else
@@ -915,7 +940,7 @@ class DefaultStatusInspector:
             f"Enhanced executable SHA-256: {hashes.get('enhanced', '<unavailable>')}",
             (f"Supported tuple: Steam {VERIFIED_STEAM_BUILD}; runtime-proven UI metadata "
              f"{VERIFIED_UI_VERSION}; "
-             "runner policy: Steam Proton Experimental 11.0 from 20260924; prefix runtime 11.0-100"),
+             "runner policy: canonical Steam-managed Proton; selected runner remains unverified until in-game testing"),
             f"Current generation: {generation_id or '<none>'}",
             f"Reloaded-II: {versions['runtime']}; Nenkai: {versions['nenkai']}; "
             f"SigScan: {versions['sigscan']}; Shared Hooks: {versions['hooks']}",

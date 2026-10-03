@@ -142,6 +142,17 @@ def test_composition_derives_owned_paths_and_delays_acquisition() -> None:
                return_value=selected) as resolver:
         assert inputs.runner_reader() == SUPPORTED_PROTON_RUNNER
     resolver.assert_called_once_with(fixture.game.steam_id, fixture.prefix)
+    stable = fixture.root / "steam/steamapps/common/Proton 9.0/proton"
+    stable.parent.mkdir(parents=True)
+    stable.write_text("fixture", encoding="utf-8")
+    (stable.parent / "version").write_text("1 proton-9.0-4f\n", encoding="utf-8")
+    (fixture.root / "steam/steamapps/appmanifest_2805730.acf").write_text(
+        '"AppState" { "appid" "2805730" "installdir" "Proton 9.0" }',
+        encoding="utf-8")
+    alternate = SimpleNamespace(proton_script=stable, tool_identity="proton-9.0-4f",
+                                prefix_runtime="9.0-200")
+    with patch("fftic_production.resolve_proton_selection", return_value=alternate):
+        assert inputs.runner_reader() == "proton-9.0-4f"
     health = SimpleNamespace(
         dotnet_desktop=SimpleNamespace(state=SimpleNamespace(value="sufficient")),
         vc_runtime=SimpleNamespace(state=SimpleNamespace(value="sufficient")))
@@ -365,6 +376,12 @@ def test_action_gating_and_prerequisite_blocker() -> None:
     actions, reasons = _action_availability(
         setup_rows, receipt_present=False, verification=None, unsupported=())
     assert actions == (OperationKind.SETUP.value,)
+    unverified_runner = tuple(
+        _row(row.key, "Unverified") if row.key == "runner" else row
+        for row in setup_rows)
+    actions, _reasons = _action_availability(
+        unverified_runner, receipt_present=False, verification=None, unsupported=())
+    assert OperationKind.SETUP.value in actions
     assert OperationKind.UPDATE.value not in actions
     assert "distinct reviewed artifact identity" in dict(reasons)["update"]
 

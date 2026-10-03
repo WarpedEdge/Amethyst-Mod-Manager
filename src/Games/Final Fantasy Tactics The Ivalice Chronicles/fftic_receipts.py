@@ -124,9 +124,14 @@ def validate_receipt(data: object) -> dict:
     _absolute_path(game["steam_library"], "game_root_identity.steam_library")
     if not isinstance(game["installed_directory"], str) or not game["installed_directory"]:
         _fail("game_root_identity.installed_directory")
-    prefix = _exact(data["prefix_identity"], {"path", "runner_identity"}, "prefix_identity")
+    prefix_fields = {"path", "runner_identity"}
+    if schema == 2 and isinstance(data["prefix_identity"], dict) and "runner_script" in data["prefix_identity"]:
+        prefix_fields.add("runner_script")
+    prefix = _exact(data["prefix_identity"], prefix_fields, "prefix_identity")
     _absolute_path(prefix["path"], "prefix_identity.path")
     _identifier(prefix["runner_identity"], "prefix_identity.runner_identity")
+    if "runner_script" in prefix:
+        _absolute_path(prefix["runner_script"], "prefix_identity.runner_script")
     executables = _exact(data["executable_hashes"], {"classic", "enhanced"}, "executable_hashes")
     for key, value in executables.items():
         _hash(value, f"executable_hashes.{key}")
@@ -138,10 +143,17 @@ def validate_receipt(data: object) -> dict:
               and authority.startswith("isolated-fixture:")
               and len(authority) <= 128):
         _fail("evidence_authority")
-    compatibility = _exact(data["compatibility_tuple"], {
+    compatibility_fields = {
         "steam_build", "ui_version", "proton_runner", "reloaded", "sigscan",
         "shared_hooks", "nenkai",
-    }, "compatibility_tuple")
+    }
+    if schema == 2 and isinstance(data["compatibility_tuple"], dict) and "proton_script" in data["compatibility_tuple"]:
+        compatibility_fields.add("proton_script")
+    compatibility = _exact(data["compatibility_tuple"], compatibility_fields, "compatibility_tuple")
+    if "proton_script" in compatibility:
+        _absolute_path(compatibility["proton_script"], "compatibility_tuple.proton_script")
+    if prefix.get("runner_script") != compatibility.get("proton_script"):
+        _fail("prefix/compatibility runner script")
     if not all(isinstance(value, str) and value for value in compatibility.values()):
         _fail("compatibility_tuple")
     if (compatibility["steam_build"] != VERIFIED_STEAM_BUILD
@@ -158,16 +170,23 @@ def validate_receipt(data: object) -> dict:
         if not isinstance(history, list) or len(history) > 64:
             _fail("runner_history")
         for index, entry in enumerate(history):
-            entry = _exact(entry, {"transaction_id", "from_runner", "to_runner",
-                                   "prior_receipt_sha256"}, f"runner_history[{index}]")
+            fields = {"transaction_id", "from_runner", "to_runner", "prior_receipt_sha256"}
+            if isinstance(entry, dict) and ("from_script" in entry or "to_script" in entry):
+                fields.update({"from_script", "to_script"})
+            entry = _exact(entry, fields, f"runner_history[{index}]")
             _identifier(entry["transaction_id"], "runner_history.transaction_id")
             _identifier(entry["from_runner"], "runner_history.from_runner")
             _identifier(entry["to_runner"], "runner_history.to_runner")
             _hash(entry["prior_receipt_sha256"], "runner_history.prior_receipt_sha256")
-            if entry["from_runner"] == entry["to_runner"]:
+            if "from_script" in entry:
+                _absolute_path(entry["from_script"], "runner_history.from_script")
+                _absolute_path(entry["to_script"], "runner_history.to_script")
+            if entry["from_runner"] == entry["to_runner"] and entry.get("from_script") == entry.get("to_script"):
                 _fail("runner_history unchanged runner")
         if history and history[-1]["to_runner"] != prefix["runner_identity"]:
             _fail("runner_history current runner")
+        if history and "to_script" in history[-1] and history[-1]["to_script"] != prefix.get("runner_script"):
+            _fail("runner_history current runner script")
     generation = _exact(data["active_generation_identity"],
                         {"generation_id", "root", "manifest_sha256"},
                         "active_generation_identity")

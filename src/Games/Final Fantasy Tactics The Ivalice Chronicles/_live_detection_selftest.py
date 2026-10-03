@@ -75,26 +75,26 @@ def test_selected_proton_tool_and_prefix_runtime_are_distinct() -> None:
         experimental = _tool(root / "Proton - Experimental", SUPPORTED_PROTON_RUNNER)
         proton_9 = _tool(root / "Proton 9.0 (Beta)", "proton-9.0-4f")
 
-        with patch("Utils.launchers.steam.find_proton_for_game",
-                   return_value=experimental):
+        with patch("fftic_proton._steam_selected_script",
+                   return_value=(experimental, "proton_experimental")):
             selected = resolve_proton_selection("1004640", prefix)
         assert selected.tool_identity == SUPPORTED_PROTON_RUNNER
         assert selected.prefix_runtime == "11.0-100"
         assert selected.prefix_runtime != selected.tool_identity
 
-        with patch("Utils.launchers.steam.find_proton_for_game", return_value=proton_9):
+        with patch("fftic_proton._steam_selected_script", return_value=(proton_9, "proton_9")):
             unsupported = resolve_proton_selection("1004640", prefix)
         assert unsupported.tool_identity == "proton-9.0-4f"
         assert unsupported.tool_identity != SUPPORTED_PROTON_RUNNER
 
         unknown_tool = _tool(root / "Unknown Proton", "unknown-build")
-        with patch("Utils.launchers.steam.find_proton_for_game",
-                   return_value=unknown_tool):
+        with patch("fftic_proton._steam_selected_script",
+                   return_value=(unknown_tool, "unknown")):
             unknown = resolve_proton_selection("1004640", prefix)
         assert unknown.tool_identity == "unknown-build"
         assert unknown.tool_identity != SUPPORTED_PROTON_RUNNER
 
-        with patch("Utils.launchers.steam.find_proton_for_game", return_value=None):
+        with patch("fftic_proton._steam_selected_script", return_value=(None, "")):
             missing = resolve_proton_selection("1004640", prefix)
         assert missing.tool_identity == ""
 
@@ -104,7 +104,8 @@ def test_selected_proton_tool_and_prefix_runtime_are_distinct() -> None:
             return FfticLifecycleComposition._current_runner(composition)
 
         assert workflow_runner(selected.tool_identity) == SUPPORTED_PROTON_RUNNER
-        for identity in (unsupported.tool_identity, unknown.tool_identity, ""):
+        assert workflow_runner(unsupported.tool_identity) == "proton-9.0-4f"
+        for identity in (unknown.tool_identity, ""):
             try:
                 workflow_runner(identity)
             except WorkflowError:
