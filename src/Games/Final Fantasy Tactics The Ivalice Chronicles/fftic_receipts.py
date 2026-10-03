@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES
+    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin
     from .fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from .fftic_reloaded_config import MANAGED_ORDER
     from .fftic_steam_requirements import REQUIRED_OPTIONS_SHA256
 except ImportError:
-    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES
+    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin
     from fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from fftic_reloaded_config import MANAGED_ORDER
     from fftic_steam_requirements import REQUIRED_OPTIONS_SHA256
@@ -161,7 +161,7 @@ def validate_receipt(data: object) -> dict:
             or compatibility["reloaded"] != "1.31.0"
             or compatibility["sigscan"] != "1.2.14"
             or compatibility["shared_hooks"] != "1.16.3"
-            or compatibility["nenkai"] != "1.7.3"):
+            or compatibility["nenkai"] not in {"1.7.3", "1.7.5"}):
         _fail("compatibility_tuple reviewed identities")
     if prefix["runner_identity"] != compatibility["proton_runner"]:
         _fail("prefix/compatibility runner identity")
@@ -211,12 +211,19 @@ def validate_receipt(data: object) -> dict:
         _hash(item["sha256"], f"artifacts[{index}].sha256")
         if item["artifact_id"] not in ARTIFACTS:
             _fail(f"artifacts[{index}].artifact_id")
-        pin = ARTIFACTS[item["artifact_id"]]
+        try:
+            pin = (loader_pin(item["version"]) if item["artifact_id"] == "nenkai-loader"
+                   else ARTIFACTS[item["artifact_id"]])
+        except ValueError:
+            _fail(f"artifacts[{index}] reviewed identity")
         if any((item["version"] != pin.version, item["url"] != pin.url,
                 item["size"] != pin.size, item["sha256"] != pin.sha256)):
             _fail(f"artifacts[{index}] reviewed identity")
     if set(artifact_ids) != expected_artifacts or len(set(artifact_ids)) != len(artifact_ids):
         _fail("artifacts identities")
+    if compatibility["nenkai"] != next(item["version"] for item in artifacts
+                                    if item["artifact_id"] == "nenkai-loader"):
+        _fail("compatibility_tuple loader identity")
 
     managed = data["managed_packages"]
     expected_managed = {"Reloaded.Memory.SigScan.ReloadedII", "reloaded.sharedlib.hooks",
@@ -233,10 +240,12 @@ def validate_receipt(data: object) -> dict:
         _hash(item["content_identity"], f"managed_packages[{index}].content_identity")
     if set(managed_ids) != expected_managed or len(set(managed_ids)) != 3:
         _fail("managed_packages identities")
+    loader_version = next(item["version"] for item in data["artifacts"]
+                          if item["artifact_id"] == "nenkai-loader")
     expected_versions = {
         "Reloaded.Memory.SigScan.ReloadedII": "1.2.14",
         "reloaded.sharedlib.hooks": "1.16.3",
-        "fftivc.utility.modloader": "1.7.3",
+        "fftivc.utility.modloader": loader_version,
     }
     if any(item["version"] != expected_versions[item["mod_id"]] for item in managed):
         _fail("managed_packages reviewed versions")

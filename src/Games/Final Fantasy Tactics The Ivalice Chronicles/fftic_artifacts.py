@@ -141,6 +141,33 @@ _PINS = (
 
 ARTIFACTS = MappingProxyType({pin.artifact_id: pin for pin in _PINS})
 
+# This candidate was inspected in isolation on 2026-10-03. GitHub's release
+# asset digest and the downloaded archive agreed. The release is not an
+# in-game compatibility claim; only this exact archive may use this policy.
+REVIEWED_LOADER_UPDATE = ArtifactPin(
+    "nenkai-loader", "Nenkai FFTIC Mod Loader", "1.7.5",
+    "https://github.com/Nenkai/fftivc.utility.modloader/releases/download/1.7.5/fftivc.utility.modloader1.7.5.7z",
+    "fftivc.utility.modloader1.7.5.7z", 1_990_741,
+    "807b489aedbd51989a4ce0e732b785c3e079165e8131d51218665b38c5c3e52d",
+    "managed; hosted in x64 game process", "Reviewed opt-in FFTIC loader update",
+    "MIT upstream with bundled mixed-license dependencies; final notice review remains",
+    ArtifactDisposition.EXTRACT, False,
+)
+
+
+def loader_pin(version: str) -> ArtifactPin:
+    for pin in (ARTIFACTS["nenkai-loader"], REVIEWED_LOADER_UPDATE):
+        if pin.version == version:
+            return pin
+    raise ValueError(f"Unreviewed FFTIC loader version: {version}")
+
+
+def loader_pin_from_digest(sha256: str) -> ArtifactPin:
+    for pin in (ARTIFACTS["nenkai-loader"], REVIEWED_LOADER_UPDATE):
+        if sha256 == pin.sha256:
+            return pin
+    raise ValueError("Unreviewed FFTIC loader archive digest")
+
 INTERNAL_FILES = MappingProxyType({
     "version-dll": InternalFilePin(
         "version-dll", "Ultimate ASI Loader", "Loader/Asi/UltimateAsiLoader.7z:ASILoader64.dll",

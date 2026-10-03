@@ -19,6 +19,7 @@ try:
     from .fftic_pac import (
         PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
         PacObservation, PacOwnershipState, exact_absent_output,
+        exact_absent_reversion_output,
     )
     from .fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from .fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
@@ -40,6 +41,7 @@ except ImportError:
     from fftic_pac import (
         PacLaunchEvidence, baseline_set_from_receipt, pac_ownership,
         PacObservation, PacOwnershipState, exact_absent_output,
+        exact_absent_reversion_output,
     )
     from fftic_prerequisites import PrefixPrerequisites, PrerequisiteState
     from fftic_receipts import PREFIX_CONFIGURATION_PATH, Receipt, validate_receipt
@@ -107,6 +109,24 @@ class ReadinessVerification:
                 self.game, self.artifacts, self.generation, self.prefix, self.runner,
                 self.prerequisites, self.bootstrap, self.steam_options,
                 self.profile, self.recovery))
+
+
+def absent_pac_reversion_ready(verification: ReadinessVerification, receipt: Receipt,
+                               game_root: Path, backup_root: Path,
+                               launch_evidence: tuple[PacLaunchEvidence, ...]) -> bool:
+    """Recognize only missing generated output after an unconfirmed launch."""
+    data = receipt.data
+    issues = tuple(issue for issue in verification.issues
+                   if not issue.startswith("Current installation evidence does not match the receipt"))
+    return bool(
+        verification.attested and verification.profile == ReadinessAspect.INVALID
+        and issues and all(issue.startswith("PAC runtime output confirmation required: ")
+                           for issue in issues)
+        and data["schema_version"] >= 2 and not data["generated_pac_observations"]
+        and not launch_evidence
+        and exact_absent_reversion_output(
+            game_root, baseline_set_from_receipt(data["generated_pac_baseline"]),
+            backup_root))
 
 
 def profile_fingerprint(user_packages: list[dict]) -> str:

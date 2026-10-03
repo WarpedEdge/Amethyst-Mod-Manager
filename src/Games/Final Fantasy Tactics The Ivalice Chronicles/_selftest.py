@@ -129,7 +129,9 @@ def test_collision_safe_discovery_imports() -> None:
         assert len(fftic_games) == 1
         for excluded in (
                 "fftic_prerequisite_runner.py",
-                "_prerequisite_production_selftest.py"):
+                "fftic_loader_releases.py",
+                "_prerequisite_production_selftest.py",
+                "_loader_update_selftest.py"):
             assert not any(path.endswith("/" + excluded) for path in loaded_paths)
         fftic_failures = [
             failure for failure in discovery.get_load_failures()

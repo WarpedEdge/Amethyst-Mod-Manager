@@ -20626,6 +20626,11 @@ class MainWindow(QMainWindow):
             if getattr(self, "_fftic_initial_status_ready", False):
                 self._refresh_fftic_status(auto_reconcile=True)
 
+    def _recheck_fftic_status(self):
+        from fftic_orchestration import force_loader_release_recheck
+        force_loader_release_recheck()
+        self._refresh_fftic_status()
+
     def _refresh_fftic_status(self, *, auto_reconcile=False):
         panel = getattr(self, "_fftic_status", None)
         if panel is None or self._fftic_status_closing:
@@ -20700,6 +20705,19 @@ class MainWindow(QMainWindow):
         self._fftic_status_cancel = None
         self._fftic_initial_status_ready = True
         panel.set_status(model)
+        release = getattr(model, "release", None)
+        if release is not None:
+            try:
+                from Utils.config_paths import get_config_dir
+                from fftic_loader_releases import ReleaseNoticeLedger
+                if ReleaseNoticeLedger(
+                        get_config_dir() / "fftic-loader-release-notices.json"
+                ).mark_if_new(release):
+                    self._notify(self.tr(
+                        "FFTIC Mod Loader {0} is available. Review its release notes in FFTIC status."
+                    ).format(release.version), "info")
+            except (OSError, ValueError) as exc:
+                self._append_log(f"FFTIC release notice could not be saved: {exc}")
         if model.error:
             self._append_log(f"FFTIC status error: {model.error}")
         if (evidence_key and not self._fftic_operation_active
@@ -20805,6 +20823,16 @@ class MainWindow(QMainWindow):
         binding = plan.binding
         setup_notice = (_FFTIC_SETUP_CONFIRMATION
                         if plan.kind.value == "setup" else "")
+        revert_notice = (
+            "Return to reviewed FFTIC Mod Loader 1.7.3 after an unsuccessful in-game "
+            "test of 1.7.5. Amethyst will rebuild the managed generation, write a new "
+            "ownership receipt, and reset the PAC/log baseline. Reloaded-II, SigScan, "
+            "and Shared Hooks remain pinned. The 1.7.5 generation is retired only "
+            "after the new state verifies. The game must be closed. Missing generated "
+            "PAC output is allowed only with exact retained backups and no matching "
+            "completed launch log; all other owned state must match. Test the returned "
+            "loader through normal Steam launch."
+            if plan.kind.value == "revert_loader" else "")
         body = "\n\n".join(value for value in (
             f"Game: {getattr(context.game, 'name', binding.game_id)}",
             f"Profile: {binding.profile}",
@@ -20812,6 +20840,7 @@ class MainWindow(QMainWindow):
             f"Prefix: {binding.prefix}",
             f"Staging: {binding.staging_root}",
             setup_notice,
+            revert_notice,
             *lines,
             "Durable recovery information is recorded before each filesystem-changing "
             "step. Cancellation takes effect at transaction boundaries; an unverified "
@@ -21761,7 +21790,7 @@ class MainWindow(QMainWindow):
         self._fftic_status = FfticStatusPanel()
         QApplication.instance().applicationStateChanged.connect(
             self._on_fftic_application_state_changed)
-        self._fftic_status.recheck_requested.connect(self._refresh_fftic_status)
+        self._fftic_status.recheck_requested.connect(self._recheck_fftic_status)
         self._fftic_status.cancel_requested.connect(self._cancel_fftic_operation)
         self._fftic_status.action_requested.connect(self._present_fftic_action)
         QTimer.singleShot(0, self._refresh_fftic_status)

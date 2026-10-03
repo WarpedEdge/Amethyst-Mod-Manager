@@ -20,7 +20,8 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 try:
-    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
+    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
+    from .fftic_loader_releases import CHECKER
     from .fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from .fftic_extraction import (
         ExtractedArchive, ExtractionLimits, VerifiedArtifactTree,
@@ -50,7 +51,8 @@ try:
     )
     from .fftic_proton import supported_runner
     from .fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, profile_fingerprint,
+        ReadinessAspect, ReadinessEvidence, absent_pac_reversion_ready,
+        profile_fingerprint,
         verify_launch_readiness,
     )
     from .fftic_receipts import (
@@ -66,7 +68,8 @@ try:
     )
     from .fftic_transactions import TargetObservation, plan_owned_file_install
 except ImportError:
-    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
+    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
+    from fftic_loader_releases import CHECKER
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from fftic_extraction import (
         ExtractedArchive, ExtractionLimits, VerifiedArtifactTree,
@@ -96,7 +99,8 @@ except ImportError:
     )
     from fftic_proton import supported_runner
     from fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, profile_fingerprint,
+        ReadinessAspect, ReadinessEvidence, absent_pac_reversion_ready,
+        profile_fingerprint,
         verify_launch_readiness,
     )
     from fftic_receipts import (
@@ -174,6 +178,8 @@ class WorkflowInputs:
     process_runner: PrerequisiteProcessRunner | None = None
     setup_candidates: ReviewedCandidateSet | None = None
     artifact_acquirer: Callable[[object], ReviewedCandidateSet] | None = None
+    update_acquirer: Callable[[object, object], ReviewedCandidateSet] | None = None
+    revert_acquirer: Callable[[object], ReviewedCandidateSet] | None = None
     pac_launch_evidence: tuple[PacLaunchEvidence, ...] = ()
     process_running: Callable[[], bool] | None = None
     failure_injector: Callable[[str, OperationKind], None] | None = None
@@ -560,10 +566,9 @@ class FfticLifecycleComposition:
         elif token.kind == OperationKind.SYNCHRONIZE:
             self._publish_profile(token, cancel, self.inputs.setup_candidates, "synchronize")
         elif token.kind == OperationKind.UPDATE:
-            raise WorkflowError(
-                "Managed-runtime update is unavailable because the reviewed ArtifactPin "
-                "contract cannot express a different candidate identity; use synchronize "
-                "for profile-only changes")
+            self._update(token, cancel)
+        elif token.kind == OperationKind.REVERT_LOADER:
+            self._revert_loader(token, cancel)
         elif token.kind == OperationKind.REMOVE:
             self._remove(token, cancel)
         elif token.kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
@@ -575,7 +580,8 @@ class FfticLifecycleComposition:
                          *, required_ids: set[str] | None = None) -> dict[str, Path]:
         expected = set(ARTIFACTS) if required_ids is None else set(required_ids)
         if candidates is None:
-            paths = {artifact_id: self.inputs.artifact_cache / pin.filename
+            paths = {artifact_id: self.inputs.artifact_cache /
+                     (self._selected_pin() if artifact_id == "nenkai-loader" else pin).filename
                      for artifact_id, pin in ARTIFACTS.items()
                      if artifact_id in expected}
         else:
@@ -584,7 +590,7 @@ class FfticLifecycleComposition:
             raise WorkflowError("The required reviewed component candidates are missing")
         for artifact_id, path in paths.items():
             path = Path(path)
-            pin = ARTIFACTS.get(artifact_id)
+            pin = self._selected_pin() if artifact_id == "nenkai-loader" else ARTIFACTS.get(artifact_id)
             if (pin is None or path.is_symlink() or path.parent.resolve() !=
                     self.inputs.artifact_cache.resolve()
                     or path.name != pin.filename or not validate_file(pin, path)):
@@ -597,9 +603,25 @@ class FfticLifecycleComposition:
         attempt.mkdir(parents=True, exist_ok=False)
         for artifact_id in sorted({*MANAGED_ARTIFACTS.values(), "reloaded-ii"}):
             result[artifact_id] = extract_verified_artifact(
-                ARTIFACTS[artifact_id], paths[artifact_id], attempt / artifact_id,
+                self._selected_pin() if artifact_id == "nenkai-loader" else ARTIFACTS[artifact_id],
+                paths[artifact_id], attempt / artifact_id,
                 cancel=cancel)
         return result
+
+    def _selected_pin(self):
+        token = getattr(self, "_operation_token", None)
+        if token is not None and token.kind == OperationKind.REVERT_LOADER:
+            return ARTIFACTS["nenkai-loader"]
+        if token is not None and token.kind == OperationKind.UPDATE:
+            if token.plan is None or token.plan.release is None:
+                raise WorkflowError("Update plan lacks exact release identity")
+            return loader_pin(token.plan.release.version)
+        receipt = token.receipt_record if token is not None else None
+        if receipt is not None:
+            version = next(item["version"] for item in receipt.data["artifacts"]
+                           if item["artifact_id"] == "nenkai-loader")
+            return loader_pin(version)
+        return ARTIFACTS["nenkai-loader"]
 
     def _current_generation_id(self) -> str | None:
         try:
@@ -828,7 +850,7 @@ class FfticLifecycleComposition:
             "steam_build": "24304444", "ui_version": "v1.5.2",
             "proton_runner": runner,
             "reloaded": "1.31.0", "sigscan": "1.2.14",
-            "shared_hooks": "1.16.3", "nenkai": "1.7.3",
+            "shared_hooks": "1.16.3", "nenkai": self._selected_pin().version,
         }
         runner_script = self._current_runner_script()
         if runner_script is not None:
@@ -915,11 +937,12 @@ class FfticLifecycleComposition:
             "artifacts": [{
                 "artifact_id": pin.artifact_id, "version": pin.version,
                 "url": pin.url, "size": pin.size, "sha256": pin.sha256,
-            } for pin in ARTIFACTS.values()],
+            } for pin in (self._selected_pin() if pin.artifact_id == "nenkai-loader"
+                          else pin for pin in ARTIFACTS.values())],
             "managed_packages": [{
                 "mod_id": mod_id,
                 "version": {MANAGED_ORDER[0]: "1.2.14", MANAGED_ORDER[1]: "1.16.3",
-                            MANAGED_ORDER[2]: "1.7.3"}[mod_id],
+                            MANAGED_ORDER[2]: self._selected_pin().version}[mod_id],
                 "content_identity": artifact_inputs[MANAGED_ARTIFACTS[mod_id]]["content_identity"],
             } for mod_id in MANAGED_ORDER],
             "configuration_hashes": {
@@ -1082,7 +1105,9 @@ class FfticLifecycleComposition:
                 raise WorkflowError("Confirmed absent PAC output or its backup has changed")
         self._assert_readiness(
             f"{operation.title()} refuses drift outside the current profile",
-            allow_profile_drift=True, allow_runner_transition=True)
+            allow_profile_drift=operation != "revert-loader",
+            allow_runner_transition=operation != "revert-loader",
+            allow_absent_reversion=operation == "revert-loader")
         generation, _paths = self._build(token, cancel, candidates)
         if generation.generation_id == self._current_generation_id():
             if (receipt.data["prefix_identity"]["runner_identity"] == self._current_runner()
@@ -1105,6 +1130,35 @@ class FfticLifecycleComposition:
         self._activate(token, generation)
         self._cancelled(cancel)
         self._write_receipt(token, generation, operation)
+
+    def _update(self, token: _Baseline, cancel) -> None:
+        release = token.plan.release if token.plan is not None else None
+        if release is None or not release.installable:
+            raise WorkflowError("Update plan lacks exact release identity for a reviewed asset")
+        current, error = CHECKER.check(
+            next(item["version"] for item in token.receipt_record.data["artifacts"]
+                 if item["artifact_id"] == "nenkai-loader"), force=True)
+        if error or current != release:
+            raise WorkflowError("FFTIC loader release changed or cannot be checked; recheck status")
+        if self.inputs.update_acquirer is None:
+            raise WorkflowError("Managed loader update acquisition is unavailable")
+        candidates = self.inputs.update_acquirer(release, cancel)
+        self._publish_profile(token, cancel, candidates, "update")
+
+    def _revert_loader(self, token: _Baseline, cancel) -> None:
+        if self.inputs.process_running is None:
+            raise WorkflowError("Cannot verify that FFTIC and related processes are stopped")
+        receipt = token.receipt_record
+        if receipt is None or next(
+                item["version"] for item in receipt.data["artifacts"]
+                if item["artifact_id"] == "nenkai-loader") != "1.7.5":
+            raise WorkflowError("Return to 1.7.3 requires an owned reviewed 1.7.5 installation")
+        self._assert_readiness("Return to 1.7.3 refuses drift in the current owned state",
+                               allow_absent_reversion=True)
+        if self.inputs.revert_acquirer is None:
+            raise WorkflowError("Reviewed 1.7.3 acquisition is unavailable")
+        candidates = self.inputs.revert_acquirer(cancel)
+        self._publish_profile(token, cancel, candidates, "revert-loader")
 
     def _dynamic_pac_evidence(self, receipt: Receipt) -> tuple[PacLaunchEvidence, ...]:
         supplied = tuple(self.inputs.pac_launch_evidence)
@@ -1471,7 +1525,8 @@ class FfticLifecycleComposition:
     def _assert_readiness(self, prefix: str, *, allow_profile_drift: bool = False,
                           allow_pac_disposition: bool = False,
                           allow_unknown_setup_baseline: bool = False,
-                          allow_runner_transition: bool = False) -> None:
+                          allow_runner_transition: bool = False,
+                          allow_absent_reversion: bool = False) -> None:
         installation, verified = self._readiness(
             allow_runner_transition=allow_runner_transition)
         states = (verified.artifacts, verified.generation, verified.prefix,
@@ -1493,7 +1548,14 @@ class FfticLifecycleComposition:
                     for issue in verified.issues)
             and any(issue.startswith("Unknown preexisting PAC is preserved")
                     for issue in verified.issues))
+        absent_reversion = False
+        if allow_absent_reversion and verified.profile != ReadinessAspect.READY:
+            receipt = read_receipt(self.inputs.receipts_root)
+            absent_reversion = bool(receipt and absent_pac_reversion_ready(
+                verified, receipt, self.inputs.game_root, self.inputs.backup_root,
+                self._dynamic_pac_evidence(receipt)))
         profile_ok = (allow_profile_drift or pac_only or unknown_baseline_only
+                      or absent_reversion
                       or verified.profile == ReadinessAspect.READY)
         if (allow_runner_transition and verified.runner != ReadinessAspect.READY
                 and any(issue.startswith((
@@ -1743,6 +1805,7 @@ class FfticLifecycleComposition:
     def repair(self, plan, cancel, progress): return self._run("repair", plan, cancel, progress)
     def synchronize(self, plan, cancel, progress): return self._run("synchronize", plan, cancel, progress)
     def update(self, plan, cancel, progress): return self._run("update", plan, cancel, progress)
+    def revert_loader(self, plan, cancel, progress): return self._run("revert_loader", plan, cancel, progress)
     def remove(self, plan, cancel, progress): return self._run("remove", plan, cancel, progress)
     def reconcile_runtime_output(self, plan, cancel, progress):
         return self._run("reconcile_runtime_output", plan, cancel, progress)

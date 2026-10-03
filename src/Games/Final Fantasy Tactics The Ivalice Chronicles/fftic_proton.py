@@ -213,6 +213,15 @@ def supported_runner(identity: str, script: Path | None = None) -> bool:
         return False
 
 
+def managed_runner_label(identity: str, selection_verified: bool) -> str:
+    """Label canonical Steam selection evidence, independent of launch readiness."""
+    if not supported_runner(identity):
+        return "Unsupported"
+    match = _OFFICIAL_IDENTITY.fullmatch(identity)
+    major = int(identity.split("-", 1)[1].split(".", 1)[0]) if match else -1
+    return "Verified" if selection_verified and major in {9, 10, 11} else "Unverified"
+
+
 @dataclass(frozen=True)
 class ProtonSelection:
     proton_script: Path | None

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QToolButton, QVBoxLayout, QWidget,
@@ -70,10 +70,18 @@ class FfticStatusPanel(QFrame):
         self._details_button.setCursor(Qt.PointingHandCursor)
         self._details_button.toggled.connect(self._set_details_visible)
         bar.addWidget(self._details_button)
+        self._release_notes = QToolButton()
+        self._release_notes.setObjectName("FormButton")
+        self._release_notes.setText(self.tr("Loader release notes"))
+        self._release_notes.setEnabled(False)
+        self._release_notes.clicked.connect(self._open_release_notes)
+        bar.addWidget(self._release_notes)
         self._recheck = QPushButton(self.tr("Recheck"))
         self._recheck.setObjectName("FormButton")
         self._recheck.setCursor(Qt.PointingHandCursor)
-        self._recheck.setToolTip(self.tr("Read current FFTIC status without changing files."))
+        self._recheck.setToolTip(self.tr(
+            "Check FFTIC status and releases without changing managed game files. "
+            "A new release notice may be saved in Amethyst's configuration."))
         self._recheck.clicked.connect(self._request_recheck_or_cancel)
         bar.addWidget(self._recheck)
         outer.addWidget(head)
@@ -94,7 +102,8 @@ class FfticStatusPanel(QFrame):
             ("setup", self.tr("Set up FFTIC support")),
             ("repair", self.tr("Repair")),
             ("synchronize", self.tr("Synchronize profile")),
-            ("update", self.tr("Update managed runtime")),
+            ("update", self.tr("Update FFTIC Mod Loader")),
+            ("revert_loader", self.tr("Return loader to 1.7.3")),
             ("remove", self.tr("Remove managed support")),
             ("reconcile_runtime_output", self.tr("Confirm runtime output")),
         )):
@@ -109,7 +118,7 @@ class FfticStatusPanel(QFrame):
         self._copy.setObjectName("FormButton")
         self._copy.setCursor(Qt.PointingHandCursor)
         self._copy.clicked.connect(self._copy_steam_options)
-        action_layout.addWidget(self._copy, 2, 0, 1, 3)
+        action_layout.addWidget(self._copy, 3, 0, 1, 3)
         for column in range(3):
             action_layout.setColumnStretch(column, 1)
         outer.addWidget(actions)
@@ -138,6 +147,7 @@ class FfticStatusPanel(QFrame):
             self._model = None
             self._clear_rows()
         self._copy.setEnabled(False)
+        self._release_notes.setEnabled(False)
         for button in self._action_buttons.values():
             button.setEnabled(False)
         if not settled:
@@ -220,6 +230,7 @@ class FfticStatusPanel(QFrame):
             button.setAccessibleDescription(
                 "Available" if enabled else reason)
         self._copy.setEnabled(bool(model.steam_copy_text))
+        self._release_notes.setEnabled(bool(model.release and model.release.notes_url))
         self._copy.setText(self.tr("Copy Steam Launch Options"))
         details = list(model.details)
         details.extend((
@@ -248,7 +259,12 @@ class FfticStatusPanel(QFrame):
         self._model = None
         self._clear_rows()
         self._copy.setEnabled(False)
+        self._release_notes.setEnabled(False)
         self.hide()
+
+    def _open_release_notes(self) -> None:
+        if self._model is not None and self._model.release is not None:
+            QDesktopServices.openUrl(QUrl(self._model.release.notes_url))
 
     def _set_details_visible(self, visible: bool) -> None:
         self._details.setVisible(visible)

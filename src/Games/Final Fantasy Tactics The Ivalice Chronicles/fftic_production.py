@@ -7,7 +7,7 @@ from pathlib import Path
 
 try:
     from .fftic_artifact_service import acquire_artifact
-    from .fftic_artifacts import ARTIFACTS
+    from .fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE
     from .fftic_managed_executor import ManagedLifecycleExecutor
     from .fftic_managed_executor import ProcessRequest
     from .fftic_orchestration import (
@@ -26,7 +26,7 @@ try:
     )
 except ImportError:
     from fftic_artifact_service import acquire_artifact
-    from fftic_artifacts import ARTIFACTS
+    from fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE
     from fftic_managed_executor import ManagedLifecycleExecutor
     from fftic_managed_executor import ProcessRequest
     from fftic_orchestration import (
@@ -181,6 +181,30 @@ def create_production_executor(
                 destination.append((artifact_id, Path(result.path)))
             return ReviewedCandidateSet(tuple(archives), tuple(installers))
 
+        def acquire_loader_update(release, cancel):
+            pin = REVIEWED_LOADER_UPDATE
+            if (not release.installable or release.version != pin.version
+                    or release.asset_url != pin.url or release.asset_size != pin.size
+                    or release.asset_sha256 != pin.sha256):
+                raise ValueError("Loader release differs from its reviewed candidate")
+            archives = []
+            for artifact_id in ("reloaded-ii", "sigscan", "shared-hooks", "nenkai-loader"):
+                selected = pin if artifact_id == "nenkai-loader" else ARTIFACTS[artifact_id]
+                result = artifact_acquire(
+                    selected, artifact_cache, cancel=cancel,
+                    quarantine_root=artifact_cache / "quarantine")
+                archives.append((artifact_id, Path(result.path)))
+            return ReviewedCandidateSet(tuple(archives))
+
+        def acquire_loader_revert(cancel):
+            archives = []
+            for artifact_id in ("reloaded-ii", "sigscan", "shared-hooks", "nenkai-loader"):
+                result = artifact_acquire(
+                    ARTIFACTS[artifact_id], artifact_cache, cancel=cancel,
+                    quarantine_root=artifact_cache / "quarantine")
+                archives.append((artifact_id, Path(result.path)))
+            return ReviewedCandidateSet(tuple(archives))
+
         def process_request(plan):
             selection = resolve_proton_selection(game.steam_id, prefix)
             runner = selection.proton_script
@@ -262,6 +286,8 @@ def create_production_executor(
                 selection_reader=lambda: resolve_proton_selection(game.steam_id, prefix)),
             setup_candidates=None,
             artifact_acquirer=acquire_reviewed,
+            update_acquirer=acquire_loader_update,
+            revert_acquirer=acquire_loader_revert,
             process_running=managed_processes_running,
         )
         lifecycle = FfticLifecycleComposition(

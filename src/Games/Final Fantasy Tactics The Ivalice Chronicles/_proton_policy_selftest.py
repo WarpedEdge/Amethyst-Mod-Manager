@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from _c3c_selftest import Fixture, _owned_state, _write_matching_log
 from fftic_orchestration import FfticOrchestrator, InspectionContext, OperationKind
-from fftic_proton import _selected_tool_identity, resolve_proton_selection, supported_runner
+from fftic_proton import (_selected_tool_identity, managed_runner_label,
+                          resolve_proton_selection, supported_runner)
 from fftic_readiness import ReadinessAspect
 from fftic_receipts import read_receipt, validate_receipt
 from fftic_pac import baseline_set_from_receipt, inspect_matching_launch_log
@@ -85,8 +86,10 @@ def test_steam_mapping_selects_releases_without_prefix_pin() -> None:
         with (patch.object(steam, "_STEAM_CANDIDATES", [root]),
               patch.object(steam, "_all_proton_search_roots", return_value=[root])):
             for mapping, directory, identity in (
+                    ("proton_8", "Proton 8.0", "proton-8.0-5f"),
                     ("proton_9", "Proton 9.0", "proton-9.0-4f"),
                     ("proton_10", "Proton 10.0", "proton-10.0-20260801"),
+                    ("proton_11", "Proton 11.0", "proton-11.0-20261001"),
                     ("proton_experimental", "Proton - Experimental", OCTOBER),
                     ("proton_12", "Proton 12.0", "proton-12.0-20300101")):
                 script = root / "steamapps/common" / directory / "proton"
@@ -107,6 +110,9 @@ def test_steam_mapping_selects_releases_without_prefix_pin() -> None:
                 assert selected.tool_identity == identity
                 assert selected.prefix_runtime == "9.0-200"
                 assert supported_runner(identity, script)
+                assert managed_runner_label(identity, supported_runner(identity, script)) == (
+                    "Verified" if mapping in {"proton_9", "proton_10", "proton_11",
+                                               "proton_experimental"} else "Unverified")
             config.write_text('"x" { "CompatToolMapping" { "0" { "name" "proton_9" } } }',
                               encoding="utf-8")
             assert resolve_proton_selection("1004640", prefix).proton_script is None

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 try:
-    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES
+    from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from .fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from .fftic_packages import PackageClassification, inspect_package
     from .fftic_reloaded_config import (
@@ -24,7 +24,7 @@ try:
         ExtractionLimits, VerifiedArtifactTree, extract_archive, verify_internal_file,
     )
 except ImportError:
-    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES
+    from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from fftic_packages import PackageClassification, inspect_package
     from fftic_reloaded_config import (
@@ -51,6 +51,18 @@ COMPATIBILITY_SET = {
     "internal_files": {key: {"size": pin.size, "sha256": pin.sha256}
                        for key, pin in INTERNAL_FILES.items()},
 }
+
+
+def component_versions_for(loader):
+    return dict(COMPONENT_VERSIONS, **{"fftivc.utility.modloader": loader.version})
+
+
+def compatibility_set_for(loader):
+    result = dict(COMPATIBILITY_SET)
+    result["artifacts"] = dict(COMPATIBILITY_SET["artifacts"])
+    result["artifacts"]["nenkai-loader"] = {
+        "version": loader.version, "size": loader.size, "sha256": loader.sha256}
+    return result
 MANAGED_ARTIFACTS = {
     "Reloaded.Memory.SigScan.ReloadedII": "sigscan",
     "reloaded.sharedlib.hooks": "shared-hooks",
@@ -299,8 +311,11 @@ def verify_legacy_reloaded_normalization(root: Path,
 
 def generation_identity(*, artifact_inputs: tuple[dict, ...], user_records: tuple[dict, ...],
                         windows_game_path: str) -> str:
+    loader_record = next(item for item in artifact_inputs
+                         if item["artifact_id"] == "nenkai-loader")
+    loader = loader_pin_from_digest(loader_record["archive_sha256"])
     compatibility = {
-        "compatibility_set": COMPATIBILITY_SET,
+        "compatibility_set": compatibility_set_for(loader),
         "artifact_inputs": artifact_inputs,
         "user_packages": user_records,
         "windows_game_path": windows_game_path,
@@ -356,9 +371,15 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
     manifest = _exact_dict(manifest, MANIFEST_FIELDS, "manifest")
     if manifest["schema_version"] != 1 or not isinstance(manifest["generation_id"], str):
         raise GenerationError(f"Generation manifest schema is invalid: {root}")
-    if manifest["compatibility_set"] != COMPATIBILITY_SET:
+    try:
+        loader_record = next(item for item in manifest["artifact_inputs"]
+                             if item["artifact_id"] == "nenkai-loader")
+        selected_loader = loader_pin_from_digest(loader_record["archive_sha256"])
+    except (KeyError, StopIteration, TypeError, ValueError):
+        raise GenerationError("Generation loader identity is invalid")
+    if manifest["compatibility_set"] != compatibility_set_for(selected_loader):
         raise GenerationError(f"Generation compatibility metadata is not the reviewed set: {root}")
-    if manifest["components"] != COMPONENT_VERSIONS:
+    if manifest["components"] != component_versions_for(selected_loader):
         raise GenerationError(f"Generation component versions are not the reviewed set: {root}")
     if manifest["managed_packages"] != list(MANAGED_ORDER):
         raise GenerationError(f"Generation managed package identities are invalid: {root}")
@@ -378,7 +399,7 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
         artifact_id = item["artifact_id"]
         if artifact_id not in expected_artifact_ids:
             raise GenerationError("Generation artifact input identity is invalid")
-        pin = ARTIFACTS[artifact_id]
+        pin = selected_loader if artifact_id == "nenkai-loader" else ARTIFACTS[artifact_id]
         if (item["archive_size"] != pin.size or item["archive_sha256"] != pin.sha256
                 or not isinstance(item["content_identity"], str)
                 or not _HASH.fullmatch(item["content_identity"])):
@@ -504,7 +525,9 @@ def build_private_generation(
     if set(verified_inputs) != expected_ids:
         raise GenerationError("All and only the reviewed verified artifact trees are required")
     for artifact_id, evidence in verified_inputs.items():
-        if not isinstance(evidence, VerifiedArtifactTree) or evidence.pin != ARTIFACTS[artifact_id]:
+        expected_pin = (loader_pin(evidence.pin.version) if artifact_id == "nenkai-loader"
+                        else ARTIFACTS[artifact_id])
+        if not isinstance(evidence, VerifiedArtifactTree) or evidence.pin != expected_pin:
             raise GenerationError(f"Artifact {artifact_id} lacks reviewed extraction provenance")
         try:
             evidence.revalidate()
@@ -632,8 +655,8 @@ def build_private_generation(
         manifest = {
             "schema_version": 1,
             "generation_id": generation_id,
-            "components": COMPONENT_VERSIONS,
-            "compatibility_set": COMPATIBILITY_SET,
+            "components": component_versions_for(verified_inputs["nenkai-loader"].pin),
+            "compatibility_set": compatibility_set_for(verified_inputs["nenkai-loader"].pin),
             "artifact_inputs": list(artifact_inputs),
             "managed_packages": list(MANAGED_ORDER),
             "user_packages": list(user_records),

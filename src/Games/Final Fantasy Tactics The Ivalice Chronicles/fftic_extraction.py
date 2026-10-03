@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 try:
-    from .fftic_artifacts import ARTIFACTS, ArtifactPin, validate_file
+    from .fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE, ArtifactPin, validate_file
 except ImportError:
-    from fftic_artifacts import ARTIFACTS, ArtifactPin, validate_file
+    from fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE, ArtifactPin, validate_file
 
 
 class ExtractionError(RuntimeError):
@@ -84,6 +84,7 @@ REVIEWED_EXTRACTION_LIMITS = {
     "sigscan": ExtractionLimits(9, 213_550, 160_120),
     "shared-hooks": ExtractionLimits(35, 3_656_160, 1_159_168),
 }
+LOADER_UPDATE_LIMITS = ExtractionLimits(340, 9_000_000, 2_200_000)
 
 
 def validate_archive_members(members: list[ArchiveMember] | tuple[ArchiveMember, ...]) -> tuple[str, ...]:
@@ -341,9 +342,12 @@ def extract_verified_artifact(pin: ArtifactPin, archive: Path, destination: Path
     """Bind an exact pinned archive to the extracted tree published from a private snapshot."""
     reviewed = ARTIFACTS.get(pin.artifact_id)
     if limits is None:
-        if reviewed != pin or pin.artifact_id not in REVIEWED_EXTRACTION_LIMITS:
+        if pin == REVIEWED_LOADER_UPDATE:
+            limits = LOADER_UPDATE_LIMITS
+        elif reviewed != pin or pin.artifact_id not in REVIEWED_EXTRACTION_LIMITS:
             raise ExtractionError("Unreviewed archive requires an explicit extraction policy")
-        limits = REVIEWED_EXTRACTION_LIMITS[pin.artifact_id]
+        else:
+            limits = REVIEWED_EXTRACTION_LIMITS[pin.artifact_id]
     archive = Path(archive)
     if archive.is_symlink() or not validate_file(pin, archive):
         raise ExtractionError(f"Archive does not match pinned identity: {archive}")
@@ -365,6 +369,8 @@ def extract_verified_artifact(pin: ArtifactPin, archive: Path, destination: Path
         result = VerifiedArtifactTree(pin, archive.resolve(), extracted.root.resolve(),
                                       identities, _tree_digest(identities), _PROVENANCE_TOKEN)
         result.revalidate()
+        if pin == REVIEWED_LOADER_UPDATE:
+            validate_loader_update_tree(result.root)
         return result
     except BaseException:
         if destination.is_dir() and not destination.is_symlink():
@@ -372,3 +378,27 @@ def extract_verified_artifact(pin: ArtifactPin, archive: Path, destination: Path
         raise
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
+def validate_loader_update_tree(root: Path) -> None:
+    """Require the reviewed loader's runtime and Reloaded dependency shape."""
+    import json
+    try:
+        config = json.loads((root / "ModConfig.json").read_text(encoding="utf-8"))
+        deps = json.loads((root / "fftivc.utility.modloader.deps.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ExtractionError(f"Loader update metadata is unreadable: {exc}") from exc
+    if (not isinstance(config, dict)
+            or config.get("ModId") != "fftivc.utility.modloader"
+            or config.get("ModVersion") != REVIEWED_LOADER_UPDATE.version
+            or config.get("ModDll") != "fftivc.utility.modloader.dll"
+            or config.get("ModDependencies") != [
+                "Reloaded.Memory.SigScan.ReloadedII", "reloaded.sharedlib.hooks"]
+            or config.get("SupportedAppId") != ["fft_classic.exe", "fft_enhanced.exe"]
+            or config.get("CanUnload") is not False
+            or config.get("HasExports") is not True
+            or not (root / "fftivc.utility.modloader.dll").is_file()
+            or not isinstance(deps, dict)
+            or not isinstance(deps.get("runtimeTarget"), dict)
+            or deps.get("runtimeTarget", {}).get("name") != ".NETCoreApp,Version=v9.0"):
+        raise ExtractionError("Loader update ID, version, dependencies, or runtime shape changed")

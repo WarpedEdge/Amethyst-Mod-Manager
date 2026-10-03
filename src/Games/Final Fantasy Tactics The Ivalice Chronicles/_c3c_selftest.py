@@ -290,7 +290,7 @@ def test_complete_setup_repair_synchronize_update_and_remove() -> None:
     try:
         fixture.run(OperationKind.UPDATE)
     except WorkflowError as exc:
-        assert "unavailable" in str(exc) and "synchronize" in str(exc)
+        assert "lacks exact release identity" in str(exc)
     else:
         raise AssertionError("Profile synchronization was mislabeled as runtime update")
     assert (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes() == receipt_before_update
@@ -338,7 +338,7 @@ def test_collisions_drift_duplicates_and_missing_inputs_fail_closed() -> None:
     try:
         missing.run(OperationKind.UPDATE)
     except WorkflowError as exc:
-        assert "unavailable" in str(exc) and "synchronize" in str(exc)
+        assert "lacks exact release identity" in str(exc)
     else:
         raise AssertionError("Unavailable update reported success")
 

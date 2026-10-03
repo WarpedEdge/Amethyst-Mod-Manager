@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 
 try:
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
+    from .fftic_loader_releases import CHECKER, LoaderRelease
     from .fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
@@ -25,9 +26,9 @@ try:
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
     )
-    from .fftic_proton import ProtonSelection, resolve_proton_selection, supported_runner
+    from .fftic_proton import ProtonSelection, managed_runner_label, resolve_proton_selection, supported_runner
     from .fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence,
+        ReadinessAspect, ReadinessEvidence, absent_pac_reversion_ready,
         verify_launch_readiness,
     )
     from .fftic_receipts import PREFIX_CONFIGURATION_PATH, read_receipt
@@ -37,6 +38,7 @@ try:
     )
 except ImportError:
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
+    from fftic_loader_releases import CHECKER, LoaderRelease
     from fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
@@ -49,9 +51,9 @@ except ImportError:
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
     )
-    from fftic_proton import ProtonSelection, resolve_proton_selection, supported_runner
+    from fftic_proton import ProtonSelection, managed_runner_label, resolve_proton_selection, supported_runner
     from fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence,
+        ReadinessAspect, ReadinessEvidence, absent_pac_reversion_ready,
         verify_launch_readiness,
     )
     from fftic_receipts import PREFIX_CONFIGURATION_PATH, read_receipt
@@ -61,6 +63,12 @@ except ImportError:
     )
 
 FFTIC_GAME_ID = "final_fantasy_tactics_the_ivalice_chronicles"
+
+
+def force_loader_release_recheck() -> None:
+    CHECKER.invalidate()
+
+
 EXECUTION_UNAVAILABLE = (
     "Live FFTIC changes are not available in this build. This action only "
     "becomes available when an authorized managed-lifecycle executor is installed."
@@ -79,6 +87,7 @@ class OperationKind(str, Enum):
     REPAIR = "repair"
     SYNCHRONIZE = "synchronize"
     UPDATE = "update"
+    REVERT_LOADER = "revert_loader"
     REMOVE = "remove"
     RECONCILE_RUNTIME_OUTPUT = "reconcile_runtime_output"
 
@@ -120,6 +129,7 @@ class OperationPlan:
     requires_confirmation: bool = True
     mutating: bool = True
     binding: "OperationBinding | None" = None
+    release: "LoaderRelease | None" = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +174,7 @@ class FfticStatusViewModel:
     observation_sha256: str = ""
     available_actions: tuple[str, ...] = ()
     action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
+    release: "LoaderRelease | None" = None
 
     def row(self, key: str) -> StatusRow:
         return next(item for item in self.rows if item.key == key)
@@ -189,6 +200,7 @@ class InspectionResult:
     observation_sha256: str = ""
     available_actions: tuple[str, ...] = ()
     action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
+    release: "LoaderRelease | None" = None
 
 
 ProgressCallback = Callable[[ProgressUpdate], None]
@@ -236,6 +248,9 @@ def _action_availability(
     verification, unsupported: tuple[UnsupportedPackage, ...],
     prerequisite_host_available: bool = True,
     prerequisite_host_reason: str = "",
+    release: LoaderRelease | None = None,
+    installed_loader: str = "",
+    revert_absent_pac: bool = False,
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """Return only lifecycle actions supported by the current exact evidence."""
     by_key = {row.key: row for row in rows}
@@ -244,12 +259,15 @@ def _action_availability(
         for kind in OperationKind
     }
     reasons[OperationKind.UPDATE.value] = (
-        "Managed-runtime update is unavailable until a distinct reviewed artifact "
-        "identity is defined. Use Synchronize for profile-only changes.")
+        "No newer reviewed loader asset is ready to install. Recheck release details.")
+    reasons[OperationKind.REVERT_LOADER.value] = (
+        "Return to 1.7.3 requires an exact receipt-owned 1.7.5 installation. "
+        "Missing generated PAC output is allowed only with exact retained backups "
+        "and no matching completed launch log; resolve any other drift first.")
     required = ("game", "steam_prefix", "runner", "steam_options", "recovery")
     foundation_ready = all(
         by_key.get(key) is not None
-        and by_key[key].state in {"Ready", "Configured", "Retry available", "Unverified"}
+        and by_key[key].state in {"Ready", "Configured", "Retry available", "Unverified", "Verified"}
         for key in required)
     prerequisites_setup_safe = all(
         by_key.get(key) is not None
@@ -264,6 +282,16 @@ def _action_availability(
         for key in ("dotnet", "vc"))
     no_unsupported = not unsupported
     actions: list[str] = []
+    reversion_ready = bool(
+        installed_loader == "1.7.5" and receipt_present and no_unsupported
+        and verification is not None and verification.attested
+        and (verification.ready or revert_absent_pac)
+        and verification.runner == ReadinessAspect.READY
+        and all(getattr(verification, key) == ReadinessAspect.READY for key in (
+            "game", "artifacts", "generation", "prefix", "prerequisites",
+            "bootstrap", "steam_options", "recovery"))
+        and by_key.get("runner") is not None
+        and by_key["runner"].state in {"Ready", "Unverified", "Verified"})
 
     reconciliation = by_key.get("reconciliation")
     reconciliation_state = reconciliation.state if reconciliation is not None else ""
@@ -281,13 +309,16 @@ def _action_availability(
                     ("prefix_config", "Ready"), ("profile", "Ready"),
                     ("recovery", "Runtime output confirmation required")))
         and by_key.get("runner") is not None
-        and by_key["runner"].state in {"Ready", "Unverified"}
+        and by_key["runner"].state in {"Ready", "Unverified", "Verified"}
         and all(by_key.get(key) is not None
                 and by_key[key].state == expected_component_state
                 for key in ("runtime", "nenkai", "sigscan", "hooks")))
     if protected_reconciliation_state:
         actions.append(OperationKind.RECONCILE_RUNTIME_OUTPUT.value)
         reasons[OperationKind.RECONCILE_RUNTIME_OUTPUT.value] = ""
+        if reversion_ready:
+            actions.append(OperationKind.REVERT_LOADER.value)
+            reasons[OperationKind.REVERT_LOADER.value] = ""
         return tuple(actions), tuple((kind.value, reasons[kind.value]) for kind in OperationKind)
 
     if not prerequisites_setup_safe:
@@ -335,17 +366,27 @@ def _action_availability(
             for issue in getattr(verification, "issues", ()))
         if (receipt_present and no_unsupported and profile_reconcilable
                 and by_key.get("runner") is not None
-                and by_key["runner"].state in {"Ready", "Unverified", "Different"}
+                and by_key["runner"].state in {"Ready", "Unverified", "Verified", "Different"}
                 and all(value == ReadinessAspect.READY for value in protected)
                 and (verification.profile != ReadinessAspect.READY or runner_transition)):
             actions.append(OperationKind.SYNCHRONIZE.value)
         if (receipt_present and no_unsupported
                 and by_key.get("runner") is not None
-                and by_key["runner"].state in {"Ready", "Unverified", "Different"}
+                and by_key["runner"].state in {"Ready", "Unverified", "Verified", "Different"}
                 and all(value == ReadinessAspect.READY for value in protected)
                 and (runner_state == ReadinessAspect.READY or runner_transition)
                 and verification.profile == ReadinessAspect.READY):
             actions.append(OperationKind.REMOVE.value)
+
+        if (release is not None and release.installable and receipt_present
+                and no_unsupported and verification.ready and
+                runner_state == ReadinessAspect.READY and
+                all(value == ReadinessAspect.READY for value in protected)):
+            actions.append(OperationKind.UPDATE.value)
+            reasons[OperationKind.UPDATE.value] = ""
+        if reversion_ready:
+            actions.append(OperationKind.REVERT_LOADER.value)
+            reasons[OperationKind.REVERT_LOADER.value] = ""
 
     return tuple(actions), tuple((kind.value, reasons[kind.value]) for kind in OperationKind)
 
@@ -564,10 +605,12 @@ class DefaultStatusInspector:
             runner_problem = (
                 "The selected Steam-managed Proton script, version, or matching "
                 "appmanifest is missing, malformed, linked, or ambiguous.")
+        runner_label = managed_runner_label(runner, runner_supported)
         runner_row = _row(
             "runner", "Proton runner",
-            "Unverified" if runner_supported else "Unsupported",
-            StatusSeverity.WARNING if runner_supported else StatusSeverity.ERROR,
+            runner_label,
+            (StatusSeverity.READY if runner_label == "Verified" else
+             StatusSeverity.WARNING if runner_supported else StatusSeverity.ERROR),
             ("The selected Steam Proton tool is safe to test; this game and mod "
              "combination has not been verified in-game." if
              runner_supported else
@@ -576,7 +619,8 @@ class DefaultStatusInspector:
             f"Selected script: {proton.proton_script or '<unresolved>'}",
             f"Steam compatibility mapping: {proton.steam_mapping or '<unresolved>'}",
             f"Prefix runtime: {proton.prefix_runtime or '<unresolved>'}",
-            "Steam-managed official Proton releases and Experimental can be tested; Hotfix and unreviewed custom executables remain blocked.")
+            "Steam-managed official Proton releases and Experimental can be tested; Hotfix and unreviewed custom executables remain blocked.",
+            "Verified describes the exact canonical Steam-selected managed runner under runner policy, not proof that every build, mod, or game mode works in-game.")
 
         self._cancelled(cancel)
         prerequisites = (inspect_prefix_prerequisites(prefix) if prefix is not None
@@ -645,9 +689,12 @@ class DefaultStatusInspector:
                 receipt_error = str(exc)
 
         component_rows: dict[str, StatusRow] = {}
+        installed_loader = next((item["version"] for item in receipt.data["artifacts"]
+                                 if item["artifact_id"] == "nenkai-loader"),
+                                ARTIFACTS["nenkai-loader"].version) if receipt else ARTIFACTS["nenkai-loader"].version
         versions = {
             "runtime": ARTIFACTS["reloaded-ii"].version,
-            "nenkai": ARTIFACTS["nenkai-loader"].version,
+            "nenkai": installed_loader,
             "sigscan": ARTIFACTS["sigscan"].version,
             "hooks": ARTIFACTS["shared-hooks"].version,
         }
@@ -682,6 +729,10 @@ class DefaultStatusInspector:
                         key, label, "Ready" if receipt else "Conflict",
                         StatusSeverity.READY if receipt else StatusSeverity.ERROR,
                         (f"Version {versions[key]} is present in generation {generation_id}."
+                         + ((" A matching normal Steam launch was recorded; visible mod behavior remains unverified."
+                             if receipt and receipt.data["last_successful_operation"] == "confirm-runtime-output"
+                             else " This loader version is in-game untested until a normal Steam launch validates it.")
+                            if key == "nenkai" and versions[key] != "1.7.3" else "")
                          if receipt else "Reviewed bytes exist without an ownership receipt."))
             except InspectionCancelled:
                 raise
@@ -765,6 +816,7 @@ class DefaultStatusInspector:
                 StatusSeverity.ERROR, "The managed prefix configuration is absent.")
 
         verification = None
+        pac_evidence = ()
         if (receipt is not None and steam_path is not None and prerequisites is not None
                 and active_state is not None):
             try:
@@ -803,7 +855,7 @@ class DefaultStatusInspector:
             issues = verification.issues
 
             def rejected(row: StatusRow, summary: str) -> StatusRow:
-                if row.severity != StatusSeverity.READY and not (row.key == "runner" and row.state == "Unverified"):
+                if row.severity != StatusSeverity.READY and not (row.key == "runner" and row.state in {"Unverified", "Verified"}):
                     return row
                 return _row(row.key, row.label, "Different",
                             StatusSeverity.ERROR, summary, *issues)
@@ -900,7 +952,25 @@ class DefaultStatusInspector:
             *((receipt.data.get("recovery_instructions", ()) if receipt else ())))
 
         ready = bool(verification and verification.ready and not unsupported
-                     and runner_row.state in {"Ready", "Unverified"})
+                     and runner_row.state in {"Ready", "Unverified", "Verified"})
+        release = None
+        release_error = ""
+        if receipt is not None and not receipt_error:
+            release, release_error = CHECKER.check(installed_loader)
+        release_row = _row(
+            "loader_release", "FFTIC Mod Loader release",
+            "Not installed" if receipt is None else
+            "Update available" if release and release.installable else
+            "Review required" if release else
+            "Check unavailable" if release_error else "Current",
+            StatusSeverity.WARNING if release or release_error else StatusSeverity.INFO,
+            ("Set up managed FFTIC support before checking loader updates."
+             if receipt is None else
+             f"Installed {installed_loader}; available {release.version}. "
+             + ("Choose Update to install the reviewed loader only." if release.installable
+                else release.reason) if release else
+             release_error or f"Installed {installed_loader}; no newer stable release was found."),
+            release.notes_url if release else "")
         launch_pending = normalization_pending or pac_confirmation_pending
         launch_row = _row(
             "launch", "Launch readiness", "Ready to test" if ready else
@@ -908,7 +978,7 @@ class DefaultStatusInspector:
             "Managed support needs attention" if receipt is not None else "Setup required",
             StatusSeverity.WARNING if ready else
             StatusSeverity.WARNING if launch_pending else StatusSeverity.ERROR,
-            ("Managed state is ready for an unverified test. Start FFTIC normally from Steam."
+            ("Managed state is ready. Start FFTIC normally from Steam and check the exact in-game result."
              if ready else
              "The managed installation exists; confirm the exact pending runtime transition."
              if launch_pending else
@@ -921,14 +991,20 @@ class DefaultStatusInspector:
             component_rows["runtime"], component_rows["nenkai"],
             component_rows["sigscan"], component_rows["hooks"],
             *prerequisite_rows, bootstrap_row, prefix_config_row, profile_row,
-            steam_row, reconciliation_row, recovery_row, launch_row, unsupported_row,
+            steam_row, reconciliation_row, recovery_row, launch_row, release_row,
+            unsupported_row,
         )
         host_available, host_reason = prerequisite_host_capability(probe=False)
+        revert_absent_pac = bool(
+            receipt is not None and verification is not None and root is not None
+            and game_root is not None and absent_pac_reversion_ready(
+                verification, receipt, game_root, root / "backups", pac_evidence))
         available_actions, action_reasons = _action_availability(
             rows, receipt_present=receipt is not None,
             verification=verification, unsupported=unsupported,
             prerequisite_host_available=host_available,
-            prerequisite_host_reason=host_reason)
+            prerequisite_host_reason=host_reason, release=release,
+            installed_loader=installed_loader, revert_absent_pac=revert_absent_pac)
         hashes = dict(installation.executable_hashes)
         details = (
             f"Detected Steam build: {build or '<unknown>'}",
@@ -940,7 +1016,8 @@ class DefaultStatusInspector:
             f"Enhanced executable SHA-256: {hashes.get('enhanced', '<unavailable>')}",
             (f"Supported tuple: Steam {VERIFIED_STEAM_BUILD}; runtime-proven UI metadata "
              f"{VERIFIED_UI_VERSION}; "
-             "runner policy: canonical Steam-managed Proton; selected runner remains unverified until in-game testing"),
+            "runner policy: canonical Steam-managed Proton; Verified labels managed selection readiness only"),
+            "Exact observed in-game compatibility results are separate from this runner label.",
             f"Current generation: {generation_id or '<none>'}",
             f"Reloaded-II: {versions['runtime']}; Nenkai: {versions['nenkai']}; "
             f"SigScan: {versions['sigscan']}; Shared Hooks: {versions['hooks']}",
@@ -957,7 +1034,7 @@ class DefaultStatusInspector:
             steam_options.preserved_unrelated, ready,
             bool(verification and verification.attested),
             available_actions=available_actions,
-            action_unavailable_reasons=action_reasons)
+            action_unavailable_reasons=action_reasons, release=release)
 
     @staticmethod
     def _observation_identity(context: InspectionContext) -> str:
@@ -1041,7 +1118,8 @@ class FfticOrchestrator:
                 "Start FFTIC normally from Steam. Amethyst's direct Proton route is not supported.",
                 observation_sha256=observation,
                 available_actions=available_actions,
-                action_unavailable_reasons=result.action_unavailable_reasons)
+                action_unavailable_reasons=result.action_unavailable_reasons,
+                release=result.release)
         except InspectionCancelled:
             raise
         except Exception as exc:
@@ -1096,8 +1174,17 @@ class FfticOrchestrator:
                     context.profile_name),),
             OperationKind.UPDATE: (
                 OperationStep(
-                    "managed runtime",
-                    "publish and activate a reviewed side-by-side generation",
+                    "FFTIC Mod Loader",
+                    f"acquire exact release {status.release.version if status.release else '<unavailable>'} asset "
+                    f"{status.release.asset_id if status.release else '<unavailable>'} "
+                    f"SHA-256 {status.release.asset_sha256 if status.release else '<unavailable>'}; "
+                    "publish and activate a side-by-side generation",
+                    "private FFTIC root"),),
+            OperationKind.REVERT_LOADER: (
+                OperationStep(
+                    "FFTIC Mod Loader",
+                    "rebuild reviewed 1.7.3 and publish a new owned generation; "
+                    "replace the 1.7.5 receipt and reset the PAC/log baseline",
                     "private FFTIC root"),),
             OperationKind.REMOVE: (
                 OperationStep(
@@ -1114,7 +1201,8 @@ class FfticOrchestrator:
             names = ", ".join(item.name for item in status.unsupported_packages)
             raise RuntimeError(f"Unsupported or unsafe packages block this plan: {names}")
         binding = self._binding(context, status, epoch)
-        return OperationPlan(kind, context.profile_name, targets[kind], binding=binding)
+        return OperationPlan(kind, context.profile_name, targets[kind], binding=binding,
+                             release=status.release if kind == OperationKind.UPDATE else None)
 
     @staticmethod
     def _binding(context: InspectionContext, status: FfticStatusViewModel,
@@ -1135,6 +1223,8 @@ class FfticOrchestrator:
             ],
             "ready": status.ready,
             "attested": status.verifier_attested,
+            "release": (getattr(status, "release", None).__dict__
+                        if getattr(status, "release", None) else None),
         }
         digest = hashlib.sha256(json.dumps(
             material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -1198,7 +1288,8 @@ class FfticOrchestrator:
             context, status, epoch = self._last_context, self._last_status, self._epoch
         if plan.binding is None or context is None or status is None:
             return False
-        return plan.binding == self._binding(context, status, epoch)
+        return (plan.binding == self._binding(context, status, epoch)
+                and (plan.kind != OperationKind.UPDATE or plan.release == status.release))
 
     def revalidate_plan(self, plan: OperationPlan) -> bool:
         """Recompute the background observation before an executor may mutate."""

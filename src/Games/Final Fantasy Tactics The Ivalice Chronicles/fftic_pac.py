@@ -155,6 +155,45 @@ def exact_absent_output(game_root: Path, baseline: PacBaselineSet,
     return True
 
 
+def exact_absent_reversion_output(game_root: Path, baseline: PacBaselineSet,
+                                  backup_root: Path) -> bool:
+    """Permit an unconfirmed launch's absent PACs only with exact owned backups."""
+    game_root, backup_root = Path(game_root), Path(backup_root)
+    if (backup_root.is_symlink() or not backup_root.is_dir()
+            or backup_root.resolve(strict=True) != backup_root.absolute()
+            or len(baseline.paths) != len(GENERATED_PAC_PATHS)
+            or {item.relative_path for item in baseline.paths} != set(GENERATED_PAC_PATHS)
+            or not any(item.state == PacOwnershipState.OWNED_EXACT
+                       for item in baseline.paths)):
+        return False
+    for item in baseline.paths:
+        target = game_root / item.relative_path
+        if os.path.lexists(target):
+            return False
+        current = game_root
+        for part in Path(item.relative_path).parts[:-1]:
+            current /= part
+            if os.path.lexists(current) and (current.is_symlink() or not current.is_dir()):
+                return False
+        if item.state == PacOwnershipState.ABSENT:
+            continue
+        if item.state != PacOwnershipState.OWNED_EXACT or not item.backup_path:
+            return False
+        backup = Path(item.backup_path)
+        if (not backup.is_absolute() or backup == backup_root
+                or not backup.is_relative_to(backup_root)):
+            return False
+        current = backup_root
+        for part in backup.relative_to(backup_root).parts[:-1]:
+            current /= part
+            if current.is_symlink() or not current.is_dir():
+                return False
+        if (backup.is_symlink() or not backup.is_file()
+                or file_sha256(backup) != item.sha256):
+            return False
+    return True
+
+
 def inspect_matching_launch_log(
     log_root: Path, *, baseline: PacBaselineSet, required_mod_ids: tuple[str, ...],
 ) -> PacLaunchEvidence | None:

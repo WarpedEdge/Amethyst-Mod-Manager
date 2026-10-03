@@ -230,6 +230,7 @@ class LifecycleOperations(Protocol):
     def repair(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def synchronize(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def update(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
+    def revert_loader(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def remove(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def reconcile_runtime_output(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
 
@@ -396,6 +397,9 @@ class StagedLifecycleOperations:
     def update(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
 
+    def revert_loader(self, plan, cancel, progress):
+        return self._run(plan, cancel, progress)
+
     def remove(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
 
@@ -474,6 +478,7 @@ class ManagedLifecycleExecutor:
                 OperationKind.REPAIR: self._operations.repair,
                 OperationKind.SYNCHRONIZE: self._operations.synchronize,
                 OperationKind.UPDATE: self._operations.update,
+                OperationKind.REVERT_LOADER: self._operations.revert_loader,
                 OperationKind.REMOVE: self._operations.remove,
                 OperationKind.RECONCILE_RUNTIME_OUTPUT:
                     self._operations.reconcile_runtime_output,

@@ -383,7 +383,7 @@ def test_action_gating_and_prerequisite_blocker() -> None:
         unverified_runner, receipt_present=False, verification=None, unsupported=())
     assert OperationKind.SETUP.value in actions
     assert OperationKind.UPDATE.value not in actions
-    assert "distinct reviewed artifact identity" in dict(reasons)["update"]
+    assert "No newer reviewed loader asset" in dict(reasons)["update"]
 
     missing = tuple(
         _row(row.key, "Not installed") if row.key == "dotnet" else row
@@ -600,7 +600,8 @@ def test_post_launch_focus_is_distinct_from_read_only_recheck() -> None:
     panel.recheck_requested.connect(lambda: calls.append({"read_only": True}))
     panel._recheck.click()
     assert calls[-1] == {"read_only": True}
-    assert "without changing files" in panel._recheck.toolTip()
+    assert "without changing managed game files" in panel._recheck.toolTip()
+    assert "notice may be saved" in panel._recheck.toolTip()
     panel.close()
     app.processEvents()
 
@@ -650,6 +651,30 @@ def test_automatic_status_ready_attempts_once_after_failure() -> None:
     assert shown == [model, model]
 
 
+def test_release_notice_once_across_rechecks_and_restart() -> None:
+    from gui_qt.app import MainWindow
+    from fftic_loader_releases import LoaderRelease
+    from Utils import config_paths
+
+    release = LoaderRelease("1.7.5", 399774110, 600208145, "", 0, "",
+                            "https://github.com/Nenkai/fftivc.utility.modloader/releases", True)
+    notices = []
+    host = SimpleNamespace(
+        _fftic_status_gen=3, _fftic_status=SimpleNamespace(set_status=lambda _model: None),
+        _fftic_status_cancel=None, _fftic_operation_active=False,
+        _fftic_auto_attempted=set(), _notify=lambda message, kind: notices.append((message, kind)),
+        _append_log=lambda _message: None, tr=lambda message: message)
+    with tempfile.TemporaryDirectory(prefix="fftic-notice-ui-") as temporary, patch.object(
+            config_paths, "get_config_dir", return_value=Path(temporary)):
+        model = SimpleNamespace(error=None, release=release)
+        MainWindow._on_fftic_status_ready(host, 3, model)
+        MainWindow._on_fftic_status_ready(host, 3, model)
+        assert len(notices) == 1 and notices[0][1] == "info"
+        restarted = SimpleNamespace(**host.__dict__)
+        MainWindow._on_fftic_status_ready(restarted, 3, model)
+        assert len(notices) == 1
+
+
 def main() -> None:
     tests = (
         test_composition_derives_owned_paths_and_delays_acquisition,
@@ -665,6 +690,7 @@ def main() -> None:
         test_setup_confirmation_keeps_steam_manual_and_shared_runtimes,
         test_post_launch_focus_is_distinct_from_read_only_recheck,
         test_automatic_status_ready_attempts_once_after_failure,
+        test_release_notice_once_across_rechecks_and_restart,
     )
     for test in tests:
         test()
