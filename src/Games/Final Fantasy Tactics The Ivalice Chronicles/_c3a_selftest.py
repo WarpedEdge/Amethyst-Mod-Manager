@@ -391,6 +391,13 @@ def test_qt_panel_copy_and_visibility() -> None:
     assert rechecks == [True]
     panel._copy_steam_options()
     assert app.clipboard().text() == model.steam_copy_text
+    settled_rows = tuple(panel._rows)
+    settled_details = panel._detail_text.toPlainText()
+    panel.set_loading(preserve_status=True)
+    assert panel.model is model and tuple(panel._rows) == settled_rows
+    assert panel._detail_text.toPlainText() == settled_details
+    assert not panel._recheck.isEnabled()
+    panel.set_status(model)
     panel.set_loading()
     assert panel.model is None and not panel._rows
     assert not panel._copy.isEnabled()

@@ -451,9 +451,15 @@ def test_prerequisite_failure_is_retryable_without_prefix_rollback_claim() -> No
                               for path in blocked.prefix.rglob("*"))
 
     failing = Fixture("fake-prerequisite-failure", missing_dotnet=True)
-    runner_path = failing.root / "tools/proton"
-    runner_path.parent.mkdir()
+    runner_path = failing.root / "steamapps/common/Proton - Experimental/proton"
+    runner_path.parent.mkdir(parents=True)
     runner_path.write_bytes(b"fake runner boundary")
+    (runner_path.parent / "version").write_text(
+        f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    (failing.root / "steamapps/appmanifest_1493710.acf").write_text(
+        '"AppState"\n{\n"appid" "1493710"\n'
+        '"installdir" "Proton - Experimental"\n}\n',
+        encoding="utf-8")
     requests = []
 
     class FakeRunner:

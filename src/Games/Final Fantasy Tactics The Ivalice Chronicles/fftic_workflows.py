@@ -48,8 +48,9 @@ try:
         PrefixPrerequisites,
         PrerequisiteState, plan_installer,
     )
+    from .fftic_proton import supported_runner
     from .fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER, profile_fingerprint,
+        ReadinessAspect, ReadinessEvidence, profile_fingerprint,
         verify_launch_readiness,
     )
     from .fftic_receipts import (
@@ -93,8 +94,9 @@ except ImportError:
         PrefixPrerequisites,
         PrerequisiteState, plan_installer,
     )
+    from fftic_proton import supported_runner
     from fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER, profile_fingerprint,
+        ReadinessAspect, ReadinessEvidence, profile_fingerprint,
         verify_launch_readiness,
     )
     from fftic_receipts import (
@@ -286,8 +288,8 @@ class FfticLifecycleComposition:
 
     def _current_runner(self) -> str:
         runner = self.inputs.runner_reader()
-        if runner != SUPPORTED_PROTON_RUNNER:
-            raise WorkflowError("Current runner identity is outside the reviewed tuple")
+        if not supported_runner(runner):
+            raise WorkflowError("Selected Proton runner is outside the supported Experimental 11.0 policy")
         return runner
 
     def _current_steam_options(self) -> SteamOptionsAnalysis:
@@ -309,7 +311,9 @@ class FfticLifecycleComposition:
         )):
             raise WorkflowError("Operation binding differs from the composed lifecycle roots")
         self._current_installation()
-        self._current_runner()
+        runner = self._current_runner()
+        if getattr(binding, "runner_identity", "") and binding.runner_identity != runner:
+            raise WorkflowError("Selected Proton runner changed since the operation plan")
         self._current_steam_options()
         resolve_steam_s_path(
             steam_library=self.inputs.steam_library,
@@ -404,7 +408,8 @@ class FfticLifecycleComposition:
         target = (self.inputs.game_root / Path(*pure.parts)).absolute()
         return self._bounded_path(target, self.inputs.game_root, "Receipt PAC path")
 
-    def _validate_receipt_context(self, receipt: Receipt) -> None:
+    def _validate_receipt_context(self, receipt: Receipt,
+                                  kind: OperationKind | None = None) -> None:
         evidence = self._current_installation()
         runner = self._current_runner()
         self._current_steam_options()
@@ -418,12 +423,17 @@ class FfticLifecycleComposition:
                 Path(game["steam_library"]) != steam.steam_library,
                 game["installed_directory"] != steam.installed_directory,
                 Path(prefix["path"]) != steam.prefix,
-                prefix["runner_identity"] != runner,
-                data["compatibility_tuple"]["proton_runner"] != runner,
+                prefix["runner_identity"] != data["compatibility_tuple"]["proton_runner"],
                 data["evidence_authority"] != evidence.authority,
                 data["executable_hashes"] != dict(evidence.detection.executable_hashes))):
             raise RecoveryRequiredError(
                 "Receipt installation, prefix, runner, or executable identity is stale")
+        if not supported_runner(prefix["runner_identity"]):
+            raise RecoveryRequiredError("Receipt runner is outside the supported Experimental 11.0 policy")
+        if (prefix["runner_identity"] != runner
+                and kind not in {OperationKind.SYNCHRONIZE, OperationKind.REMOVE}):
+            raise RecoveryRequiredError(
+                "Selected Proton runner changed; synchronize before launch-log reconciliation or repair")
         generation = data["active_generation_identity"]
         self._bounded_path(generation["root"], self.inputs.generations_root,
                            "Receipt generation root", kind="directory")
@@ -468,7 +478,7 @@ class FfticLifecycleComposition:
         baseline.pac_backup_files = {}
         current_receipt = read_receipt(self.inputs.receipts_root)
         if current_receipt is not None:
-            self._validate_receipt_context(current_receipt)
+            self._validate_receipt_context(current_receipt, kind)
             baseline.receipt_record = current_receipt
             baseline.pac_files = {
                 item["relative_path"]: self._read_optional(
@@ -758,7 +768,8 @@ class FfticLifecycleComposition:
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _receipt_data(self, generation: GenerationResult, operation: str,
-                      prior: Receipt | None = None) -> dict:
+                      prior: Receipt | None = None,
+                      prior_bytes: bytes | None = None) -> dict:
         manifest = json.loads((generation.root / "amethyst-generation.json").read_text(encoding="utf-8"))
         steam = resolve_steam_s_path(
             steam_library=self.inputs.steam_library, app_manifest=self.inputs.app_manifest,
@@ -926,15 +937,39 @@ class FfticLifecycleComposition:
             "recovery_instructions": [
                 f"Review durable lifecycle evidence at {self.inputs.journal_file}."],
         }
+        if old and (old.get("runner_history") or old["prefix_identity"]["runner_identity"] != runner):
+            history = list(old.get("runner_history", ()))
+            previous_runner = old["prefix_identity"]["runner_identity"]
+            if previous_runner != runner:
+                if prior_bytes is None:
+                    raise WorkflowError("Prior receipt bytes are unavailable for runner history")
+                history.append({
+                    "transaction_id": old["transaction_id"],
+                    "from_runner": previous_runner,
+                    "to_runner": runner,
+                    "prior_receipt_sha256": hashlib.sha256(prior_bytes).hexdigest(),
+                })
+            data["runner_history"] = history
         return validate_receipt(data)
 
     def _write_receipt(self, token: _Baseline, generation: GenerationResult,
                        operation: str) -> None:
         self._ensure_stopped()
+        if token.plan is not None:
+            self._revalidate(token.plan)
+        receipt_path = self.inputs.receipts_root / "fftic-receipt.json"
+        old_bytes = self._read_optional(receipt_path)
+        if old_bytes != token.receipt:
+            raise WorkflowError("Ownership receipt changed during the operation")
         old = read_receipt(self.inputs.receipts_root)
+        if self._read_optional(receipt_path) != old_bytes:
+            raise WorkflowError("Ownership receipt changed while building runner history")
+        data = self._receipt_data(generation, operation, old, old_bytes)
+        if self._read_optional(receipt_path) != old_bytes:
+            raise WorkflowError("Ownership receipt changed before replacement")
         write_receipt(self.inputs.receipts_root,
-                      self._receipt_data(generation, operation, old))
-        token.mutated_files.add(self.inputs.receipts_root / "fftic-receipt.json")
+                      data)
+        token.mutated_files.add(receipt_path)
         self._inject("receipt", token.kind)
 
     def _setup(self, token: _Baseline, cancel) -> None:
@@ -1025,11 +1060,19 @@ class FfticLifecycleComposition:
                 raise WorkflowError("Confirmed absent PAC output or its backup has changed")
         self._assert_readiness(
             f"{operation.title()} refuses drift outside the current profile",
-            allow_profile_drift=True)
+            allow_profile_drift=True, allow_runner_transition=True)
         generation, _paths = self._build(token, cancel, candidates)
         if generation.generation_id == self._current_generation_id():
-            raise WorkflowError(
-                f"{operation.title()} has no changed reviewed input to publish")
+            if (receipt.data["prefix_identity"]["runner_identity"] == self._current_runner()
+                    or operation != "synchronize"):
+                raise WorkflowError(
+                    f"{operation.title()} has no changed reviewed input to publish")
+            # The private generation and its activation are still exact. Record
+            # the new Steam runner as a new receipt transaction and PAC/log
+            # baseline without touching owned game or prefix configuration.
+            token.activation_id = f"runner-transition-{uuid.uuid4().hex}"
+            self._write_receipt(token, generation, operation)
+            return
         self._inject("generation", token.kind)
         self._cancelled(cancel)
         self._install_bootstrap(token, generation)
@@ -1288,7 +1331,8 @@ class FfticLifecycleComposition:
             raise WorkflowError("Removal requires an ownership receipt")
         try:
             self._assert_readiness(
-                "Removal refuses unverified owned state", allow_pac_disposition=True)
+                "Removal refuses unverified owned state", allow_pac_disposition=True,
+                allow_runner_transition=True)
         except WorkflowError as exc:
             raise RecoveryRequiredError(str(exc)) from exc
         for record in receipt.data["owned_game_targets"]:
@@ -1381,11 +1425,12 @@ class FfticLifecycleComposition:
         self._quarantine_file(token, receipt_path, file_sha256(receipt_path))
         self._inject("remove:receipt", token.kind)
 
-    def _readiness(self):
+    def _readiness(self, *, allow_runner_transition: bool = False):
         receipt = read_receipt(self.inputs.receipts_root)
         if receipt is None:
             raise WorkflowError("A complete ownership receipt is missing")
-        self._validate_receipt_context(receipt)
+        self._validate_receipt_context(
+            receipt, OperationKind.SYNCHRONIZE if allow_runner_transition else None)
         installation = self._current_installation()
         steam = resolve_steam_s_path(
             steam_library=self.inputs.steam_library, app_manifest=self.inputs.app_manifest,
@@ -1399,11 +1444,17 @@ class FfticLifecycleComposition:
 
     def _assert_readiness(self, prefix: str, *, allow_profile_drift: bool = False,
                           allow_pac_disposition: bool = False,
-                          allow_unknown_setup_baseline: bool = False) -> None:
-        installation, verified = self._readiness()
+                          allow_unknown_setup_baseline: bool = False,
+                          allow_runner_transition: bool = False) -> None:
+        installation, verified = self._readiness(
+            allow_runner_transition=allow_runner_transition)
         states = (verified.artifacts, verified.generation, verified.prefix,
                   verified.prerequisites, verified.bootstrap, verified.steam_options,
                   verified.recovery)
+        runner_ok = (verified.runner == ReadinessAspect.READY or
+                     (allow_runner_transition and verified.runner == ReadinessAspect.INVALID
+                      and any(issue.startswith("Selected Proton runner changed since")
+                              for issue in verified.issues)))
         pac_only = (allow_pac_disposition
                     and all(issue.startswith("PAC observation")
                             for issue in verified.issues
@@ -1418,14 +1469,18 @@ class FfticLifecycleComposition:
                     for issue in verified.issues))
         profile_ok = (allow_profile_drift or pac_only or unknown_baseline_only
                       or verified.profile == ReadinessAspect.READY)
+        if (allow_runner_transition and verified.runner != ReadinessAspect.READY
+                and any(issue.startswith((
+                    "PAC ", "Unknown preexisting PAC")) for issue in verified.issues)):
+            profile_ok = False
         fixture_ok = (installation.authority.startswith("isolated-fixture:")
                       and verified.attested and verified.game == ReadinessAspect.INVALID
                       and profile_ok
-                      and all(state == ReadinessAspect.READY for state in states))
+                      and runner_ok and all(state == ReadinessAspect.READY for state in states))
         production_ok = (installation.authority == "reviewed-production"
                          and verified.attested and verified.game == ReadinessAspect.READY
                          and profile_ok
-                         and all(state == ReadinessAspect.READY for state in states))
+                         and runner_ok and all(state == ReadinessAspect.READY for state in states))
         if not (fixture_ok or production_ok):
             raise WorkflowError(prefix + ": " + "; ".join(verified.issues))
 

@@ -23,7 +23,7 @@ try:
         ProgressUpdate,
     )
     from .fftic_prerequisites import InstallerPlan
-    from .fftic_readiness import SUPPORTED_PROTON_RUNNER
+    from .fftic_proton import supported_runner
 except ImportError:
     from fftic_artifacts import ArtifactPin, validate_file
     from fftic_orchestration import (
@@ -31,7 +31,7 @@ except ImportError:
         ProgressUpdate,
     )
     from fftic_prerequisites import InstallerPlan
-    from fftic_readiness import SUPPORTED_PROTON_RUNNER
+    from fftic_proton import supported_runner
 
 
 class OperationState(str, Enum):
@@ -150,7 +150,7 @@ class ProcessRequest:
                 or prefix != Path(self.plan.prefix).resolve(strict=True)):
             raise ManagedOperationError("Installer prefix differs from its prerequisite plan")
         if (self.runner_identity != self.plan.runner_identity
-                or self.runner_identity != SUPPORTED_PROTON_RUNNER):
+                or not supported_runner(self.runner_identity)):
             raise ManagedOperationError("Installer runner identity differs from its prerequisite plan")
         if self.arguments != self.plan.arguments:
             raise ManagedOperationError("Installer arguments differ from the reviewed plan")
@@ -163,6 +163,8 @@ class ProcessRequest:
         runner = self._regular_unlinked(self.runner, "Runner")
         if runner != Path(self.runner):
             raise ManagedOperationError("Runner path is not its exact resolved path")
+        if not supported_runner(self.runner_identity, runner):
+            raise ManagedOperationError("Selected Steam Proton tool changed or is outside policy")
         working_directory = self._directory_unlinked(
             self.working_directory, "Working directory")
         if working_directory != Path(self.working_directory):

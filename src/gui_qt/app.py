@@ -594,6 +594,8 @@ class MainWindow(QMainWindow):
         self._fftic_refresh_pending = False
         self._fftic_auto_attempted = set()
         self._fftic_auto_operation = False
+        self._fftic_seen_inactive = False
+        self._fftic_initial_status_ready = False
         # Deploy/restore state + notification host.
         self._deploy_running = False
         self._deploy_rerun_pending = False
@@ -20617,8 +20619,12 @@ class MainWindow(QMainWindow):
     def _on_fftic_application_state_changed(self, state):
         # Returning from Steam/game is the post-launch lifecycle point. Recheck
         # remains a read-only status action and never requests this path.
-        if state == Qt.ApplicationActive:
-            self._refresh_fftic_status(auto_reconcile=True)
+        if state != Qt.ApplicationActive:
+            self._fftic_seen_inactive = True
+        elif getattr(self, "_fftic_seen_inactive", False):
+            self._fftic_seen_inactive = False
+            if getattr(self, "_fftic_initial_status_ready", False):
+                self._refresh_fftic_status(auto_reconcile=True)
 
     def _refresh_fftic_status(self, *, auto_reconcile=False):
         panel = getattr(self, "_fftic_status", None)
@@ -20648,7 +20654,7 @@ class MainWindow(QMainWindow):
         cancel = threading.Event()
         self._fftic_status_cancel = cancel
         panel.show()
-        panel.set_loading()
+        panel.set_loading(preserve_status=auto_reconcile)
         controller = context.game.get_managed_support_controller()
         controller.invalidate(context)
         self._fftic_status_controller = controller
@@ -20692,6 +20698,7 @@ class MainWindow(QMainWindow):
             return
         model, evidence_key = model if isinstance(model, tuple) else (model, None)
         self._fftic_status_cancel = None
+        self._fftic_initial_status_ready = True
         panel.set_status(model)
         if model.error:
             self._append_log(f"FFTIC status error: {model.error}")

@@ -13,7 +13,7 @@ try:
     from .fftic_orchestration import (
         FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
-    from .fftic_proton import resolve_proton_selection
+    from .fftic_proton import resolve_proton_selection, supported_runner
     from .fftic_prerequisites import (
         inspect_prefix_prerequisites, prerequisite_host_capability,
     )
@@ -32,7 +32,7 @@ except ImportError:
     from fftic_orchestration import (
         FFTIC_GAME_ID, InspectionContext, _manifest_value, _pe_version,
     )
-    from fftic_proton import resolve_proton_selection
+    from fftic_proton import resolve_proton_selection, supported_runner
     from fftic_prerequisites import (
         inspect_prefix_prerequisites, prerequisite_host_capability,
     )
@@ -68,6 +68,14 @@ def _canonical_steam_client_root(value) -> Path:
         raise ValueError(
             "The Steam client root for selected Proton is unavailable") from exc
     return _canonical_directory(resolved, "Steam client root")
+
+
+def _supported_selected_runner(steam_id: str, prefix: Path) -> str:
+    selection = resolve_proton_selection(steam_id, prefix)
+    if (selection.prefix_runtime != "11.0-100"
+            or not supported_runner(selection.tool_identity, selection.proton_script)):
+        return ""
+    return selection.tool_identity
 
 
 def _prerequisite_is_sufficient(plan, prefix: Path) -> bool:
@@ -178,6 +186,8 @@ def create_production_executor(
             runner = selection.proton_script
             if selection.tool_identity != plan.runner_identity:
                 raise ValueError("The selected Proton identity changed before installation")
+            if not supported_runner(selection.tool_identity, selection.proton_script):
+                raise ValueError("The selected Proton tool is outside the supported Steam policy")
             if runner is None:
                 raise ValueError("The selected Proton installation could not be resolved")
             runner = Path(runner).absolute()
@@ -243,11 +253,11 @@ def create_production_executor(
             installation_reader=production_installation,
             steam_options_reader=lambda: analyze_steam_launch_options(
                 steam_launch_options(game.steam_id)),
-            runner_reader=lambda: resolve_proton_selection(
-                game.steam_id, prefix).tool_identity,
+            runner_reader=lambda: _supported_selected_runner(game.steam_id, prefix),
             prerequisite_reader=inspect_prefix_prerequisites,
             process_request_factory=process_request,
-            process_runner=FfticPrerequisiteRunner(),
+            process_runner=FfticPrerequisiteRunner(
+                selection_reader=lambda: resolve_proton_selection(game.steam_id, prefix)),
             setup_candidates=None,
             artifact_acquirer=acquire_reviewed,
             process_running=managed_processes_running,

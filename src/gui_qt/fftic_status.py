@@ -132,13 +132,16 @@ class FfticStatusPanel(QFrame):
         self._details.hide()
         outer.addWidget(self._details)
 
-    def set_loading(self) -> None:
-        self._model = None
-        self._clear_rows()
+    def set_loading(self, *, preserve_status: bool = False) -> None:
+        settled = preserve_status and self._model is not None
+        if not settled:
+            self._model = None
+            self._clear_rows()
         self._copy.setEnabled(False)
         for button in self._action_buttons.values():
             button.setEnabled(False)
-        self._detail_text.setPlainText(self.tr("Checking current FFTIC status…"))
+        if not settled:
+            self._detail_text.setPlainText(self.tr("Checking current FFTIC status…"))
         self._recheck.setEnabled(False)
         self._recheck.setText(self.tr("Checking…"))
 

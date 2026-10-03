@@ -127,7 +127,16 @@ def test_composition_derives_owned_paths_and_delays_acquisition() -> None:
     assert inputs.process_runner is not None
     assert inputs.process_request_factory is not None
     assert inputs.setup_candidates is None
-    selected = SimpleNamespace(
+    runner = fixture.root / "steam/steamapps/common/Proton - Experimental/proton"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("fixture", encoding="utf-8")
+    (runner.parent / "version").write_text(
+        f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    (fixture.root / "steam/steamapps/appmanifest_1493710.acf").write_text(
+        '"AppState"\n{\n"appid" "1493710"\n'
+        '"installdir" "Proton - Experimental"\n}\n',
+        encoding="utf-8")
+    selected = SimpleNamespace(proton_script=runner,
         tool_identity=SUPPORTED_PROTON_RUNNER, prefix_runtime="11.0-100")
     with patch("fftic_production.resolve_proton_selection",
                return_value=selected) as resolver:
@@ -245,11 +254,15 @@ def test_production_request_binds_exact_proton_prefix_and_steam_context() -> Non
     fixture.cache.mkdir(parents=True)
     installer = fixture.cache / ARTIFACTS["dotnet-desktop-runtime"].filename
     installer.write_bytes(b"synthetic request candidate")
-    runner = fixture.root / "steam/steamapps/common/Proton Experimental/proton"
+    runner = fixture.root / "steam/steamapps/common/Proton - Experimental/proton"
     runner.parent.mkdir(parents=True)
     runner.write_text("#!/usr/bin/python3\n", encoding="utf-8")
     (runner.parent / "version").write_text(
         f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    (fixture.root / "steam/steamapps/appmanifest_1493710.acf").write_text(
+        '"AppState"\n{\n"appid" "1493710"\n'
+        '"installdir" "Proton - Experimental"\n}\n',
+        encoding="utf-8")
     steam_client = fixture.root / "steam"
     steam_alias = fixture.root / "alias/root"
     steam_alias.parent.mkdir()
@@ -559,7 +572,8 @@ def test_post_launch_focus_is_distinct_from_read_only_recheck() -> None:
 
     app = QApplication.instance() or QApplication([])
     calls = []
-    host = SimpleNamespace(_refresh_fftic_status=lambda **kw: calls.append(kw))
+    host = SimpleNamespace(_fftic_initial_status_ready=True,
+                           _refresh_fftic_status=lambda **kw: calls.append(kw))
     MainWindow._on_fftic_application_state_changed(host, Qt.ApplicationInactive)
     assert calls == []
     MainWindow._on_fftic_application_state_changed(host, Qt.ApplicationActive)

@@ -29,6 +29,7 @@ try:
         analyze_steam_launch_options,
     )
     from .fftic_transaction_executor import file_sha256
+    from .fftic_proton import supported_runner
 except ImportError:
     from fftic_artifacts import INTERNAL_FILES, validate_file
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
@@ -49,7 +50,9 @@ except ImportError:
         analyze_steam_launch_options,
     )
     from fftic_transaction_executor import file_sha256
+    from fftic_proton import supported_runner
 
+# Historical fixture and receipt baseline. Policy is evaluated by supported_runner.
 SUPPORTED_PROTON_RUNNER = "experimental-11.0-20260924-x86_64"
 _VERIFICATION_TOKEN = object()
 
@@ -83,6 +86,7 @@ class ReadinessVerification:
     artifacts: ReadinessAspect
     generation: ReadinessAspect
     prefix: ReadinessAspect
+    runner: ReadinessAspect
     prerequisites: ReadinessAspect
     bootstrap: ReadinessAspect
     steam_options: ReadinessAspect
@@ -99,7 +103,7 @@ class ReadinessVerification:
     def ready(self) -> bool:
         return self.attested and not self.issues and all(
             value == ReadinessAspect.READY for value in (
-                self.game, self.artifacts, self.generation, self.prefix,
+                self.game, self.artifacts, self.generation, self.prefix, self.runner,
                 self.prerequisites, self.bootstrap, self.steam_options,
                 self.profile, self.recovery))
 
@@ -162,7 +166,7 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
     """Correlate a valid receipt with current inspector and filesystem evidence."""
     issues: list[str] = []
     states = {name: ReadinessAspect.READY for name in (
-        "game", "artifacts", "generation", "prefix", "prerequisites",
+        "game", "artifacts", "generation", "prefix", "runner", "prerequisites",
         "bootstrap", "steam_options", "profile", "recovery")}
 
     def reject(aspect: str, message: str, *, missing: bool = False) -> None:
@@ -208,10 +212,14 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
             reject("prefix", "Steam library, manifest, game root, prefix, or S: identity changed")
     except Exception as exc:
         reject("prefix", f"Steam path identity is not currently verified: {exc}")
-    if (prefix["runner_identity"] != compatibility["proton_runner"]
-            or evidence.runner_identity != prefix["runner_identity"]
-            or evidence.runner_identity != SUPPORTED_PROTON_RUNNER):
-        reject("prefix", "Runner identity does not match the supported compatibility tuple")
+    if prefix["runner_identity"] != compatibility["proton_runner"]:
+        reject("recovery", "Receipt runner fields disagree")
+    if not supported_runner(prefix["runner_identity"]):
+        reject("recovery", "Receipt runner is outside the supported Experimental 11.0 policy")
+    if not supported_runner(evidence.runner_identity):
+        reject("runner", "Selected Proton runner is outside the supported Experimental 11.0 policy")
+    elif evidence.runner_identity != prefix["runner_identity"]:
+        reject("runner", "Selected Proton runner changed since the managed receipt; synchronize to record a new generation")
 
     generation_identity = receipt["active_generation_identity"]
     generation_root = Path(generation_identity["root"])

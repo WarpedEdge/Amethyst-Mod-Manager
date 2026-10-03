@@ -56,6 +56,19 @@ def _prefix_processes_active(request: ProcessRequest) -> bool:
 class FfticPrerequisiteRunner:
     """Execute only a validated FFTIC installer plan through selected Proton."""
 
+    def __init__(self, selection_reader=None):
+        self._selection_reader = selection_reader
+
+    def _check_selected_tool(self, request: ProcessRequest) -> None:
+        if self._selection_reader is None:
+            return  # Isolated runner tests supply a synthetic request.
+        selected = self._selection_reader()
+        if (selected.proton_script != request.runner
+                or selected.tool_identity != request.runner_identity
+                or selected.prefix_runtime != "11.0-100"):
+            raise ManagedOperationError(
+                "Steam selected a different Proton tool since the installer plan")
+
     def run(self, request: ProcessRequest, cancel: threading.Event | None = None,
             progress=None) -> ProcessResult:
         request.validate()
@@ -68,6 +81,7 @@ class FfticPrerequisiteRunner:
         if _selected_tool_identity(request.runner) != request.runner_identity:
             raise ManagedOperationError(
                 "The selected Proton installation identity changed before execution")
+        self._check_selected_tool(request)
         if request.allow_flatpak_host_spawn:
             available, reason = host_execution_capability()
             if not available:
@@ -93,6 +107,7 @@ class FfticPrerequisiteRunner:
             request.runner, "runinprefix", str(request.executable),
             *request.arguments, env=environment,
             host_cwd=request.working_directory)
+        self._check_selected_tool(request)
         if any(value in {"sh", "bash", "-c"} for value in command):
             raise ManagedOperationError("Installer command unexpectedly requires a shell")
         _append_log(request.log_path, f"Starting reviewed {request.plan.component} installer")

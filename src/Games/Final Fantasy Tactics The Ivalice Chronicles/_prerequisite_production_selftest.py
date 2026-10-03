@@ -6,6 +6,7 @@ import tempfile
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fftic_artifacts import ARTIFACTS
@@ -33,11 +34,15 @@ def _request() -> ProcessRequest:
         directory.mkdir(parents=True, exist_ok=True)
     installer = cache / ARTIFACTS["dotnet-desktop-runtime"].filename
     installer.write_bytes(b"synthetic installer; hash validation is selectively patched")
-    runner = root / "Proton Experimental/proton"
+    runner = root / "steamapps/common/Proton - Experimental/proton"
     runner.parent.mkdir(parents=True)
     runner.write_text("#!/usr/bin/python3\n", encoding="utf-8")
     (runner.parent / "version").write_text(
         f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    (root / "steamapps/appmanifest_1493710.acf").write_text(
+        '"AppState"\n{\n"appid" "1493710"\n'
+        '"installdir" "Proton - Experimental"\n}\n',
+        encoding="utf-8")
     health = classify_prerequisite(
         component=DOTNET_COMPONENT, required_version="9.0.20",
         observed_version=None, healthy=True, present=False)
@@ -75,6 +80,20 @@ def _run_with_code(request: ProcessRequest, code, cancel=None):
                   return_value=(code, "synthetic output")) as execute:
         result = FfticPrerequisiteRunner().run(request, cancel)
     return result, tuple(command), execute
+
+
+def test_steam_selection_change_blocks_stale_installer_request() -> None:
+    request = _request()
+    other = SimpleNamespace(proton_script=request.runner,
+                            tool_identity="experimental-11.0-20261001-x86_64")
+    runner = FfticPrerequisiteRunner(selection_reader=lambda: other)
+    with patch("fftic_managed_executor.validate_file", return_value=True):
+        try:
+            runner.run(request)
+        except ManagedOperationError as exc:
+            assert "different Proton tool" in str(exc)
+        else:
+            raise AssertionError("Changed Steam selection ran stale installer plan")
 
 
 def test_exact_command_success_and_restart_codes() -> None:
@@ -225,6 +244,7 @@ def test_status_check_does_not_probe_and_runner_rechecks_host() -> None:
 
 def main() -> None:
     tests = (
+        test_steam_selection_change_blocks_stale_installer_request,
         test_exact_command_success_and_restart_codes,
         test_wrong_hash_and_proton_identity_stop_before_execution,
         test_failure_timeout_and_cancellation_boundaries,

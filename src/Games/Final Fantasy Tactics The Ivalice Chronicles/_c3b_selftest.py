@@ -342,7 +342,15 @@ def test_prerequisite_request_is_injectable_and_flatpak_closed():
     from fftic_readiness import SUPPORTED_PROTON_RUNNER
     payload = b"reviewed installer fixture"
     executable = ROOT / "installer.exe"; executable.write_bytes(payload)
-    runner = ROOT / "proton"; runner.write_text("fixture", encoding="utf-8")
+    runner = ROOT / "steamapps/common/Proton - Experimental/proton"
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text("fixture", encoding="utf-8")
+    (runner.parent / "version").write_text(
+        f"1 {SUPPORTED_PROTON_RUNNER}\n", encoding="utf-8")
+    (ROOT / "steamapps/appmanifest_1493710.acf").write_text(
+        '"AppState"\n{\n"appid" "1493710"\n'
+        '"installdir" "Proton - Experimental"\n}\n',
+        encoding="utf-8")
     prefix = ROOT / "process-prefix"; prefix.mkdir(exist_ok=True)
     working = ROOT / "process-working"; working.mkdir(exist_ok=True)
     logs = ROOT / "process-logs"; logs.mkdir(exist_ok=True)
@@ -443,6 +451,27 @@ def test_refresh_explicit_cancel_and_close_cancel_are_distinct():
     assert requested == [True]
 
 
+def test_focus_refresh_requires_a_prior_inactive_state():
+    from PySide6.QtCore import Qt
+    from gui_qt.app import MainWindow
+    refreshes = []
+    fixture = SimpleNamespace(
+        _fftic_seen_inactive=False,
+        _fftic_initial_status_ready=False,
+        _refresh_fftic_status=lambda **kwargs: refreshes.append(kwargs))
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationActive)
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationActive)
+    assert refreshes == []
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationInactive)
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationActive)
+    assert refreshes == []
+    fixture._fftic_initial_status_ready = True
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationInactive)
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationActive)
+    MainWindow._on_fftic_application_state_changed(fixture, Qt.ApplicationActive)
+    assert refreshes == [{"auto_reconcile": True}]
+
+
 TESTS = (
     test_status_snapshot_retries_instead_of_accepting_mixed_evidence,
     test_stable_snapshot_identity_is_bound_to_plan,
@@ -455,6 +484,7 @@ TESTS = (
     test_prerequisite_retryable_requires_verified_owned_rollback,
     test_prerequisite_request_is_injectable_and_flatpak_closed,
     test_refresh_explicit_cancel_and_close_cancel_are_distinct,
+    test_focus_refresh_requires_a_prior_inactive_state,
 )
 
 if __name__ == "__main__":

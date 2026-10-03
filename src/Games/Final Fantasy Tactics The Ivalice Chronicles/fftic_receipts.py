@@ -108,7 +108,7 @@ def validate_receipt(data: object) -> dict:
     schema = data.get("schema_version")
     required = _REQUIRED if schema == 1 else _V2_REQUIRED if schema == SCHEMA_VERSION else set()
     missing = sorted(required - set(data))
-    extra = sorted(set(data) - required)
+    extra = sorted(set(data) - required - ({"runner_history"} if schema == 2 else set()))
     if missing or extra:
         raise ReceiptCorruptError(f"FFTIC receipt fields differ (missing={missing}, extra={extra})")
     if schema not in {1, SCHEMA_VERSION}:
@@ -153,6 +153,21 @@ def validate_receipt(data: object) -> dict:
         _fail("compatibility_tuple reviewed identities")
     if prefix["runner_identity"] != compatibility["proton_runner"]:
         _fail("prefix/compatibility runner identity")
+    if "runner_history" in data:
+        history = data["runner_history"]
+        if not isinstance(history, list) or len(history) > 64:
+            _fail("runner_history")
+        for index, entry in enumerate(history):
+            entry = _exact(entry, {"transaction_id", "from_runner", "to_runner",
+                                   "prior_receipt_sha256"}, f"runner_history[{index}]")
+            _identifier(entry["transaction_id"], "runner_history.transaction_id")
+            _identifier(entry["from_runner"], "runner_history.from_runner")
+            _identifier(entry["to_runner"], "runner_history.to_runner")
+            _hash(entry["prior_receipt_sha256"], "runner_history.prior_receipt_sha256")
+            if entry["from_runner"] == entry["to_runner"]:
+                _fail("runner_history unchanged runner")
+        if history and history[-1]["to_runner"] != prefix["runner_identity"]:
+            _fail("runner_history current runner")
     generation = _exact(data["active_generation_identity"],
                         {"generation_id", "root", "manifest_sha256"},
                         "active_generation_identity")

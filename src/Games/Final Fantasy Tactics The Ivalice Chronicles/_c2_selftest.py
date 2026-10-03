@@ -873,7 +873,7 @@ def test_cross_field_readiness() -> None:
 
     forged = ReadinessVerification(
         InstallStatus.EXACT_VERIFIED, SteamOptionsStatus.CONFIGURED,
-        *(ReadinessAspect.READY for _ in range(9)), issues=())
+        *(ReadinessAspect.READY for _ in range(10)), issues=())
     assert not forged.ready and not forged.attested
     forged_status = compose_lifecycle_status(forged)
     assert not forged_status.ready
@@ -904,7 +904,13 @@ def test_cross_field_readiness() -> None:
     result = verify_launch_readiness(replace(
         evidence, receipt=Receipt(validate_receipt(unsupported)),
         runner_identity="unsupported-runner"))
-    assert not result.ready and result.prefix.value == "invalid"
+    assert not result.ready and result.runner.value == "invalid"
+
+    selected_october = verify_launch_readiness(replace(
+        evidence, runner_identity="experimental-11.0-20261001-x86_64"))
+    assert selected_october.prefix == ReadinessAspect.READY
+    assert selected_october.runner == ReadinessAspect.INVALID
+    assert any("synchronize" in issue for issue in selected_october.issues)
 
     missing = copy.deepcopy(receipt)
     missing["active_generation_identity"]["root"] = str(ROOT / "data" / "missing-generation")

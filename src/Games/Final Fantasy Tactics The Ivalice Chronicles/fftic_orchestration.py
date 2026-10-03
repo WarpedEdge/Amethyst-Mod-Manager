@@ -25,9 +25,9 @@ try:
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
     )
-    from .fftic_proton import ProtonSelection, resolve_proton_selection
+    from .fftic_proton import ProtonSelection, resolve_proton_selection, supported_runner
     from .fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
+        ReadinessAspect, ReadinessEvidence,
         verify_launch_readiness,
     )
     from .fftic_receipts import PREFIX_CONFIGURATION_PATH, read_receipt
@@ -49,9 +49,9 @@ except ImportError:
         PrerequisiteState, inspect_prefix_prerequisites,
         prerequisite_host_capability,
     )
-    from fftic_proton import ProtonSelection, resolve_proton_selection
+    from fftic_proton import ProtonSelection, resolve_proton_selection, supported_runner
     from fftic_readiness import (
-        ReadinessAspect, ReadinessEvidence, SUPPORTED_PROTON_RUNNER,
+        ReadinessAspect, ReadinessEvidence,
         verify_launch_readiness,
     )
     from fftic_receipts import PREFIX_CONFIGURATION_PATH, read_receipt
@@ -135,6 +135,8 @@ class OperationBinding:
     status_generation: int
     status_sha256: str
     observation_sha256: str
+    runner_identity: str = ""
+    runner_script: str = ""
 
 
 @dataclass(frozen=True)
@@ -322,14 +324,25 @@ def _action_availability(
             verification.prefix, verification.prerequisites, verification.bootstrap,
             verification.steam_options, verification.recovery,
         )
+        runner_state = getattr(verification, "runner", ReadinessAspect.READY)
+        runner_transition = (runner_state == ReadinessAspect.INVALID
+                             and any(issue.startswith("Selected Proton runner changed since")
+                                     for issue in verification.issues))
         profile_reconcilable = not any(issue.startswith((
             "PAC ", "Unknown preexisting PAC"))
             for issue in getattr(verification, "issues", ()))
         if (receipt_present and no_unsupported and profile_reconcilable
+                and by_key.get("runner") is not None
+                and by_key["runner"].state in {"Ready", "Different"}
                 and all(value == ReadinessAspect.READY for value in protected)
-                and verification.profile != ReadinessAspect.READY):
+                and (verification.profile != ReadinessAspect.READY or runner_transition)):
             actions.append(OperationKind.SYNCHRONIZE.value)
-        if receipt_present and verification.ready and no_unsupported:
+        if (receipt_present and no_unsupported
+                and by_key.get("runner") is not None
+                and by_key["runner"].state in {"Ready", "Different"}
+                and all(value == ReadinessAspect.READY for value in protected)
+                and (runner_state == ReadinessAspect.READY or runner_transition)
+                and verification.profile == ReadinessAspect.READY):
             actions.append(OperationKind.REMOVE.value)
 
     return tuple(actions), tuple((kind.value, reasons[kind.value]) for kind in OperationKind)
@@ -527,16 +540,19 @@ class DefaultStatusInspector:
         except Exception:
             proton = ProtonSelection(None, "", "")
         runner = proton.tool_identity
+        runner_supported = (supported_runner(runner, proton.proton_script)
+                            and proton.prefix_runtime == "11.0-100")
         runner_row = _row(
             "runner", "Proton runner",
-            "Ready" if runner == SUPPORTED_PROTON_RUNNER else "Unsupported",
-            StatusSeverity.READY if runner == SUPPORTED_PROTON_RUNNER else StatusSeverity.ERROR,
-            ("The selected Proton runner matches the tested tuple." if
-             runner == SUPPORTED_PROTON_RUNNER
-             else "The selected runner is not the tested FFTIC runner."),
+            "Ready" if runner_supported else "Unsupported",
+            StatusSeverity.READY if runner_supported else StatusSeverity.ERROR,
+            ("The selected Steam Proton Experimental 11.0 tool is within policy." if
+             runner_supported else
+             "The selected tool or prefix runtime is unresolved or outside the supported policy."),
             f"Selected runner: {runner or '<unresolved>'}",
+            f"Selected script: {proton.proton_script or '<unresolved>'}",
             f"Prefix runtime: {proton.prefix_runtime or '<unresolved>'}",
-            f"Supported runner: {SUPPORTED_PROTON_RUNNER}")
+            "Supported: Steam Proton Experimental 11.0 builds dated 20260924 or later; prefix runtime 11.0-100")
 
         self._cancelled(cancel)
         prerequisites = (inspect_prefix_prerequisites(prefix) if prefix is not None
@@ -774,6 +790,7 @@ class DefaultStatusInspector:
                 location_row = rejected(
                     location_row,
                     "The Steam library or prefix differs from the managed receipt.")
+            if verification.runner != ReadinessAspect.READY:
                 runner_row = rejected(
                     runner_row, "The runner identity differs from the managed receipt.")
             if verification.generation != ReadinessAspect.READY:
@@ -857,7 +874,8 @@ class DefaultStatusInspector:
             receipt_error, generation_error, journal_error, journal_retry,
             *((receipt.data.get("recovery_instructions", ()) if receipt else ())))
 
-        ready = bool(verification and verification.ready and not unsupported)
+        ready = bool(verification and verification.ready and not unsupported
+                     and runner_row.state == "Ready")
         launch_pending = normalization_pending or pac_confirmation_pending
         launch_row = _row(
             "launch", "Launch readiness", "Ready" if ready else
@@ -897,7 +915,7 @@ class DefaultStatusInspector:
             f"Enhanced executable SHA-256: {hashes.get('enhanced', '<unavailable>')}",
             (f"Supported tuple: Steam {VERIFIED_STEAM_BUILD}; runtime-proven UI metadata "
              f"{VERIFIED_UI_VERSION}; "
-             f"runner {SUPPORTED_PROTON_RUNNER}"),
+             "runner policy: Steam Proton Experimental 11.0 from 20260924; prefix runtime 11.0-100"),
             f"Current generation: {generation_id or '<none>'}",
             f"Reloaded-II: {versions['runtime']}; Nenkai: {versions['nenkai']}; "
             f"SigScan: {versions['sigscan']}; Shared Hooks: {versions['hooks']}",
@@ -919,8 +937,16 @@ class DefaultStatusInspector:
     @staticmethod
     def _observation_identity(context: InspectionContext) -> str:
         records = FfticOrchestrator._live_file_identity(context)
+        try:
+            selection = resolve_proton_selection(
+                context.game.steam_id, context.game.get_prefix_path())
+            runner = (str(selection.proton_script or ""), selection.tool_identity,
+                      selection.prefix_runtime)
+        except Exception:
+            runner = ("", "", "")
         return hashlib.sha256(json.dumps(
-            records, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            (records, runner), sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 class FfticOrchestrator:
@@ -1087,10 +1113,15 @@ class FfticOrchestrator:
         }
         digest = hashlib.sha256(json.dumps(
             material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        try:
+            selection = resolve_proton_selection(context.game.steam_id, prefix)
+        except Exception:
+            selection = ProtonSelection(None, "", "")
         return OperationBinding(
             material["game_id"], context.profile_name, material["game_root"],
             material["prefix"], material["profile_dir"], material["staging_root"],
-            epoch, digest, status.observation_sha256)
+            epoch, digest, status.observation_sha256, selection.tool_identity,
+            str(selection.proton_script or ""))
 
     @staticmethod
     def _live_file_identity(context: InspectionContext) -> tuple[tuple, ...]:
