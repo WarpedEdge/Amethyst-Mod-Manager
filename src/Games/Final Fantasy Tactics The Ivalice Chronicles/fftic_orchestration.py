@@ -13,7 +13,7 @@ from typing import Callable, Protocol
 
 try:
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
-    from .fftic_loader_releases import CHECKER, LoaderRelease
+    from .fftic_loader_releases import CHECKER, LoaderRelease, reviewed_release_identity
     from .fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
@@ -38,7 +38,7 @@ try:
     )
 except ImportError:
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, validate_file
-    from fftic_loader_releases import CHECKER, LoaderRelease
+    from fftic_loader_releases import CHECKER, LoaderRelease, reviewed_release_identity
     from fftic_detection import (
         InstallStatus, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION,
     )
@@ -378,7 +378,7 @@ def _action_availability(
                 and verification.profile == ReadinessAspect.READY):
             actions.append(OperationKind.REMOVE.value)
 
-        if (release is not None and release.installable and receipt_present
+        if (reviewed_release_identity(release) and receipt_present
                 and no_unsupported and verification.ready and
                 runner_state == ReadinessAspect.READY and
                 all(value == ReadinessAspect.READY for value in protected)):
@@ -512,7 +512,9 @@ class DefaultStatusInspector:
                     return InspectionResult(
                         result.rows, result.details, result.unsupported_packages,
                         result.steam_copy_text, result.steam_preserved_options,
-                        result.ready, result.verifier_attested, after)
+                        result.ready, result.verifier_attested, after,
+                        result.available_actions,
+                        result.action_unavailable_reasons, result.release)
                 if attempt == 0:
                     self._progress(
                         progress, 0, 5,
@@ -1108,7 +1110,22 @@ class FfticOrchestrator:
             mutation_available = self.mutation_available
             available_actions = result.available_actions
             if not available_actions and not result.action_unavailable_reasons:
-                available_actions = tuple(kind.value for kind in OperationKind)
+                available_actions = tuple(kind.value for kind in OperationKind
+                                          if kind != OperationKind.UPDATE)
+            unbound_update = (OperationKind.UPDATE.value in available_actions
+                              and not reviewed_release_identity(result.release))
+            if not reviewed_release_identity(result.release):
+                available_actions = tuple(action for action in available_actions
+                                          if action != OperationKind.UPDATE.value)
+            action_reasons = dict(result.action_unavailable_reasons)
+            if unbound_update:
+                action_reasons[OperationKind.UPDATE.value] = (
+                    "The FFTIC loader update has no exact reviewed release and asset identity. "
+                    "Recheck status before choosing Update.")
+            elif OperationKind.UPDATE.value not in available_actions:
+                action_reasons.setdefault(
+                    OperationKind.UPDATE.value,
+                    "No newer reviewed loader asset is ready to install. Recheck release details.")
             model = FfticStatusViewModel(
                 FFTIC_GAME_ID, "FFTIC Mod Support", result.rows, result.details,
                 result.unsupported_packages, result.steam_copy_text,
@@ -1118,7 +1135,7 @@ class FfticOrchestrator:
                 "Start FFTIC normally from Steam. Amethyst's direct Proton route is not supported.",
                 observation_sha256=observation,
                 available_actions=available_actions,
-                action_unavailable_reasons=result.action_unavailable_reasons,
+                action_unavailable_reasons=tuple(action_reasons.items()),
                 release=result.release)
         except InspectionCancelled:
             raise
@@ -1149,6 +1166,10 @@ class FfticOrchestrator:
             reason = dict(status.action_unavailable_reasons).get(
                 kind.value, "Current FFTIC evidence does not authorize this action.")
             raise RuntimeError(reason)
+        if kind == OperationKind.UPDATE and not reviewed_release_identity(status.release):
+            raise RuntimeError(
+                "The FFTIC loader update plan is stale: exact reviewed release and asset "
+                "identity is missing or changed. Recheck status before choosing Update.")
         targets = {
             OperationKind.SETUP: (
                 OperationStep(
@@ -1289,7 +1310,11 @@ class FfticOrchestrator:
         if plan.binding is None or context is None or status is None:
             return False
         return (plan.binding == self._binding(context, status, epoch)
-                and (plan.kind != OperationKind.UPDATE or plan.release == status.release))
+                and (plan.kind != OperationKind.UPDATE or (
+                    OperationKind.UPDATE.value in status.available_actions
+                    and reviewed_release_identity(plan.release)
+                    and reviewed_release_identity(status.release)
+                    and plan.release == status.release)))
 
     def revalidate_plan(self, plan: OperationPlan) -> bool:
         """Recompute the background observation before an executor may mutate."""

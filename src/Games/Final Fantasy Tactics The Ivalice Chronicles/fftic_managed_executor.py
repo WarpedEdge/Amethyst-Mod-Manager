@@ -18,6 +18,7 @@ from typing import Callable, Protocol
 
 try:
     from .fftic_artifacts import ArtifactPin, validate_file
+    from .fftic_loader_releases import reviewed_release_identity
     from .fftic_orchestration import (
         OperationBinding, OperationKind, OperationPlan, ProgressCallback,
         ProgressUpdate,
@@ -26,6 +27,7 @@ try:
     from .fftic_proton import supported_runner
 except ImportError:
     from fftic_artifacts import ArtifactPin, validate_file
+    from fftic_loader_releases import reviewed_release_identity
     from fftic_orchestration import (
         OperationBinding, OperationKind, OperationPlan, ProgressCallback,
         ProgressUpdate,
@@ -469,6 +471,10 @@ class ManagedLifecycleExecutor:
                 progress: ProgressCallback | None = None) -> OperationResult:
         if not isinstance(plan, OperationPlan) or not isinstance(plan.binding, OperationBinding):
             raise StaleOperationPlan("Only a typed, context-bound FFTIC plan can execute")
+        if plan.kind == OperationKind.UPDATE and not reviewed_release_identity(plan.release):
+            raise StaleOperationPlan(
+                "FFTIC loader update plan is stale: exact reviewed release and asset "
+                "identity is missing or changed. Recheck status and confirm Update again.")
         self._cancelled(cancel)
         with self._coordinator.mutation():
             self._cancelled(cancel)

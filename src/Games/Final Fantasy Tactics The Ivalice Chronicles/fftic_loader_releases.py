@@ -38,6 +38,21 @@ class LoaderRelease:
     reason: str = ""
 
 
+def reviewed_release_identity(release: LoaderRelease | None) -> bool:
+    """Require the complete, exact identity of the reviewed 1.7.5 archive."""
+    pin = REVIEWED_LOADER_UPDATE
+    return (isinstance(release, LoaderRelease)
+            and release.installable is True and release.reason == ""
+            and release.version == pin.version
+            and type(release.release_id) is int and release.release_id == _RELEASE_ID
+            and type(release.asset_id) is int and release.asset_id == _ASSET_ID
+            and release.asset_url == pin.url
+            and type(release.asset_size) is int and release.asset_size == pin.size
+            and release.asset_sha256 == pin.sha256
+            and release.notes_url == (
+                f"https://github.com/Nenkai/fftivc.utility.modloader/releases/tag/{pin.version}"))
+
+
 class ReleaseNoticeLedger:
     """App-local UI notice history; release checks never mutate this file."""
 

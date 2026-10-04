@@ -131,7 +131,8 @@ def test_collision_safe_discovery_imports() -> None:
                 "fftic_prerequisite_runner.py",
                 "fftic_loader_releases.py",
                 "_prerequisite_production_selftest.py",
-                "_loader_update_selftest.py"):
+                "_loader_update_selftest.py",
+                "_loader_update_production_selftest.py"):
             assert not any(path.endswith("/" + excluded) for path in loaded_paths)
         fftic_failures = [
             failure for failure in discovery.get_load_failures()

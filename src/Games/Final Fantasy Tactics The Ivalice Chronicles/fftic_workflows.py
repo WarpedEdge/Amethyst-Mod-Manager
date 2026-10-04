@@ -21,7 +21,7 @@ from typing import Callable
 
 try:
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
-    from .fftic_loader_releases import CHECKER
+    from .fftic_loader_releases import CHECKER, reviewed_release_identity
     from .fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from .fftic_extraction import (
         ExtractedArchive, ExtractionLimits, VerifiedArtifactTree,
@@ -69,7 +69,7 @@ try:
     from .fftic_transactions import TargetObservation, plan_owned_file_install
 except ImportError:
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
-    from fftic_loader_releases import CHECKER
+    from fftic_loader_releases import CHECKER, reviewed_release_identity
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from fftic_extraction import (
         ExtractedArchive, ExtractionLimits, VerifiedArtifactTree,
@@ -314,6 +314,10 @@ class FfticLifecycleComposition:
         return value
 
     def _revalidate(self, plan: OperationPlan) -> None:
+        if plan.kind == OperationKind.UPDATE and not reviewed_release_identity(plan.release):
+            raise WorkflowError(
+                "FFTIC loader update plan is stale: exact reviewed release and asset "
+                "identity is missing or changed. Recheck status.")
         if self._plan_validator(plan) is False:
             raise WorkflowError("FFTIC operation plan is stale")
         binding = plan.binding
@@ -1133,8 +1137,8 @@ class FfticLifecycleComposition:
 
     def _update(self, token: _Baseline, cancel) -> None:
         release = token.plan.release if token.plan is not None else None
-        if release is None or not release.installable:
-            raise WorkflowError("Update plan lacks exact release identity for a reviewed asset")
+        if not reviewed_release_identity(release):
+            raise WorkflowError("FFTIC loader update plan is stale; recheck status")
         current, error = CHECKER.check(
             next(item["version"] for item in token.receipt_record.data["artifacts"]
                  if item["artifact_id"] == "nenkai-loader"), force=True)
@@ -1797,6 +1801,18 @@ class FfticLifecycleComposition:
 
     def revalidate(self, plan: OperationPlan) -> None:
         self._staged.revalidate(plan)
+        if plan.kind == OperationKind.UPDATE:
+            receipt = read_receipt(self.inputs.receipts_root)
+            if receipt is None:
+                raise WorkflowError("FFTIC loader update plan is stale: managed receipt is missing")
+            installed = next((item["version"] for item in receipt.data["artifacts"]
+                              if item["artifact_id"] == "nenkai-loader"), None)
+            if installed is None:
+                raise WorkflowError("FFTIC loader update plan is stale: loader receipt is invalid")
+            current, error = CHECKER.check(installed, force=True)
+            if error or current != plan.release:
+                raise WorkflowError(
+                    "FFTIC loader release changed or cannot be checked; recheck status")
 
     def _run(self, method: str, plan, cancel, progress) -> OperationResult:
         return getattr(self._staged, method)(plan, cancel, progress)

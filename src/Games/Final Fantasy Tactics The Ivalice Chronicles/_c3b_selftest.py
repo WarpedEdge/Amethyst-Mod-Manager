@@ -258,9 +258,9 @@ def test_rollback_raise_and_unverified_rollback_require_recovery():
             lambda _token: "verify fixture", lambda _token, _cancel: None,
             lambda _token: None, lambda _token: None, lambda _token: None,
             mutates=False, final_verifier=True)
-        workflows, _states = _workflows(); workflows[OperationKind.UPDATE] = (action, verifier)
+        workflows, _states = _workflows(); workflows[OperationKind.REPAIR] = (action, verifier)
         journal = _Journal(); controller, _states = _controller(workflows, journal)
-        try: controller.execute(controller.plan(OperationKind.UPDATE))
+        try: controller.execute(controller.plan(OperationKind.REPAIR))
         except RecoveryRequiredError as exc:
             assert journal.events[-1]["attempt_id"] in str(exc)
             assert journal.events[-1]["plan_fingerprint"] in str(exc)

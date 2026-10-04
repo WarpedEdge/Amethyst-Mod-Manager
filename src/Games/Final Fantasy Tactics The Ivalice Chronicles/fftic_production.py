@@ -8,6 +8,7 @@ from pathlib import Path
 try:
     from .fftic_artifact_service import acquire_artifact
     from .fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE
+    from .fftic_loader_releases import reviewed_release_identity
     from .fftic_managed_executor import ManagedLifecycleExecutor
     from .fftic_managed_executor import ProcessRequest
     from .fftic_orchestration import (
@@ -27,6 +28,7 @@ try:
 except ImportError:
     from fftic_artifact_service import acquire_artifact
     from fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE
+    from fftic_loader_releases import reviewed_release_identity
     from fftic_managed_executor import ManagedLifecycleExecutor
     from fftic_managed_executor import ProcessRequest
     from fftic_orchestration import (
@@ -183,9 +185,7 @@ def create_production_executor(
 
         def acquire_loader_update(release, cancel):
             pin = REVIEWED_LOADER_UPDATE
-            if (not release.installable or release.version != pin.version
-                    or release.asset_url != pin.url or release.asset_size != pin.size
-                    or release.asset_sha256 != pin.sha256):
+            if not reviewed_release_identity(release):
                 raise ValueError("Loader release differs from its reviewed candidate")
             archives = []
             for artifact_id in ("reloaded-ii", "sigscan", "shared-hooks", "nenkai-loader"):

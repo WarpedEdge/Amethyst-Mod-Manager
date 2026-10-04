@@ -17,7 +17,7 @@ from fftic_detection import (
 from fftic_managed_executor import (
     ManagedLifecycleExecutor, ManagedOperationCancelled, OperationState,
     ProcessRequest, ProcessResult, RecoveryRequiredError, RecoveryState,
-    PrerequisiteRetryableError, StagedLifecycleOperations,
+    PrerequisiteRetryableError, StagedLifecycleOperations, StaleOperationPlan,
 )
 from fftic_orchestration import (
     FFTIC_GAME_ID, OperationBinding, OperationKind, OperationPlan, OperationStep,
@@ -287,13 +287,15 @@ def test_complete_setup_repair_synchronize_update_and_remove() -> None:
 
     (fixture.staging / "Low/FFTIVC/data/combined/same.nxd").write_bytes(b"updated")
     receipt_before_update = (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes()
+    journal_before_update = fixture.inputs.journal_file.read_bytes()
     try:
         fixture.run(OperationKind.UPDATE)
-    except WorkflowError as exc:
-        assert "lacks exact release identity" in str(exc)
+    except StaleOperationPlan as exc:
+        assert "stale" in str(exc).lower()
     else:
         raise AssertionError("Profile synchronization was mislabeled as runtime update")
     assert (fixture.inputs.receipts_root / "fftic-receipt.json").read_bytes() == receipt_before_update
+    assert fixture.inputs.journal_file.read_bytes() == journal_before_update
     assert (fixture.inputs.generations_root / synchronized_id).is_dir()
     assert fixture.run(OperationKind.SYNCHRONIZE).state == OperationState.SUCCEEDED
 
@@ -337,8 +339,8 @@ def test_collisions_drift_duplicates_and_missing_inputs_fail_closed() -> None:
     missing = Fixture("unavailable-update")
     try:
         missing.run(OperationKind.UPDATE)
-    except WorkflowError as exc:
-        assert "lacks exact release identity" in str(exc)
+    except StaleOperationPlan as exc:
+        assert "stale" in str(exc).lower()
     else:
         raise AssertionError("Unavailable update reported success")
 

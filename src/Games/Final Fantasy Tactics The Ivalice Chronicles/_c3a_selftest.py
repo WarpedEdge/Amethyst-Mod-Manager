@@ -250,11 +250,13 @@ def test_plan_execution_cancellation_and_progress() -> None:
     executor = _Executor()
     controller = FfticOrchestrator(_Inspector(), executor)
     controller.refresh(_context())
-    plans = {kind: controller.plan(kind) for kind in OperationKind}
+    plans = {kind: controller.plan(kind) for kind in OperationKind
+             if kind != OperationKind.UPDATE}
     assert any(step.component == "managed runtime"
                for step in plans[OperationKind.SETUP].steps)
     assert plans[OperationKind.REMOVE].steps[0].action.startswith("restore receipt-owned")
-    selected = plans[OperationKind.UPDATE]
+    assert OperationKind.UPDATE.value not in controller.last_status.available_actions
+    selected = plans[OperationKind.REPAIR]
     assert controller.execute(selected, cancel, progress.append) == "ok"
     assert executor.received == (selected, cancel, progress.append)
     assert progress[-1].phase == "executed"

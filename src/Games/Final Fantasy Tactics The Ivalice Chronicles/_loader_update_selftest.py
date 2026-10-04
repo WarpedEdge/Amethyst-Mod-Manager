@@ -15,14 +15,16 @@ from unittest.mock import patch
 from _c3c_selftest import Fixture, _write_matching_log
 from fftic_artifacts import ARTIFACTS, REVIEWED_LOADER_UPDATE
 from fftic_extraction import ExtractionError, validate_loader_update_tree
-from fftic_loader_releases import CHECKER, LoaderReleaseChecker, ReleaseNoticeLedger, parse_release
-from fftic_managed_executor import RecoveryRequiredError
+from fftic_loader_releases import (CHECKER, LoaderReleaseChecker, ReleaseNoticeLedger,
+                                   parse_release, reviewed_release_identity)
+from fftic_managed_executor import RecoveryRequiredError, StaleOperationPlan
 from fftic_pac import (PacOwnershipState, baseline_set_from_receipt,
                        exact_absent_reversion_output)
 from fftic_orchestration import (FFTIC_GAME_ID, FfticOrchestrator,
-                                  OperationBinding, OperationKind, OperationPlan,
+                                  InspectionContext, InspectionResult, OperationBinding,
+                                  OperationKind, OperationPlan,
                                   StatusRow, StatusSeverity, _action_availability)
-from fftic_proton import managed_runner_label
+from fftic_proton import ProtonSelection, managed_runner_label
 from fftic_readiness import ReadinessAspect, absent_pac_reversion_ready
 from fftic_receipts import read_receipt, validate_receipt
 from fftic_workflows import ReviewedCandidateSet, WorkflowError
@@ -40,7 +42,16 @@ def metadata():
 
 def test_metadata():
     source = metadata()
-    assert parse_release(source, "1.7.3").installable
+    reviewed = parse_release(source, "1.7.3")
+    assert reviewed_release_identity(reviewed)
+    for change in (dict(release_id=reviewed.release_id + 1),
+                   dict(asset_id=reviewed.asset_id + 1),
+                   dict(asset_url="https://example.invalid/loader.7z"),
+                   dict(asset_size=reviewed.asset_size + 1),
+                   dict(asset_sha256="0" * 64),
+                   dict(notes_url="https://example.invalid/notes"),
+                   dict(installable=False)):
+        assert not reviewed_release_identity(replace(reviewed, **change))
     assert parse_release(source, "1.7.5") is None
     for change in ({"tag_name": "1.7.5-rc1"}, {"prerelease": True},
                    {"draft": True}, {"tag_name": "bad"}):
@@ -170,7 +181,8 @@ def test_release_bound_plan_staleness():
         staging_root=Path("/tmp/fftic-plan-staging"))
     status = SimpleNamespace(rows=(), unsupported_packages=(), ready=True,
                              verifier_attested=True, observation_sha256="fixture",
-                             release=release)
+                             release=release,
+                             available_actions=(OperationKind.UPDATE.value,))
     controller = FfticOrchestrator()
     controller._last_context = context
     controller._last_status = status
@@ -180,6 +192,102 @@ def test_release_bound_plan_staleness():
     assert controller.plan_is_current(plan)
     controller._last_status = SimpleNamespace(**dict(status.__dict__, release=None))
     assert not controller.plan_is_current(plan)
+
+
+def test_controller_created_update_plan(asset: Path):
+    """Exercise the same controller plan passed by the Update UI into the executor."""
+    fixture = Fixture("controller-created-update")
+    fixture.run(OperationKind.SETUP)
+    shutil.copyfile(asset, fixture.cache / REVIEWED_LOADER_UPDATE.filename)
+    release = parse_release(metadata(), "1.7.3")
+    def acquire(_release, _cancel):
+        assert _release == release
+        return ReviewedCandidateSet(tuple(
+            (key, fixture.cache / (REVIEWED_LOADER_UPDATE if key == "nenkai-loader"
+                                   else ARTIFACTS[key]).filename)
+            for key in ("reloaded-ii", "nenkai-loader", "sigscan", "shared-hooks")))
+    fixture.recompose(update_acquirer=acquire, setup_candidates=None)
+    game = SimpleNamespace(game_id=FFTIC_GAME_ID, steam_id="1004640",
+                           get_game_path=lambda: fixture.game,
+                           get_prefix_path=lambda: fixture.prefix)
+    context = InspectionContext(game, "default", fixture.profile, fixture.staging)
+    class Inspector:
+        def __init__(self, selected):
+            self.selected = selected
+        def inspect(self, *_args):
+            return InspectionResult((), (), (), "", (), True, True,
+                                    available_actions=(OperationKind.UPDATE.value,),
+                                    release=self.selected)
+    inspector = Inspector(release)
+    controller = FfticOrchestrator(inspector, fixture.executor)
+    selection = ProtonSelection(None, fixture.inputs.runner_reader(), "")
+    with patch("fftic_orchestration.resolve_proton_selection", return_value=selection):
+        status = controller.refresh(context)
+        assert OperationKind.UPDATE.value in status.available_actions
+        plan = controller.plan(OperationKind.UPDATE)
+        assert plan.release == release
+        assert (plan.release.release_id, plan.release.asset_id,
+                plan.release.asset_url, plan.release.asset_size,
+                plan.release.asset_sha256) == (
+                    release.release_id, release.asset_id, release.asset_url,
+                    release.asset_size, release.asset_sha256)
+        receipt_path = fixture.inputs.receipts_root / "fftic-receipt.json"
+        receipt_before = receipt_path.read_bytes()
+        journal_path = fixture.inputs.journal_file
+        journal_before = journal_path.read_bytes()
+        for invalid in (None, replace(release, asset_id=release.asset_id + 1),
+                        replace(release, asset_sha256="0" * 64)):
+            assert not controller.plan_is_current(replace(plan, release=invalid))
+            try:
+                fixture.executor.execute(replace(plan, release=invalid))
+            except StaleOperationPlan as exc:
+                assert "stale" in str(exc).lower()
+            else:
+                raise AssertionError("Update plan with missing or changed identity executed")
+            assert receipt_path.read_bytes() == receipt_before
+            assert journal_path.read_bytes() == journal_before
+        try:
+            controller.execute(replace(plan, release=None))
+        except RuntimeError as exc:
+            assert "stale" in str(exc).lower()
+        else:
+            raise AssertionError("Controller executed an unbound Update plan")
+        assert journal_path.read_bytes() == journal_before
+        with patch.object(CHECKER, "check", return_value=(None, "offline")):
+            try:
+                controller.execute(plan)
+            except WorkflowError as exc:
+                assert "recheck" in str(exc).lower()
+            else:
+                raise AssertionError("Changed release metadata reached the journal")
+        assert receipt_path.read_bytes() == receipt_before
+        assert journal_path.read_bytes() == journal_before
+        with patch.object(CHECKER, "check", return_value=(
+                replace(release, asset_id=release.asset_id + 1), "")):
+            try:
+                controller.execute(plan)
+            except WorkflowError as exc:
+                assert "recheck" in str(exc).lower()
+            else:
+                raise AssertionError("Changed upstream asset identity reached the journal")
+        assert journal_path.read_bytes() == journal_before
+        inspector.selected = None
+        status = controller.refresh(context)
+        assert OperationKind.UPDATE.value not in status.available_actions
+        try:
+            controller.plan(OperationKind.UPDATE)
+        except RuntimeError as exc:
+            assert "recheck" in str(exc).lower()
+        else:
+            raise AssertionError("Update remained enabled without release identity")
+        inspector.selected = release
+        controller.refresh(context)
+        with patch.object(CHECKER, "check", return_value=(release, "")):
+            controller.execute(controller.plan(OperationKind.UPDATE))
+        installed = read_receipt(fixture.inputs.receipts_root)
+        assert next(item["version"] for item in installed.data["artifacts"]
+                    if item["artifact_id"] == "nenkai-loader") == "1.7.5"
+    shutil.rmtree(fixture.root)
 
 
 def test_transition(asset: Path):
@@ -444,6 +552,7 @@ if __name__ == "__main__":
     test_proton_labels_and_setup_actions()
     test_release_bound_plan_staleness()
     if os.environ.get("FFTIC_REVIEWED_LOADER_ASSET"):
+        test_controller_created_update_plan(Path(os.environ["FFTIC_REVIEWED_LOADER_ASSET"]))
         test_transition(Path(os.environ["FFTIC_REVIEWED_LOADER_ASSET"]))
         test_failed_launch_absent_pac_reversion(Path(os.environ["FFTIC_REVIEWED_LOADER_ASSET"]))
     print("FFTIC loader release checks passed")

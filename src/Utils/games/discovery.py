@@ -74,6 +74,7 @@ _NON_HANDLER_FILES = {
     "Final Fantasy Tactics The Ivalice Chronicles/_c3d_selftest.py",
     "Final Fantasy Tactics The Ivalice Chronicles/_prerequisite_production_selftest.py",
     "Final Fantasy Tactics The Ivalice Chronicles/_loader_update_selftest.py",
+    "Final Fantasy Tactics The Ivalice Chronicles/_loader_update_production_selftest.py",
     "FromSoftware/me3_profile.py",
     "FromSoftware/me3_runtime.py",
     "Hades/hades_mod_importer.py",
