@@ -63,6 +63,10 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         return STEAM_APP_ID
 
     @property
+    def nexus_game_domain(self) -> str:
+        return "finalfantasytacticstheivalicechronicles"
+
+    @property
     def auto_install_deps(self) -> list[str]:
         # FFTIC prerequisites are never installed implicitly by Add Game.
         return []

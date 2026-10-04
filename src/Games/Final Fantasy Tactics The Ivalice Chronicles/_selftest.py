@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -571,11 +572,173 @@ def test_direct_launch_policy_and_no_live_side_effects() -> None:
     assert not any((_ROOT / "profiles").rglob("modded*.pac"))
 
 
+def test_nexus_browser_install_contract() -> None:
+    """Exercise the shared UI handoff without a network request or live install."""
+    from gui_qt.app import MainWindow
+    from gui_qt.nexus_browser_view import NexusBrowserView
+    from Utils.mods.install import (
+        _validate_prepared_package, finish_install, prepare_archive)
+    from Nexus.nexus_meta import NexusModMeta
+
+    fftic = FinalFantasyTacticsTheIvaliceChronicles()
+    fftic.is_configured = lambda: True
+    domain = "finalfantasytacticstheivalicechronicles"
+    assert fftic.nexus_game_domain == domain
+    assert fftic.nexus_game_domains == (domain,)
+    assert fftic.accepts_nexus_domain(domain)
+
+    class Button:
+        _hide_key = "nexus"
+
+        def setVisible(self, visible):
+            self.visible = visible
+
+    button = Button()
+    game_state = SimpleNamespace(game=fftic)
+    header = SimpleNamespace(
+        _gs=game_state, _nexus_btn=button, _action_buttons=(),
+        _game_has_prefix=lambda game: False,
+        _wabbajack_available=lambda: False,
+        _hidden_header_buttons=lambda: set(),
+    )
+    MainWindow._sync_thunderstore_button(header)
+    assert button.visible
+
+    opened = []
+    class Tabs:
+        def has_key(self, key):
+            return False
+
+        def open_tab(self, view, title, key):
+            opened.append((view, title, key))
+
+    class Signal:
+        def connect(self, callback):
+            self.callback = callback
+
+    class Browser:
+        def __init__(self, api, selected_domain, game, **kwargs):
+            self.api = api
+            self.domain = selected_domain
+            self.game = game
+            self._game = game
+            self.install_fn = kwargs["install_fn"]
+            self._install_fn = self.install_fn
+            self.destroyed = Signal()
+
+        def set_game(self, game, selected_domain):
+            self.game = game
+            self._game = game
+            self.domain = selected_domain
+
+    archive_installs = []
+    app = SimpleNamespace(
+        _tabs=Tabs(), _gs=game_state, _nexus_view=None,
+        _collections_view=None, _thunderstore_view=None,
+        _download_only_active=lambda: False,
+        _install_paths=lambda paths, metas=None: archive_installs.append(
+            (paths, metas)),
+        _ensure_nexus_api=lambda: "existing OAuth API",
+        _append_log=lambda message: None,
+        _nexus_download_progress=lambda *args: None,
+        _notify=lambda *args: None, tr=lambda message: message,
+    )
+    app._deliver_download = lambda paths, metas=None: MainWindow._deliver_download(
+        app, paths, metas)
+    with patch("gui_qt.nexus_browser_view.NexusBrowserView", Browser):
+        MainWindow._open_nexus_browser_tab(app)
+    browser = app._nexus_view
+    assert browser.domain == domain and browser.api == "existing OAuth API"
+    assert opened[0][2] == "nexus_browser"
+
+    other = SimpleNamespace(
+        name="Other game", nexus_game_domain="othergame",
+        is_configured=lambda: True,
+        accepts_nexus_domain=lambda candidate: candidate == "othergame")
+    game_state.game_name = fftic.name
+    with patch.dict("Utils.games.registry._GAMES",
+                    {fftic.name: fftic, other.name: other}, clear=True):
+        assert MainWindow._match_game_for_domain(app, domain) == (fftic.name, fftic)
+        assert MainWindow._match_game_for_domain(app, "othergame") == (other.name, other)
+        game_state.game = other
+        game_state.game_name = other.name
+        assert MainWindow._match_game_for_domain(app, domain) == (fftic.name, fftic)
+        assert MainWindow._match_game_for_domain(app, "othergame") == (other.name, other)
+    game_state.game = fftic
+    game_state.game_name = fftic.name
+
+    # The browser's completed-download callback supplies the cached archive
+    # and Nexus metadata to the same install function used by other games.
+    cached = str(_ROOT / "cache" / "fftic-package.zip")
+    metadata = object()
+    browser._progress_fn = lambda *args: None
+    browser._download_cancels = {"download": None}
+    browser._download_games = {"download": fftic.name}
+    browser._download_oversize = {"download": None}
+    browser._install_all_active = set()
+    browser._log = lambda message: None
+    browser._download_only = lambda: False
+    NexusBrowserView._on_download_done(browser, cached, metadata, "download")
+    assert archive_installs == [([cached], {cached: metadata})]
+
+    packages = _ROOT / "nexus-packages"
+    supported = _package(packages / "supported", _manifest())
+    unsupported = _package(packages / "unsupported",
+                           _manifest(apps=["other.exe"]))
+    unsafe = _package(packages / "unsafe", _manifest())
+    (unsafe / "FFTIVC" / "link").symlink_to(_ROOT / "outside")
+    for package, accepted, diagnostic in (
+            (supported, True, ""),
+            (unsupported, False, "unsupported"),
+            (unsafe, False, "Unsafe package path")):
+        log = []
+        prepared = SimpleNamespace(game=fftic, src_root=package)
+        assert _validate_prepared_package(prepared, log.append) is accepted
+        if diagnostic:
+            assert any(diagnostic in line for line in log), log
+
+    # A synthetic cached archive follows the ordinary extraction and staging
+    # path with prebuilt Nexus metadata; no API lookup or live game path is used.
+    install_root = _ROOT / "nexus-install"
+    install_root.mkdir()
+    fftic.get_mod_staging_path = lambda: install_root / "mods"
+    archive = install_root / "supported.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("ModConfig.json", json.dumps(_manifest()))
+        handle.writestr("FFTIVC/data/enhanced/test.nxd", b"fixture")
+    log = []
+    prepared = prepare_archive(
+        str(archive), fftic, install_root / "profile", log_fn=log.append,
+        preferred_name="supported", prebuilt_meta=NexusModMeta(
+            game_domain=domain, mod_id=1, file_id=2))
+    assert prepared is not None
+    assert finish_install(prepared, None, log_fn=log.append,
+                          interactive=False) == "supported", log
+    assert (install_root / "mods/supported/FFTIVC/data/enhanced/test.nxd").is_file()
+
+    # An in-flight FFTIC download stays in its original cache after a switch.
+    game_state.game = other
+    browser._download_games = {"switched": fftic.name}
+    browser._download_cancels = {"switched": None}
+    browser._download_oversize = {"switched": None}
+    browser.game = browser._game = other
+    NexusBrowserView._on_download_done(browser, cached, metadata, "switched")
+    assert len(archive_installs) == 1
+    MainWindow._retarget_browsers_for_game(app)
+    assert browser.domain == "othergame" and browser.game is other
+    MainWindow._sync_thunderstore_button(header)
+    assert button.visible
+    game_state.game = SimpleNamespace(name="No Nexus", nexus_game_domain="")
+    MainWindow._sync_thunderstore_button(header)
+    assert not button.visible
+
+
 def main() -> None:
     tests = [
         test_collision_safe_discovery_imports,
         test_identity_detection_and_cache_contract,
         test_package_recognition,
+        test_nexus_browser_install_contract,
         test_special_file_manifest,
         test_managed_code_packages,
         test_artifact_manifest,
