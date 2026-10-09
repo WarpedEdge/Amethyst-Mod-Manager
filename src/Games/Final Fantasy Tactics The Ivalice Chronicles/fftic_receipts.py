@@ -108,7 +108,7 @@ def validate_receipt(data: object) -> dict:
     schema = data.get("schema_version")
     required = _REQUIRED if schema == 1 else _V2_REQUIRED if schema == SCHEMA_VERSION else set()
     missing = sorted(required - set(data))
-    extra = sorted(set(data) - required - ({"runner_history", "color_state"} if schema == 2 else set()))
+    extra = sorted(set(data) - required - ({"runner_history", "color_state", "mod_states"} if schema == 2 else set()))
     if missing or extra:
         raise ReceiptCorruptError(f"FFTIC receipt fields differ (missing={missing}, extra={extra})")
     if schema not in {1, SCHEMA_VERSION}:
@@ -464,6 +464,29 @@ def validate_receipt(data: object) -> dict:
             _fail('color_state.head.generation')
         if not any(item['mod_id'] == 'paxtrick.fft.colorcustomizer' for item in data['user_packages']):
             _fail('color_state package binding')
+    if 'mod_states' in data:
+        states = data['mod_states']
+        if not isinstance(states, list) or not states:
+            _fail('mod_states')
+        keys = []
+        for state in states:
+            _exact(state, {'mod_id', 'profile', 'package_sha256', 'head'}, 'mod_states entry')
+            _identifier(state['mod_id'], 'mod_states.mod_id')
+            _absolute_path(state['profile'], 'mod_states.profile')
+            _hash(state['package_sha256'], 'mod_states.package_sha256')
+            head = _exact(state['head'], {'revision', 'transaction', 'generation'}, 'mod_states.head')
+            _hash(head['revision'], 'mod_states.head.revision')
+            _identifier(head['transaction'], 'mod_states.head.transaction')
+            if head['generation'] != generation['generation_id']:
+                _fail('mod_states.head.generation')
+            if not any(p['mod_id'] == state['mod_id'] and
+                       p['content_identity'] == state['package_sha256'] for p in data['user_packages']):
+                _fail('mod_states package binding')
+            keys.append(state['mod_id'])
+        if keys != sorted(set(keys)) or len({k.casefold() for k in keys}) != len(keys):
+            _fail('mod_states duplicate/order')
+        if 'color_state' in data and 'paxtrick.fft.colorcustomizer' in keys:
+            _fail('mod_states legacy overlap')
     return data
 
 

@@ -6,6 +6,7 @@ py.install_sources(
   'fftic_extraction.py',
   'fftic_generation.py',
   'fftic_color_state.py',
+  'fftic_mod_state.py',
   'fftic_lifecycle.py',
   'fftic_loader_releases.py',
   'fftic_managed_executor.py',

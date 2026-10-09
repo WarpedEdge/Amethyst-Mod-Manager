@@ -77,7 +77,9 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
 
     @property
     def mod_required_top_level_folders(self) -> set[str]:
-        return {"fftivc"}
+        # The shared installer also accepts file names as root markers. A
+        # managed-only package may contain no FFTIVC directory.
+        return {"fftivc", "modconfig.json"}
 
     @property
     def mod_auto_strip_until_required(self) -> bool:
@@ -146,7 +148,7 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
 
     def retain_mod_archive(self, source_root: Path, archive: Path, staging_root: Path) -> None:
         result = inspect_package(source_root)
-        if result.manifest and result.manifest.mod_id == 'paxtrick.fft.colorcustomizer':
+        if result.manifest and result.manifest.mod_id == 'paxtrick.fft.colorcustomizer' and result.manifest.version == '3.3.0':
             try:
                 from .fftic_color_state import reviewed_source_archive
             except ImportError:

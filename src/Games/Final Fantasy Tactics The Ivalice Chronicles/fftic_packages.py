@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import stat
+import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -159,6 +160,8 @@ def _identifier_list(data: dict, key: str, errors: list[str]) -> tuple[str, ...]
             errors.append(f"{key} contains unsafe identifier {value!r}.")
         else:
             result.append(value)
+    if len({value.casefold() for value in result}) != len(result):
+        errors.append(f'{key} contains duplicate or case-colliding identifiers.')
     return tuple(result)
 
 
@@ -168,7 +171,68 @@ def _safe_relative_path(path: str) -> bool:
         return False
     pure = PurePosixPath(path)
     return (not pure.is_absolute() and path == pure.as_posix()
-            and all(part not in ("", ".", "..") for part in pure.parts))
+            and all(part not in ("", ".", "..") and not part.endswith((' ', '.'))
+                    and not any(c in part for c in '<>"|?*')
+                    and part.split('.')[0].upper() not in {
+                        'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)),
+                        *(f'LPT{i}' for i in range(1, 10))}
+                    for part in pure.parts))
+
+
+def is_managed_dll(path: Path) -> bool:
+    """Static PE/CLR shape check, never a load or a claim that code is trustworthy.
+
+    Require an x86/x64 DLL image, IL-only CLR header and mapped metadata signature. This separates
+    managed user assemblies from undeclared native DLLs in the supported boundary.
+    """
+    try:
+        with path.open('rb') as stream:
+            size = path.stat().st_size
+            def read(offset, count):
+                if offset < 0 or offset + count > size:
+                    raise ValueError('PE range')
+                stream.seek(offset)
+                value = stream.read(count)
+                if len(value) != count:
+                    raise ValueError('short PE')
+                return value
+            if read(0, 2) != b'MZ':
+                return False
+            pe = struct.unpack('<I', read(0x3c, 4))[0]
+            header = read(pe, 24)
+            if header[:4] != b'PE\0\0':
+                return False
+            sections = struct.unpack_from('<H', header, 6)[0]
+            optional_size, flags = struct.unpack_from('<HH', header, 20)
+            machine = struct.unpack_from('<H', header, 4)[0]
+            if machine not in {0x14c, 0x8664} or not flags & 0x2000 or not 1 <= sections <= 96:
+                return False
+            optional = read(pe + 24, optional_size)
+            magic = struct.unpack_from('<H', optional)[0]
+            directory = 112 if magic == 0x20b else 96 if magic == 0x10b else -1
+            if directory < 0 or optional_size < directory + 15 * 8:
+                return False
+            if struct.unpack_from('<I', optional, directory - 4)[0] < 15:
+                return False
+            rva, length = struct.unpack_from('<II', optional, directory + 14 * 8)
+            section_table = read(pe + 24 + optional_size, sections * 40)
+            def mapped(address, count):
+                for i in range(sections):
+                    virtual_size, virtual, raw_size, raw = struct.unpack_from('<IIII', section_table, i * 40 + 8)
+                    delta = address - virtual
+                    if 0 <= delta and delta + count <= min(virtual_size, raw_size):
+                        return raw + delta
+                raise ValueError('unmapped CLR')
+            if length < 72:
+                return False
+            clr = read(mapped(rva, 72), 72)
+            metadata_rva, metadata_size = struct.unpack_from('<II', clr, 8)
+            clr_flags = struct.unpack_from('<I', clr, 16)[0]
+            return (clr_flags & 1 and not clr_flags & 0x10
+                    and struct.unpack_from('<I', clr)[0] >= 72 and metadata_size >= 4
+                    and read(mapped(metadata_rva, metadata_size), 4) == b'BSJB')
+    except (OSError, ValueError, struct.error):
+        return False
 
 
 def _file_sha256(path: Path) -> str:
@@ -225,7 +289,8 @@ def validate_color_customizer_archive(root: Path, archive: Path | None) -> list[
     ZIP identity alone cannot grant lifecycle readiness.
     """
     result = inspect_package(root)
-    if (result.manifest is None or result.manifest.mod_id.casefold() != _COLOR_ID):
+    if (result.manifest is None or result.manifest.mod_id.casefold() != _COLOR_ID
+            or result.manifest.version != "3.3.0"):
         return []
     if archive is None or not is_reviewed_color_customizer_archive(archive):
         return ["Color Customizer archive is not the exact reviewed v3.3.0 ZIP "
@@ -246,13 +311,22 @@ def inspect_package(root: Path) -> PackageResult:
     except OSError as exc:
         return PackageResult(PackageClassification.MALFORMED, None,
                              (f"{source}: cannot inspect ModConfig.json: {exc}",), ())
-    if not stat.S_ISREG(manifest_mode):
+    if not stat.S_ISREG(manifest_mode) or manifest_path.lstat().st_nlink != 1:
         return PackageResult(PackageClassification.MALFORMED, None,
                              (f"{source}: ModConfig.json must be a regular non-symlink file.",), ())
     try:
+        if manifest_path.stat().st_size > 1024 * 1024:
+            raise ValueError("ModConfig.json exceeds 1 MiB")
         raw = manifest_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        def unique_pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError(f'Duplicate manifest key: {key}')
+                result[key] = value
+            return result
+        data = json.loads(raw, object_pairs_hook=unique_pairs)
+    except (OSError, UnicodeError, ValueError) as exc:
         return PackageResult(PackageClassification.MALFORMED, None,
                              (f"{source}: cannot parse ModConfig.json: {exc}",), ())
     if not isinstance(data, dict):
@@ -261,7 +335,7 @@ def inspect_package(root: Path) -> PackageResult:
 
     errors: list[str] = []
     mod_id = _string_field(data, "ModId", errors)
-    if mod_id and not _safe_identifier(mod_id):
+    if mod_id and (not _safe_identifier(mod_id) or not _safe_relative_path(mod_id)):
         errors.append(f"ModId is unsafe: {mod_id!r}.")
     name = _string_field(data, "ModName", errors)
     author = _string_field(data, "ModAuthor", errors)
@@ -281,6 +355,8 @@ def inspect_package(root: Path) -> PackageResult:
             declarations.append((key, value))
             if not _safe_relative_path(value):
                 errors.append(f"{key} contains unsafe path {value!r}.")
+            elif key.startswith("ModR2RManagedDll") and PurePosixPath(value).suffix.casefold() != ".dll":
+                errors.append(f"{key} must name a managed DLL path.")
 
     package_files: list[str] = []
     package_directories: list[str] = []
@@ -295,7 +371,8 @@ def inspect_package(root: Path) -> PackageResult:
                 unsafe.append(f"{previous} / {rel} (case collision)")
             mode = item.lstat().st_mode
             if (not _safe_relative_path(rel) or not
-                    (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
+                    (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
+                    or stat.S_ISREG(mode) and item.lstat().st_nlink != 1):
                 unsafe.append(rel)
                 continue
             if stat.S_ISDIR(mode):
@@ -346,6 +423,23 @@ def inspect_package(root: Path) -> PackageResult:
         return PackageResult(PackageClassification.UNSUPPORTED_CODE, manifest,
                              (f"{name} ({mod_id}) at {source}: unsupported native/external executable: "
                               + ", ".join(detail),), tuple(sorted(payloads)))
+    if not reviewed_color and not (mod_id.casefold() == _COLOR_ID and version == '3.3.0'):
+        unknown_dlls = [p for p in compiled_files if PurePosixPath(p).suffix.casefold() == '.dll'
+                        and not is_managed_dll(root / p)]
+        scripts = [p for p in package_files if PurePosixPath(p).suffix.casefold() in {
+            '.bat', '.cmd', '.ps1', '.sh', '.py', '.pyc', '.js', '.vbs', '.msi', '.wasm', '.jar'}]
+        disguised = []
+        for path in package_files:
+            if path in compiled_files:
+                continue
+            with (root / path).open('rb') as stream:
+                prefix = stream.read(4)
+            if prefix.startswith((b'MZ', b'\x7fELF', b'#!', b'\x00asm', b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf')):
+                disguised.append(path)
+        if unknown_dlls or scripts or disguised:
+            return PackageResult(PackageClassification.UNSUPPORTED_CODE, manifest,
+                (f'{name} ({mod_id}): unknown native DLL or external code needs a separate policy: '
+                 + ', '.join(unknown_dlls + scripts + disguised),), tuple(sorted(payloads)))
     if declared_dll:
         target = root / declared_dll
         if (declared_dll not in package_files or not target.is_file()

@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 
 try:
+    from .fftic_mod_state import stores_for, state_receipt
     from .fftic_color_state import working_store, working_baseline, reviewed_source_archive, ColorStateError
     from .fftic_artifacts import INTERNAL_FILES, validate_file
     from .fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
@@ -33,6 +34,7 @@ try:
     from .fftic_transaction_executor import file_sha256
     from .fftic_proton import supported_runner
 except ImportError:
+    from fftic_mod_state import stores_for, state_receipt
     from fftic_color_state import working_store, working_baseline, reviewed_source_archive, ColorStateError
     from fftic_artifacts import INTERNAL_FILES, validate_file
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
@@ -279,6 +281,18 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
                 reject('profile', 'Current Amethyst profile owns a different Color working copy')
         elif receipt.get('color_state'):
             raise ValueError('Color state receipt has no working-copy binding')
+        stores = stores_for(manifest)
+        if receipt.get('mod_states', []) != state_receipt(stores):
+            raise ValueError('mod working-state heads differ from receipt')
+        for binding in manifest.get('mod_working_copies', []):
+            store = stores[binding['contract']['mod_id']]
+            if binding['revision'] is not None:
+                store.read(binding['revision'])
+            if (store.head() is None or (store.root / 'intent.json').exists()
+                    or store.head()['generation'] != generation_identity['generation_id']):
+                raise ValueError('mod working-state head is missing, interrupted or belongs to another generation')
+            if store.profile != Path(evidence.profile_dir):
+                reject('profile', 'Current profile owns a different mod working copy')
         state = _read_active_state(Path(evidence.active_state_file))
         expected_state = {
             "active_generation": generation_identity["generation_id"],

@@ -8,6 +8,7 @@ Run from the source tree:
 from __future__ import annotations
 
 import json
+from _managed_fixture import managed_bytes
 import os
 import sys
 import tempfile
@@ -129,6 +130,9 @@ def test_collision_safe_discovery_imports() -> None:
         ]
         assert len(fftic_games) == 1
         for excluded in (
+                "fftic_mod_state.py",
+                "_managed_fixture.py",
+                "_mod_state_selftest.py",
                 "fftic_prerequisite_runner.py",
                 "fftic_loader_releases.py",
                 "_prerequisite_production_selftest.py",
@@ -300,9 +304,9 @@ def test_managed_code_packages() -> None:
     data["ModR2RManagedDll32"] = "x86/GenericJobs.dll"
     data["ModR2RManagedDll64"] = "x64/GenericJobs.dll"
     package = _package(root / "valid", data, "FFTIVC/data/enhanced/job.nxd")
-    (package / "GenericJobs.dll").write_bytes(b"synthetic managed assembly")
+    (package / "GenericJobs.dll").write_bytes(managed_bytes())
     (package / "GenericJobs.deps.json").write_text("{}", encoding="utf-8")
-    (package / "Reloaded.Support.dll").write_bytes(b"synthetic dependency")
+    (package / "Reloaded.Support.dll").write_bytes(managed_bytes(b"dependency"))
     result = inspect_package(package)
     assert result.classification == PackageClassification.ENHANCED_MANAGED_CODE
     handler = FinalFantasyTacticsTheIvaliceChronicles()
@@ -310,7 +314,7 @@ def test_managed_code_packages() -> None:
     prepared = SimpleNamespace(game=handler, src_root=package)
     assert _validate_prepared_package(prepared, lambda _line: None)
     before = manifest_digest(content_manifest(package))
-    (package / "GenericJobs.dll").write_bytes(b"changed synthetic assembly")
+    (package / "GenericJobs.dll").write_bytes(managed_bytes(b"changed"))
     assert manifest_digest(content_manifest(package)) != before
     mod = UserMod(data["ModId"], package, result.classification, True, 0)
     validate_user_dependencies((mod,))
@@ -349,7 +353,7 @@ def test_managed_code_packages() -> None:
     (native / "GenericJobs.dll").write_bytes(b"synthetic")
     assert inspect_package(native).classification == PackageClassification.UNSUPPORTED_CODE
     missing = _package(root / "missing-dependency", dict(data, ModDependencies=["unknown.api"]))
-    (missing / "GenericJobs.dll").write_bytes(b"synthetic")
+    (missing / "GenericJobs.dll").write_bytes(managed_bytes())
     try:
         validate_user_dependencies((replace(mod, package_location=missing),))
     except GenerationError as exc:
@@ -513,7 +517,7 @@ def test_color_customizer_configuration_boundary() -> None:
                 ModConfig="FFTColorCustomizer.Configuration.Configurator")
     package = _package(staging / "Color Customizer", data,
                        "FFTIVC/data/enhanced/fftpack/unit/battle_knight_m_spr.bin")
-    (package / data["ModDll"]).write_bytes(b"synthetic non-executable fixture")
+    (package / data["ModDll"]).write_bytes(managed_bytes(b"color-shaped"))
     (package / "UserThemes.json").write_text('{"Knight_Male": ["Mine"]}')
     handler = FinalFantasyTacticsTheIvaliceChronicles()
     before = content_manifest(package)

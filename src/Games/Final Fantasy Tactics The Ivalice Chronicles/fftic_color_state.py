@@ -460,14 +460,16 @@ class ColorStateStore:
     explicit rollback restores only the exact journaled prior head.
     """
 
-    def __init__(self, profile_dir, policy, *, create=True):
+    def __init__(self, profile_dir, policy, *, create=True, namespace=None, owner=None):
         self.profile = _canonical(profile_dir)
         if not self.profile.is_dir():
             raise ColorStateError("Profile is missing")
         self.policy = policy
-        self.root = self.profile / '.fftic-color-330'
+        self.root = self.profile / (namespace or '.fftic-color-330')
         self.owner = {'schema': 1, 'profile': str(self.profile), 'mod_id': _COLOR_ID,
                       'archive_sha256': _COLOR_ARCHIVE_SHA256}
+        if owner is not None:
+            self.owner = owner
         if not self.root.exists():
             if not create:
                 raise ColorStateError('Retained state is missing; recovery required')
@@ -737,6 +739,9 @@ class ColorWorkingPolicy(Color330Policy):
     A mod-internal deletion is retained as deletion, not treated as corruption.
     """
 
+    mod = MOD
+    user = USER
+
     def __init__(self, pristine_package):
         files, dirs = _scan(pristine_package)
         baseline = ({MOD + p: v for p, v in files.items()}, {MOD + p for p in dirs})
@@ -795,8 +800,8 @@ class ColorWorkingPolicy(Color330Policy):
         return MAX_BYTES
 
     def _directory(self, path):
-        return (path in {USER.rstrip('/'), MOD + 'UserThemes', MOD + 'logs'}
-                or path.startswith((USER, MOD + 'UserThemes/', MOD + 'logs/'))
+        return (path in {self.user.rstrip('/'), self.mod + 'UserThemes', self.mod + 'logs'}
+                or path.startswith((self.user, self.mod + 'UserThemes/', self.mod + 'logs/'))
                 or self.mutable(path + '/state.bin'))
 
     def _validate_inputs(self, generation, files):
@@ -809,9 +814,9 @@ class ColorWorkingPolicy(Color330Policy):
         # The generation verifier owns all remaining code/file identities.
         root = _canonical(generation)
         files, dirs = {}, set()
-        for prefix in (MOD, USER):
+        for prefix in (self.mod, self.user):
             child = _canonical(root / prefix.rstrip('/'))
-            if prefix == USER and not child.exists():
+            if prefix == self.user and not child.exists():
                 continue
             observed, directories = _scan(child)
             files.update({prefix + p: value for p, value in observed.items()})
@@ -822,9 +827,9 @@ class ColorWorkingPolicy(Color330Policy):
     def _pristine_destination(self, generation, baseline):
         files, dirs = self._working_scan(generation)
         original, original_dirs = baseline
-        expected = {p: v for p, v in original.items() if p.startswith((MOD, USER))}
-        expected_dirs = {p for p in original_dirs if p.startswith((MOD, USER))
-                         or p in {MOD.rstrip('/'), USER.rstrip('/')}}
+        expected = {p: v for p, v in original.items() if p.startswith((self.mod, self.user))}
+        expected_dirs = {p for p in original_dirs if p.startswith((self.mod, self.user))
+                         or p in {self.mod.rstrip('/'), self.user.rstrip('/')}}
         return files == expected and dirs == expected_dirs
 
     def inspect(self, generation, baseline):
@@ -837,7 +842,7 @@ class ColorWorkingPolicy(Color330Policy):
             elif original.get(path) != value:
                 raise ColorStateError(f'Immutable or unrelated working-copy file: {path}')
         for path in original:
-            if path.startswith(MOD) and path not in files and not self.mutable(path):
+            if path.startswith(self.mod) and path not in files and not self.mutable(path):
                 raise ColorStateError(f'Immutable working-copy file missing: {path}')
         dynamic = _parents(allowed)
         extra = dirs - original_dirs - dynamic
@@ -876,7 +881,7 @@ class ColorWorkingPolicy(Color330Policy):
         """Caller retains both paths first and journals active-copy migration writes."""
         changed = False
         for name in ('Config.json', 'WindowState.json'):
-            fallback, user = Path(generation) / (MOD + name), Path(generation) / (USER + name)
+            fallback, user = Path(generation) / (self.mod + name), Path(generation) / (self.user + name)
             if fallback.exists():
                 data = _read_regular(fallback, MAX_BYTES)
                 if user.exists() and _read_regular(user, MAX_BYTES) != data:
@@ -890,7 +895,7 @@ class ColorWorkingPolicy(Color330Policy):
     def check_migration(self, snapshot):
         files = {p: (s, h) for p, s, h in snapshot.files}
         for name in ('Config.json', 'WindowState.json'):
-            left, right = MOD + name, USER + name
+            left, right = self.mod + name, self.user + name
             if left in files and right in files and files[left] != files[right]:
                 raise ColorStateError(
                     f'Divergent fallback and User {name}; both copies are snapshotted. '
