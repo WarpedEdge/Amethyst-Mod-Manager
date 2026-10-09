@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
@@ -19,6 +20,7 @@ MANAGED_PACKAGE_IDS = frozenset({
 })
 MANAGED_PACKAGE_ID_KEYS = frozenset(value.casefold() for value in MANAGED_PACKAGE_IDS)
 COMPILED_RUNTIME_EXTENSIONS = frozenset({
+    ".a",
     ".asi",
     ".com",
     ".dll",
@@ -43,6 +45,7 @@ class PackageClassification(str, Enum):
     DUAL_MODE_MANAGED_CODE = "dual-mode managed Reloaded code/API mod"
     UNSUPPORTED_APPLICATION = "unsupported application"
     UNSUPPORTED_CODE = "unsupported native/external executable package"
+    UNSUPPORTED_CONFIGURATION = "unsupported persistent mod configuration"
     MALFORMED = "malformed package"
     MANAGED_INTERNAL = "managed internal package"
 
@@ -77,6 +80,55 @@ class PackageResult:
             PackageClassification.CLASSIC_MANAGED_CODE,
             PackageClassification.DUAL_MODE_MANAGED_CODE,
         }
+
+
+# Unchanged author v3.3.0 GitHub asset 528229133; full inventory and static
+# format/import review: FFTIC-Color-Customizer-3.3.0-Audit.md in the docs repo.
+# This grants package retention only in the Windows x64 Reloaded/Proton host.
+# Foreign RID files remain inert; Amethyst never loads them into native Python.
+_COLOR_ID = "paxtrick.fft.colorcustomizer"
+_COLOR_ARCHIVE_SIZE = 34_466_238
+_COLOR_ARCHIVE_SHA256 = "faf854fd508e0095ee1c080b48d1adbb7ec557ce5433f894ea0d4ffb9cbd7005"
+_COLOR_FILE_COUNT = 1323
+_COLOR_TREE_SHA256 = "ec8559ecf7ae671b993646feade0c59fd964fb19c3279ca175a4440ae3b7be2a"
+# Include every compiled member, including Windows support DLLs and WASM ar.
+_COLOR_COMPILED_FILES = {
+    'FFTColorCustomizer.dll': (1491968, '002f22efb95434662e7cc08753008afd0e91f3efd66b93f2d48f624694d9ecbe'),
+    'Microsoft.Data.Sqlite.dll': (173088, '29981956955da36990b3cfc93fe50597eeacae669663e230bef519d5693bb2fb'),
+    'Newtonsoft.Json.dll': (712464, '22c649f75fce5be7c7ccda8880473b634ef69ecf33f5d1ab8ad892caf47d5a07'),
+    'Reloaded.Hooks.Definitions.dll': (59904, '6eff93e6eba62a441bc682812fdf169dedc8e9daec06cefc0a936da1611e2ba7'),
+    'Reloaded.Hooks.ReloadedII.Interfaces.dll': (6144, 'b2661f2bc4a39a50ccd038b7b94201b422e53488ad5f4c6ef8caf337ff84d2be'),
+    'Reloaded.Memory.SigScan.ReloadedII.Interfaces.dll': (5632, '9b470f74b372d3affa7da304901a1be1f17904d4d75d5c6b0df422b84c2ca99d'),
+    'Reloaded.Memory.Sigscan.Definitions.dll': (6656, 'a433d3f9e5c752642cd0c5b70ae263a25fecbc70d2666cdddfcfa25eb71913cd'),
+    'Reloaded.Memory.Sigscan.dll': (20480, '7d2acda95707add456513675111349b8c9496ea82d1120da9e72530de872895e'),
+    'Reloaded.Memory.dll': (101888, '337fb8a9743289e0d31cc4d9aa98cfa3ca973acfbe346a3f5ccde44ff502eba7'),
+    'Reloaded.Mod.Interfaces.dll': (22016, 'e287ee42b40ff2515aed997f5778a37b536e8404acfabea4a43bf3ca1d0f4ab9'),
+    'Reloaded.Mod.Loader.IO.dll': (136704, '445ad0d809acbea84f495f0ea879442b6b3e9415e2166c401c1ed4f8e93dd595'),
+    'SQLitePCLRaw.batteries_v2.dll': (5120, 'e2709fda3ee4137dcea3398221f0afcd6241db0ea6fa55fd31a33610be78cf02'),
+    'SQLitePCLRaw.core.dll': (50688, 'c33995427edd44fa641cf702df8b63cc82cb7054dd984dc8277d15ee7c958874'),
+    'SQLitePCLRaw.provider.e_sqlite3.dll': (36352, '2e7315a35cb86213200654b717f8cbe3c7643a6bec4a106f22fc8c744a94906c'),
+    'e_sqlite3.dll': (1691648, 'dccbabb2bc7e7d4302c44d9ce41b70721a7d0914fa4d289e2f340d39766ad102'),
+    'runtimes/browser-wasm/nativeassets/net8.0/e_sqlite3.a': (1122394, '01be7351d0d273d1516bdd96bd60453d1685b9bb177ae3e38b4c8e97ad5b3639'),
+    'runtimes/linux-arm/native/libe_sqlite3.so': (827568, '851e33dfd50bcfac3b3317523d59e5897c1b41475f7c90d8d4b7666e409749ea'),
+    'runtimes/linux-arm64/native/libe_sqlite3.so': (1285800, 'c159ef66bfed7fc5690c4fe6f2807027f627531538adeee7cdcc6d03ad0c662a'),
+    'runtimes/linux-armel/native/libe_sqlite3.so': (1162812, '84606f9b96569fb9cb7e3d1549eb5bea685f5dd6cdba543e75edd4088874793e'),
+    'runtimes/linux-mips64/native/libe_sqlite3.so': (1500256, '8309ddd190f301b936bc6d921f70d596064f34e76496d3880a7dd03d47d11130'),
+    'runtimes/linux-musl-arm/native/libe_sqlite3.so': (1126664, '862d977ac6e1718c2fbf81f7ee7f73c86f91ed992112d8d699848a8cf72921b8'),
+    'runtimes/linux-musl-arm64/native/libe_sqlite3.so': (1333800, '395f1b01ed51acac4d53e50ca7b80efd64bdb3c7ec64c985667f340e1eba9173'),
+    'runtimes/linux-musl-x64/native/libe_sqlite3.so': (1228752, '12c1ae5551c2045efbe5231be42cad1a283dfbc2226022a39a83b77ee4ccc23b'),
+    'runtimes/linux-ppc64le/native/libe_sqlite3.so': (1648888, '6bb95fa133e10254508fa623a9e4198a195b35d1e9c684dc1045af82fae5bc0c'),
+    'runtimes/linux-s390x/native/libe_sqlite3.so': (1397832, '80968311d0c3e95d7ba3c46c7ba235ab84c697622124cc11f31a387251b2d7a1'),
+    'runtimes/linux-x64/native/libe_sqlite3.so': (1249880, '14b1cd337aa1f6c64708e194fd3f5d467262a92a10d3da9724a8835d06567bd2'),
+    'runtimes/linux-x86/native/libe_sqlite3.so': (1309268, 'c53204c3e467ad032f1c86650f5e46eb72ec275feca806e3d33998265e6f25d6'),
+    'runtimes/maccatalyst-arm64/native/libe_sqlite3.dylib': (1091295, '5d4297bc345073af6ec432873bc26e84eb0afbd95e18a30e2ce16f3aacdcfa38'),
+    'runtimes/maccatalyst-x64/native/libe_sqlite3.dylib': (1117336, '634c9fc110c6b84f4e29d6e507dda06e6a2bb3336570608c7c9d314bd3d0d9d1'),
+    'runtimes/osx-arm64/native/libe_sqlite3.dylib': (1091359, 'fc6bb3a9aa7a83ec1936ff7a0418f2fc73f51b7acd5065911db2a94ee00259d2'),
+    'runtimes/osx-x64/native/libe_sqlite3.dylib': (1116192, 'addd7a70661bca5eebc8eafca3b491722315149cf038b1b3f2f324703b289d8f'),
+    'runtimes/win-arm/native/e_sqlite3.dll': (1192960, '6098739e729776b9a221e4266fd9b43fb8b04013fd2dff23b617d3202eafae38'),
+    'runtimes/win-arm64/native/e_sqlite3.dll': (1485824, 'a56e35d6abac40a657e0445be007f6479b16b4f0566ca7b0b9a3e0794e87a969'),
+    'runtimes/win-x64/native/e_sqlite3.dll': (1691648, 'dccbabb2bc7e7d4302c44d9ce41b70721a7d0914fa4d289e2f340d39766ad102'),
+    'runtimes/win-x86/native/e_sqlite3.dll': (1308672, 'f80d5f5de3f7a82e684229028b946f6efa1682d27ec960ef18518542fd12a407'),
+}
 
 
 def _safe_identifier(value: object) -> bool:
@@ -117,6 +169,68 @@ def _safe_relative_path(path: str) -> bool:
     pure = PurePosixPath(path)
     return (not pure.is_absolute() and path == pure.as_posix()
             and all(part not in ("", ".", "..") for part in pure.parts))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_reviewed_color_customizer_archive(archive: Path) -> bool:
+    """Recognize only the unchanged ZIP bytes, never a version label or filename."""
+    try:
+        archive = Path(archive)
+        info = archive.lstat()
+        return (stat.S_ISREG(info.st_mode) and info.st_size == _COLOR_ARCHIVE_SIZE
+                and _file_sha256(archive) == _COLOR_ARCHIVE_SHA256)
+    except (OSError, TypeError):
+        return False
+
+
+def _is_reviewed_color_tree(root: Path, files: list[str], directories: list[str]) -> bool:
+    # Called only AFTER the existing path, collision, link and special-file checks.
+    # Full inventory prevents a known DLL/native set from blessing changed content,
+    # manifests, absent members, or extra files/empty directories. No persisted
+    # marker, caller flag, manifest assertion or cached result grants this policy.
+    files = [path for path in files if path != "meta.ini"]
+    if len(files) != _COLOR_FILE_COUNT:
+        return False
+    expected_dirs = {str(parent) for path in files for parent in PurePosixPath(path).parents
+                     if str(parent) != "."}
+    if set(directories) != expected_dirs:
+        return False
+    records = []
+    compiled = {}
+    try:
+        for path in sorted(files):
+            item = root / path
+            size, digest = item.stat().st_size, _file_sha256(item)
+            records.append(f"{path}\0{size}\0{digest}\n")
+            if PurePosixPath(path).suffix.casefold() in COMPILED_RUNTIME_EXTENSIONS:
+                compiled[path] = (size, digest)
+    except OSError:
+        return False
+    return (compiled == _COLOR_COMPILED_FILES
+            and hashlib.sha256("".join(records).encode("utf-8")).hexdigest()
+            == _COLOR_TREE_SHA256)
+
+
+def validate_color_customizer_archive(root: Path, archive: Path | None) -> list[str]:
+    """Check original ZIP identity at install; staged inspections use exact tree bytes.
+
+    The package validator and profile-owned working-copy lifecycle remain mandatory.
+    ZIP identity alone cannot grant lifecycle readiness.
+    """
+    result = inspect_package(root)
+    if (result.manifest is None or result.manifest.mod_id.casefold() != _COLOR_ID):
+        return []
+    if archive is None or not is_reviewed_color_customizer_archive(archive):
+        return ["Color Customizer archive is not the exact reviewed v3.3.0 ZIP "
+                f"(SHA-256 {_COLOR_ARCHIVE_SHA256}); changed or repacked archives are refused."]
+    return []
 
 
 def inspect_package(root: Path) -> PackageResult:
@@ -169,6 +283,7 @@ def inspect_package(root: Path) -> PackageResult:
                 errors.append(f"{key} contains unsafe path {value!r}.")
 
     package_files: list[str] = []
+    package_directories: list[str] = []
     payloads: list[str] = []
     unsafe: list[str] = []
     seen_paths: dict[str, str] = {}
@@ -183,6 +298,8 @@ def inspect_package(root: Path) -> PackageResult:
                     (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
                 unsafe.append(rel)
                 continue
+            if stat.S_ISDIR(mode):
+                package_directories.append(rel)
             if stat.S_ISREG(mode):
                 package_files.append(rel)
                 if rel.casefold().startswith("fftivc/"):
@@ -220,8 +337,10 @@ def inspect_package(root: Path) -> PackageResult:
     native = [(key, value) for key, value in declarations
               if key in {"ModNativeDll32", "ModNativeDll64"}]
     forbidden = [path for path in compiled_files if PurePosixPath(path).suffix.casefold()
-                 in {".asi", ".com", ".dylib", ".exe", ".scr", ".so"}]
-    if native or forbidden:
+                 in {".a", ".asi", ".com", ".dylib", ".exe", ".scr", ".so"}]
+    reviewed_color = (mod_id == _COLOR_ID and version == "3.3.0"
+                      and _is_reviewed_color_tree(root, package_files, package_directories))
+    if native or (forbidden and not reviewed_color):
         detail = [f"{key}={value!r}" for key, value in native]
         detail.extend(sorted(set(forbidden)))
         return PackageResult(PackageClassification.UNSUPPORTED_CODE, manifest,
@@ -234,6 +353,14 @@ def inspect_package(root: Path) -> PackageResult:
             return PackageResult(PackageClassification.MALFORMED, manifest,
                                  (f"{name} ({mod_id}) at {source}: ModDll {declared_dll!r} "
                                   "must name an existing regular package DLL.",), tuple(sorted(payloads)))
+        # The writable lifecycle applies only to the complete reviewed release.
+        # A familiar ModId/version cannot authorize synthetic or edited code.
+        if mod_id.casefold() == _COLOR_ID and version == "3.3.0" and not reviewed_color:
+            return PackageResult(
+                PackageClassification.UNSUPPORTED_CONFIGURATION, manifest,
+                (f"{name} ({mod_id}) at {source}: Color Customizer requires the unchanged "
+                 "reviewed 3.3.0 release; this package has not passed its exact payload policy.",),
+                tuple(sorted(payloads)))
         kind = (PackageClassification.ENHANCED_MANAGED_CODE if supported_set == {ENHANCED_APP_ID}
                 else PackageClassification.CLASSIC_MANAGED_CODE if supported_set == {CLASSIC_APP_ID}
                 else PackageClassification.DUAL_MODE_MANAGED_CODE)

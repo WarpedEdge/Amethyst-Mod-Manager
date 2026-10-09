@@ -627,7 +627,7 @@ def test_automatic_status_ready_attempts_once_after_failure() -> None:
             started.append((selected, selected_plan)),
         _notify=lambda message, level: notices.append((message, level)),
         _append_log=lambda message: None,
-        _refresh_fftic_status=lambda: refreshed.append(True),
+        _refresh_fftic_status=lambda **kw: refreshed.append(kw or True),
         tr=lambda message: message,
     )
     model = SimpleNamespace(error=None)
@@ -641,14 +641,25 @@ def test_automatic_status_ready_attempts_once_after_failure() -> None:
     MainWindow._on_fftic_operation_ready(host, 7, None, RuntimeError("synthetic failure"))
     assert not host._fftic_auto_operation
     assert notices == [(
-        "Could not save FFTIC launch results. Check that FFTIC is closed, "
-        "then open FFTIC status and use Confirm runtime output.", "error")]
+        "Could not save FFTIC state: synthetic failure. Close FFTIC and review FFTIC status details.", "error")]
     assert refreshed == [True]
 
     MainWindow._on_fftic_status_ready(host, 7, (model, "completed-log-hash"))
     assert planned == [OperationKind.RECONCILE_RUNTIME_OUTPUT]
     assert started == [(controller, plan)]
     assert shown == [model, model]
+    # Mod-state saving selects a different operation and then allows a fresh
+    # independent PAC probe; the same state evidence cannot loop after failure.
+    state_key = ('save_mod_state', 'state-hash')
+    MainWindow._on_fftic_status_ready(host, 7, (model, state_key))
+    assert planned[-1] == OperationKind.SAVE_MOD_STATE
+    result = SimpleNamespace(plan=SimpleNamespace(kind=OperationKind.SAVE_MOD_STATE))
+    MainWindow._on_fftic_operation_ready(host, 7, result, None)
+    assert notices[-1] == ('FFTIC mod state saved.', 'info')
+    assert refreshed[-1] == {'auto_reconcile': True}
+    before = len(planned)
+    MainWindow._on_fftic_status_ready(host, 7, (model, state_key))
+    assert len(planned) == before
 
 
 def test_release_notice_once_across_rechecks_and_restart() -> None:

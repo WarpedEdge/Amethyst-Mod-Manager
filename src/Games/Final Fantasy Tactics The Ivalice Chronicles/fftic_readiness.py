@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 
 try:
+    from .fftic_color_state import working_store, working_baseline, reviewed_source_archive, ColorStateError
     from .fftic_artifacts import INTERNAL_FILES, validate_file
     from .fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from .fftic_generation import (
@@ -32,6 +33,7 @@ try:
     from .fftic_transaction_executor import file_sha256
     from .fftic_proton import supported_runner
 except ImportError:
+    from fftic_color_state import working_store, working_baseline, reviewed_source_archive, ColorStateError
     from fftic_artifacts import INTERNAL_FILES, validate_file
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
     from fftic_generation import (
@@ -258,6 +260,25 @@ def verify_launch_readiness(evidence: ReadinessEvidence) -> ReadinessVerificatio
             encoding="utf-8"))
         if verify_private_generation(generation_root, generation_identity["generation_id"]) != manifest_hash:
             raise ValueError("generation changed during readiness inspection")
+        working = manifest.get('color_working_copy')
+        if working:
+            store = working_store(manifest)
+            reviewed_source_archive(store.profile, profile=True)
+            if working['revision'] is not None:
+                store.read(working['revision'])
+            if (store.head() is None or (store.root / 'intent.json').exists()
+                    or receipt.get('color_state') != {'profile': str(store.profile), 'head': store.head()}):
+                raise ValueError('retained Color state is missing or differs from receipt')
+            if store.head()['generation'] != generation_identity['generation_id']:
+                raise ValueError('retained Color state belongs to another generation')
+            try:
+                store.policy.check_migration(store.policy.inspect(generation_root, working_baseline(manifest)))
+            except ColorStateError as exc:
+                reject('profile', 'Color configuration migration requires resolution: ' + str(exc))
+            if Path(working['profile']) != Path(evidence.profile_dir):
+                reject('profile', 'Current Amethyst profile owns a different Color working copy')
+        elif receipt.get('color_state'):
+            raise ValueError('Color state receipt has no working-copy binding')
         state = _read_active_state(Path(evidence.active_state_file))
         expected_state = {
             "active_generation": generation_identity["generation_id"],

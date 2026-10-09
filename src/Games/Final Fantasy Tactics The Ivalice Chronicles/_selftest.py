@@ -358,6 +358,275 @@ def test_managed_code_packages() -> None:
         raise AssertionError("missing dependency was accepted")
 
 
+def test_reviewed_color_customizer_archive() -> None:
+    """Optional unchanged release fixture; never loads or executes release code."""
+    import hashlib
+    import shutil
+    from fftic_extraction import ExtractionLimits, extract_archive
+    from fftic_packages import (is_reviewed_color_customizer_archive,
+                                validate_color_customizer_archive,
+                                _COLOR_COMPILED_FILES)
+    from fftic_generation import GenerationError, read_profile_mods
+    from fftic_orchestration import _profile_packages
+    from Utils.mods.install import _finish_install, _single_root_unwrap, _validate_prepared_package
+
+    fixture = os.environ.get("FFTIC_COLOR_330_ARCHIVE")
+    if not fixture:
+        print("Release fixture checks not run: set FFTIC_COLOR_330_ARCHIVE to the isolated audited ZIP.")
+        return
+    archive = Path(fixture)
+    assert is_reviewed_color_customizer_archive(archive), "Fixture must be the unchanged reviewed ZIP"
+    before = hashlib.sha256(archive.read_bytes()).hexdigest()
+    profile = _ROOT / "reviewed-color"
+    staging = profile / "mods"
+    extracted = extract_archive(archive, staging, limits=ExtractionLimits(1323, 108569077, 1691648))
+    package = _single_root_unwrap(extracted.root)
+    handler = FinalFantasyTacticsTheIvaliceChronicles()
+    assert validate_color_customizer_archive(package, archive) == []
+    result = inspect_package(package)
+    assert result.classification == PackageClassification.DUAL_MODE_MANAGED_CODE
+    assert result.is_user_content
+    context = SimpleNamespace(profile_dir=profile, staging_root=staging)
+    for enabled in (True, False):
+        (profile / "modlist.txt").write_text(("+" if enabled else "-") + package.name + "\n")
+        assert _profile_packages(context) == ()
+        mods = read_profile_mods(profile, staging)
+        assert len(mods) == 1 and mods[0].enabled == enabled
+
+    def refused():
+        observed = inspect_package(package)
+        assert observed.classification in {PackageClassification.UNSUPPORTED_CODE,
+                                            PackageClassification.MALFORMED}, observed
+        assert not observed.is_user_content
+
+    # Every compiled member is independently bound, including all five Windows
+    # SQLite DLLs and the static archive. Same-length edits cannot inherit trust.
+    for relative in _COLOR_COMPILED_FILES:
+        item = package / relative
+        original = item.read_bytes()
+        item.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        refused()
+        item.write_bytes(original)
+    item = package / "Preview.png"
+    original = item.read_bytes()
+    item.write_bytes(original + b"changed")
+    refused()
+    item.write_bytes(original)
+    item = package / "runtimes/linux-x64/native/libe_sqlite3.so"
+    original = item.read_bytes()
+    renamed = item.with_name("renamed.so")
+    item.rename(renamed)
+    refused()
+    renamed.rename(item)
+    item.unlink()
+    refused()
+    item.write_bytes(original)
+    for relative in ("extra.so", "extra.a", "extra.txt", "unknown.exe"):
+        extra = package / relative
+        extra.write_bytes(b"unreviewed")
+        refused()
+        extra.unlink()
+    extra_dir = package / "empty-unreviewed-directory"
+    extra_dir.mkdir()
+    refused()
+    extra_dir.rmdir()
+    item.unlink()
+    item.symlink_to(package / "e_sqlite3.dll")
+    refused()
+    item.unlink()
+    item.write_bytes(original)
+    manifest = package / "ModConfig.json"
+    manifest_bytes = manifest.read_bytes()
+    data = json.loads(manifest_bytes)
+    for edits in ({"ModVersion": "3.3.1"}, {"ModId": "unrelated.native"},
+                  {"ModId": data["ModId"].upper()}, {"ModDll": "../outside.dll"},
+                  {"ModDll": "missing.dll"}, {"ModNativeDll64": "e_sqlite3.dll"}):
+        manifest.write_text(json.dumps(dict(data, **edits)))
+        refused()
+    manifest.write_bytes(manifest_bytes)
+
+    # Repacking identical member contents changes archive identity too. Path,
+    # version, member set, trailing bytes and ZIP metadata are not substitutes.
+    altered = _ROOT / "changed-color.zip"
+    shutil.copyfile(archive, altered)
+    with altered.open("r+b") as stream:
+        first = stream.read(1)
+        stream.seek(0)
+        stream.write(bytes([first[0] ^ 1]))
+    assert altered.stat().st_size == archive.stat().st_size
+    assert not is_reviewed_color_customizer_archive(altered)
+    assert validate_color_customizer_archive(package, altered)
+    # Verify the original-archive seam independently of the exact release boundary.
+    # The patch models a future completed persistence gate; no installation runs.
+    with patch.object(handler, "validate_mod_package", return_value=[]):
+        assert _validate_prepared_package(
+            SimpleNamespace(game=handler, src_root=package, archive=archive), lambda _line: None)
+        assert not _validate_prepared_package(
+            SimpleNamespace(game=handler, src_root=package, archive=altered), lambda _line: None)
+        assert not _validate_prepared_package(
+            SimpleNamespace(game=handler, src_root=package), lambda _line: None)
+    shutil.copyfile(archive, altered)
+    with altered.open("ab") as stream:
+        stream.write(b"changed archive bytes")
+    assert not is_reviewed_color_customizer_archive(altered)
+    assert validate_color_customizer_archive(package, altered)
+    shutil.copyfile(archive, altered)
+    with zipfile.ZipFile(altered, "a") as output:
+        output.comment = b"repacked identity"
+    assert not is_reviewed_color_customizer_archive(altered)
+    for changed in ("path", "member", "version"):
+        with zipfile.ZipFile(archive) as source, zipfile.ZipFile(altered, "w", zipfile.ZIP_DEFLATED) as output:
+            for info in source.infolist():
+                payload = source.read(info)
+                name = info.filename
+                if name.endswith("/ModConfig.json") and changed == "version":
+                    payload = json.dumps(dict(json.loads(payload), ModVersion="3.3.1")).encode()
+                if name.endswith("/e_sqlite3.dll") and changed == "path":
+                    name += ".renamed"
+                if name.endswith("/Preview.png") and changed == "member":
+                    continue
+                output.writestr(name, payload)
+        assert not is_reviewed_color_customizer_archive(altered)
+        assert validate_color_customizer_archive(package, altered)
+    assert inspect_package(package).is_user_content
+    assert validate_color_customizer_archive(package, archive) == []
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == before
+    assert len(list(package.rglob("*.so"))) == 11
+    assert len(list(package.rglob("*.dylib"))) == 4
+    print("Reviewed ZIP accepted by payload policy; all 35 compiled-member edits and lifecycle bypasses refused.")
+
+
+def test_color_customizer_configuration_boundary() -> None:
+    """Source-shaped bytes only: neither a release archive nor executable code."""
+    from fftic_generation import GenerationError, content_manifest, read_profile_mods
+    from fftic_orchestration import _profile_packages
+    from Utils.mods.install import _validate_prepared_package
+
+    profile = _ROOT / "color-customizer"
+    staging = profile / "mods"
+    data = _manifest(mod_id="paxtrick.fft.colorcustomizer",
+                     apps=[ENHANCED_APP_ID, CLASSIC_APP_ID], deps=list(MANAGED_ORDER))
+    data.update(ModName="FFT Color Customizer", ModAuthor="prawl", ModVersion="3.3.0",
+                ModDll="FFTColorCustomizer.dll",
+                ModR2RManagedDll32="x86/FFTColorCustomizer.dll",
+                ModR2RManagedDll64="x64/FFTColorCustomizer.dll",
+                ModConfig="FFTColorCustomizer.Configuration.Configurator")
+    package = _package(staging / "Color Customizer", data,
+                       "FFTIVC/data/enhanced/fftpack/unit/battle_knight_m_spr.bin")
+    (package / data["ModDll"]).write_bytes(b"synthetic non-executable fixture")
+    (package / "UserThemes.json").write_text('{"Knight_Male": ["Mine"]}')
+    handler = FinalFantasyTacticsTheIvaliceChronicles()
+    before = content_manifest(package)
+    result = inspect_package(package)
+    assert result.classification == PackageClassification.UNSUPPORTED_CONFIGURATION
+    assert not result.is_user_content
+    assert result.manifest.dependencies == tuple(MANAGED_ORDER)
+    assert result.manifest.supported_app_ids == (ENHANCED_APP_ID, CLASSIC_APP_ID)
+    assert dict(result.manifest.managed_native_declarations)["ModDll"] == data["ModDll"]
+    assert "unchanged reviewed" in handler.validate_mod_package(package)[0]
+    messages = []
+    assert not _validate_prepared_package(
+        SimpleNamespace(game=handler, src_root=package), messages.append)
+    assert any("unchanged reviewed" in message for message in messages)
+
+    # Already-staged copies must surface the same reason, including disabled
+    # ones: generations snapshot disabled packages too. Never discard edits.
+    context = SimpleNamespace(profile_dir=profile, staging_root=staging)
+    for enabled in (True, False):
+        (profile / "modlist.txt").write_text(
+            ("+" if enabled else "-") + "Color Customizer\n")
+        unsupported = _profile_packages(context)
+        assert len(unsupported) == 1
+        assert unsupported[0].enabled == enabled
+        assert "unchanged reviewed" in unsupported[0].reason
+        try:
+            read_profile_mods(profile, staging)
+        except GenerationError as exc:
+            assert "unchanged reviewed" in str(exc)
+        else:
+            raise AssertionError("Mutable package entered a generation")
+    assert content_manifest(package) == before
+
+    # Case variants do not bypass exact release identity. Structural/executable validation
+    # still takes precedence; this name never authorizes a payload exception.
+    manifest_path = package / "ModConfig.json"
+    data["ModId"] = data["ModId"].upper()
+    manifest_path.write_text(json.dumps(data))
+    assert inspect_package(package).classification == PackageClassification.UNSUPPORTED_CONFIGURATION
+    # Synthetic SQLite .so/.dylib bytes do not match the reviewed release.
+    # Each is independently rejected before the exact release boundary, including
+    # for disabled staged packages. Never remove payloads to make it install.
+    from Utils.mods.install import _finish_install
+    for relative in ("unknown.exe",
+                     "runtimes/linux-x64/native/libe_sqlite3.so",
+                     "runtimes/osx-arm64/native/libe_sqlite3.dylib"):
+        extra = package / relative
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_bytes(b"synthetic non-executable fixture")
+        snapshot = content_manifest(package)
+        result = inspect_package(package)
+        assert result.classification == PackageClassification.UNSUPPORTED_CODE
+        assert relative in result.diagnostics[0]
+        messages = []
+        # This minimal prepared record deliberately lacks staging fields: the
+        # real finish seam must reject before resolving or replacing staging.
+        assert _finish_install(SimpleNamespace(game=handler, src_root=package),
+                               None, log_fn=messages.append) is None
+        assert any(relative in message for message in messages)
+        for enabled in (True, False):
+            (profile / "modlist.txt").write_text(
+                ("+" if enabled else "-") + "Color Customizer\n")
+            assert relative in _profile_packages(context)[0].reason
+            try:
+                read_profile_mods(profile, staging)
+            except GenerationError as exc:
+                assert relative in str(exc)
+            else:
+                raise AssertionError("Unsupported native payload entered a generation")
+        assert content_manifest(package) == snapshot
+        extra.unlink()
+    manifest_path.write_text(json.dumps(dict(data, ModDll="../outside.dll")))
+    assert inspect_package(package).classification == PackageClassification.MALFORMED
+    manifest_path.write_text(json.dumps(dict(data, ModDll="missing.dll")))
+    assert inspect_package(package).classification == PackageClassification.MALFORMED
+
+    # Other managed packages with a configurator retain the existing D1 rule.
+    # A configurator declaration by itself proves neither writes nor safety.
+    manifest_path.write_text(json.dumps(dict(data, ModId="test.configurable")))
+    assert inspect_package(package).classification == PackageClassification.DUAL_MODE_MANAGED_CODE
+    (profile / "modlist.txt").write_text("+Color Customizer\n")
+    accepted = read_profile_mods(profile, staging)
+    manifest_before = manifest_path.read_bytes()
+    generated = generate_reloaded_configuration(
+        private_generation_root=(profile / "generation").resolve(),
+        windows_game_path=ValidatedSteamPath.from_resolver(r"S:\steamapps\common\FFTIC"),
+        managed_package_locations={identity: (profile / identity).resolve()
+                                   for identity in MANAGED_ORDER}, user_mods=accepted)
+    for app in (CLASSIC_APP_ID, ENHANCED_APP_ID):
+        assert json.loads(generated.file_bytes(f"Apps/{app}/AppConfig.json"))["EnabledMods"] \
+            == [*MANAGED_ORDER, "test.configurable"]
+    assert manifest_path.read_bytes() == manifest_before
+
+    # A configurable dual-mode mod must still have every required user
+    # dependency enabled in both modes, not merely installed for Enhanced.
+    dependent = dict(data, ModId="test.configurable",
+                     ModDependencies=[*MANAGED_ORDER, "test.api"])
+    manifest_path.write_text(json.dumps(dependent))
+    dependency = _package(staging / "API", _manifest(mod_id="test.api"))
+    for modlist in ("+Color Customizer\n", "+Color Customizer\n-API\n",
+                    "+Color Customizer\n+API\n"):
+        (profile / "modlist.txt").write_text(modlist)
+        try:
+            read_profile_mods(profile, staging)
+        except GenerationError as exc:
+            assert "test.api" in str(exc) and "classic" in str(exc)
+        else:
+            raise AssertionError("Missing, disabled, or mode-incompatible dependency accepted")
+    (dependency / "ModConfig.json").write_text(json.dumps(
+        _manifest(mod_id="test.api", apps=[CLASSIC_APP_ID, ENHANCED_APP_ID])))
+    assert len(read_profile_mods(profile, staging)) == 2
+
+
 def test_artifact_manifest() -> None:
     assert set(ARTIFACTS) == {
         "reloaded-ii", "nenkai-loader", "sigscan", "shared-hooks",
@@ -741,6 +1010,8 @@ def main() -> None:
         test_nexus_browser_install_contract,
         test_special_file_manifest,
         test_managed_code_packages,
+        test_color_customizer_configuration_boundary,
+        test_reviewed_color_customizer_archive,
         test_artifact_manifest,
         test_reloaded_generation,
         test_transaction_plans,

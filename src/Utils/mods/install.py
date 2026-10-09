@@ -1962,6 +1962,10 @@ def _validate_prepared_package(prepared, log_fn: LogFn) -> bool:
         return True
     try:
         package_errors = list(validate_package(Path(prepared.src_root)) or [])
+        validate_archive = getattr(prepared.game, "validate_mod_archive", None)
+        if callable(validate_archive):
+            package_errors.extend(validate_archive(
+                Path(prepared.src_root), getattr(prepared, "archive", None)) or [])
     except Exception as exc:
         package_errors = [f"Package validation failed unexpectedly: {exc}"]
     if not package_errors:
@@ -1982,6 +1986,13 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
     staging_root = Path(resolve_target_staging(p.game, p.profile_dir))
     staging_root.mkdir(parents=True, exist_ok=True)
     dest_root = staging_root / p.mod_name
+    retain_archive = getattr(p.game, 'retain_mod_archive', None)
+    if callable(retain_archive):
+        try:
+            retain_archive(Path(p.src_root), Path(p.archive), staging_root)
+        except Exception as exc:
+            log_fn(f'Install refused while retaining the pristine archive: {exc}')
+            return None
 
     def _pp(done, total, phase=None):
         if progress_fn is not None:

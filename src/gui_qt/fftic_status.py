@@ -105,6 +105,7 @@ class FfticStatusPanel(QFrame):
             ("update", self.tr("Update FFTIC Mod Loader")),
             ("revert_loader", self.tr("Return loader to 1.7.3")),
             ("remove", self.tr("Remove managed support")),
+            ("save_mod_state", self.tr("Save mod state")),
             ("reconcile_runtime_output", self.tr("Confirm runtime output")),
         )):
             button = QPushButton(label)

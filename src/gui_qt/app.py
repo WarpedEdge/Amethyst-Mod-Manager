@@ -20678,8 +20678,15 @@ class MainWindow(QMainWindow):
             except InspectionCancelled:
                 return
             if not cancel.is_set():
-                evidence_key = (controller.automatic_reconciliation_ready()
-                                if auto_reconcile and not model.error else None)
+                evidence_key = None
+                if auto_reconcile and not model.error:
+                    state_key = controller.automatic_mod_state_ready()
+                    if state_key:
+                        evidence_key = ('save_mod_state', state_key)
+                    else:
+                        pac_key = controller.automatic_reconciliation_ready()
+                        if pac_key:
+                            evidence_key = ('reconcile_runtime_output', pac_key)
                 safe_emit(ready_signal, generation, (model, evidence_key))
 
         self._fftic_status_jobs.submit(worker)
@@ -20725,7 +20732,8 @@ class MainWindow(QMainWindow):
             try:
                 from fftic_orchestration import OperationKind
                 plan = self._fftic_status_controller.plan(
-                    OperationKind.RECONCILE_RUNTIME_OUTPUT)
+                    OperationKind(evidence_key[0]) if isinstance(evidence_key, tuple)
+                    else OperationKind.RECONCILE_RUNTIME_OUTPUT)
             except Exception as exc:
                 self._append_log(f"FFTIC completed-launch check changed: {exc}")
                 return
@@ -20789,6 +20797,7 @@ class MainWindow(QMainWindow):
         self._fftic_auto_operation = False
         if error is None:
             self._notify(self.tr(
+                "FFTIC mod state saved." if automatic and result.plan.kind.value == "save_mod_state" else
                 "FFTIC launch results saved." if automatic
                 else "FFTIC operation completed and was verified."), "info")
         else:
@@ -20797,11 +20806,13 @@ class MainWindow(QMainWindow):
                 self._notify(self.tr("FFTIC operation cancelled at a safe boundary."), "warning")
             else:
                 self._notify(self.tr(
-                    "Could not save FFTIC launch results. Check that FFTIC is closed, "
-                    "then open FFTIC status and use Confirm runtime output." if automatic else
+                    "Could not save FFTIC state: {0}. Close FFTIC and review FFTIC status details." if automatic else
                     "FFTIC operation failed: {0}").format(error), "error")
                 self._append_log(f"FFTIC operation failed: {error}")
-        self._refresh_fftic_status()
+        if automatic and error is None:
+            self._refresh_fftic_status(auto_reconcile=True)
+        else:
+            self._refresh_fftic_status()
 
     def _present_fftic_action(self, action: str):
         context = self._fftic_context()

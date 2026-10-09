@@ -17,7 +17,7 @@ from fftic_detection import (  # noqa: E402
     ExecutableHashCache, InstallationDetection, STEAM_APP_ID,
     detect_installation,
 )
-from fftic_packages import inspect_package  # noqa: E402
+from fftic_packages import inspect_package, validate_color_customizer_archive  # noqa: E402
 from fftic_orchestration import FfticOrchestrator  # noqa: E402
 from fftic_production import create_production_executor  # noqa: E402
 
@@ -140,6 +140,18 @@ class FinalFantasyTacticsTheIvaliceChronicles(BaseGame):
         return list(result.diagnostics or (
             f"Unsupported FFTIC package classification: {result.classification.value}.",
         ))
+
+    def validate_mod_archive(self, source_root: Path, archive: Path | None) -> list[str]:
+        return validate_color_customizer_archive(source_root, archive)
+
+    def retain_mod_archive(self, source_root: Path, archive: Path, staging_root: Path) -> None:
+        result = inspect_package(source_root)
+        if result.manifest and result.manifest.mod_id == 'paxtrick.fft.colorcustomizer':
+            try:
+                from .fftic_color_state import reviewed_source_archive
+            except ImportError:
+                from fftic_color_state import reviewed_source_archive
+            reviewed_source_archive(staging_root, archive)
 
     def direct_proton_launch_blocked_reason(self, exe_path: Path) -> str:
         try:

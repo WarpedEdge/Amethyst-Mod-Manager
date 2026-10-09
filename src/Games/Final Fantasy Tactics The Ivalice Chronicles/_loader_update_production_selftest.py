@@ -28,7 +28,7 @@ from fftic_transaction_executor import file_sha256 as real_file_sha256
 from fftic_workflows import CurrentInstallationEvidence
 
 
-def test_default_status_to_production_update(asset: Path) -> None:
+def test_default_status_to_production_update(asset: Path, *, with_color=False) -> None:
     fixture = Fixture("production-update-plan")
     try:
         runner = fixture.root / "steam/steamapps/common/Proton - Experimental/proton"
@@ -68,6 +68,11 @@ def test_default_status_to_production_update(asset: Path) -> None:
             installation_reader=lambda: CurrentInstallationEvidence(
                 detection, "reviewed-production"),
             runner_script_reader=lambda: runner)
+        if with_color:
+            fixture.recompose(process_running=lambda: False)
+            from _color_working_selftest import install
+            install(fixture)
+            (fixture.profile / 'modlist.txt').write_text('+High\n+Low\n-Disabled\n+Color\n')
         with patch("fftic_workflows.file_sha256", side_effect=synthetic_file_hash):
             fixture.run(OperationKind.SETUP)
         shutil.copyfile(asset, fixture.cache / REVIEWED_LOADER_UPDATE.filename)
@@ -128,6 +133,26 @@ def test_default_status_to_production_update(asset: Path) -> None:
                 inner_results[-1].action_unavailable_reasons)
             assert controller.mutation_available
 
+            if with_color:
+                from fftic_color_state import USER
+                receipt = read_receipt(fixture.inputs.receipts_root)
+                root = Path(receipt.data['active_generation_identity']['root'])
+                config = root / (USER + 'Config.json')
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_bytes(b'{"Knight_Male":"Factory"}')
+                assert OperationKind.SAVE_MOD_STATE.value in status.available_actions
+                first_state_key = controller.automatic_mod_state_ready()
+                assert first_state_key
+                controller.execute(controller.plan(OperationKind.SAVE_MOD_STATE))
+                status = controller.refresh(context)
+                assert controller.automatic_mod_state_ready() is None
+                assert config.read_bytes() == b'{"Knight_Male":"Factory"}'
+                config.write_bytes(b'{"Knight_Male":"Second"}')
+                controller.execute(controller.plan(OperationKind.SAVE_MOD_STATE))
+                status = controller.refresh(context)
+                config.write_bytes(b'{"Knight_Male":"Factory"}')
+                assert controller.automatic_mod_state_ready() != first_state_key
+                assert controller.automatic_mod_state_ready()
             plan = controller.plan(OperationKind.UPDATE)
             assert plan.release is release
             operations = controller._executor._operations
@@ -154,6 +179,34 @@ def test_default_status_to_production_update(asset: Path) -> None:
             receipt = read_receipt(fixture.inputs.receipts_root)
             assert next(item["version"] for item in receipt.data["artifacts"]
                         if item["artifact_id"] == "nenkai-loader") == "1.7.5"
+            if with_color:
+                root = Path(receipt.data['active_generation_identity']['root'])
+                assert (root / (USER + 'Config.json')).read_bytes() == b'{"Knight_Male":"Factory"}'
+                status = controller.refresh(context)
+                assert OperationKind.REVERT_LOADER.value in status.available_actions
+                controller.execute(controller.plan(OperationKind.REVERT_LOADER))
+                # Removing just Color from a profile exports its state and
+                # leaves unrelated managed/user mods ready; re-adding restores it.
+                (fixture.profile / 'modlist.txt').write_text('+High\n+Low\n-Disabled\n')
+                status = controller.refresh(context)
+                assert OperationKind.SYNCHRONIZE.value in status.available_actions
+                controller.execute(controller.plan(OperationKind.SYNCHRONIZE))
+                receipt = read_receipt(fixture.inputs.receipts_root)
+                assert 'color_state' not in receipt.data
+                root = Path(receipt.data['active_generation_identity']['root'])
+                assert (root / 'Mods/fixture.high/ModConfig.json').is_file()
+                assert list((managed / 'quarantine').glob('color-user-state-*'))
+                (fixture.profile / 'modlist.txt').write_text('+High\n+Low\n-Disabled\n+Color\n')
+                status = controller.refresh(context)
+                controller.execute(controller.plan(OperationKind.SYNCHRONIZE))
+                receipt = read_receipt(fixture.inputs.receipts_root)
+                root = Path(receipt.data['active_generation_identity']['root'])
+                assert (root / (USER + 'Config.json')).read_bytes() == b'{"Knight_Male":"Factory"}'
+                status = controller.refresh(context)
+                assert OperationKind.REMOVE.value in status.available_actions
+                controller.execute(controller.plan(OperationKind.REMOVE))
+                assert list((managed / 'quarantine').glob('color-user-state-*'))
+                print('PASS default inspector/controller/factory repeated state save, update/return, profile removal/re-add and managed removal')
     finally:
         shutil.rmtree(fixture.root)
 

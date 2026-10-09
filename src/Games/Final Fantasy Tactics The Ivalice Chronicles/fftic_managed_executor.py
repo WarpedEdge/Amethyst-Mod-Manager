@@ -234,6 +234,7 @@ class LifecycleOperations(Protocol):
     def update(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def revert_loader(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def remove(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
+    def save_mod_state(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
     def reconcile_runtime_output(self, plan: OperationPlan, cancel, progress) -> OperationResult: ...
 
 
@@ -405,6 +406,9 @@ class StagedLifecycleOperations:
     def remove(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
 
+    def save_mod_state(self, plan, cancel, progress):
+        return self._run(plan, cancel, progress)
+
     def reconcile_runtime_output(self, plan, cancel, progress):
         return self._run(plan, cancel, progress)
 
@@ -457,6 +461,10 @@ class ManagedLifecycleExecutor:
     def automatic_reconciliation_ready(self) -> str | None:
         return self._operations.automatic_reconciliation_ready()
 
+    def mod_state_pending(self):
+        probe = getattr(self._operations, 'mod_state_pending', None)
+        return probe() if callable(probe) else None
+
     def __init__(self, operations: LifecycleOperations,
                  *, coordinator: MutationCoordinator = MUTATION_COORDINATOR) -> None:
         self._operations = operations
@@ -486,6 +494,7 @@ class ManagedLifecycleExecutor:
                 OperationKind.UPDATE: self._operations.update,
                 OperationKind.REVERT_LOADER: self._operations.revert_loader,
                 OperationKind.REMOVE: self._operations.remove,
+                OperationKind.SAVE_MOD_STATE: getattr(self._operations, 'save_mod_state', None),
                 OperationKind.RECONCILE_RUNTIME_OUTPUT:
                     self._operations.reconcile_runtime_output,
             }[plan.kind]

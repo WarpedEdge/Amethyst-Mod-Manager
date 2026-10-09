@@ -108,7 +108,7 @@ def validate_receipt(data: object) -> dict:
     schema = data.get("schema_version")
     required = _REQUIRED if schema == 1 else _V2_REQUIRED if schema == SCHEMA_VERSION else set()
     missing = sorted(required - set(data))
-    extra = sorted(set(data) - required - ({"runner_history"} if schema == 2 else set()))
+    extra = sorted(set(data) - required - ({"runner_history", "color_state"} if schema == 2 else set()))
     if missing or extra:
         raise ReceiptCorruptError(f"FFTIC receipt fields differ (missing={missing}, extra={extra})")
     if schema not in {1, SCHEMA_VERSION}:
@@ -454,6 +454,16 @@ def validate_receipt(data: object) -> dict:
     recovery = data["recovery_instructions"]
     if not isinstance(recovery, list) or not recovery or not all(isinstance(x, str) and x for x in recovery):
         _fail("recovery_instructions")
+    if 'color_state' in data:
+        state = _exact(data['color_state'], {'profile', 'head'}, 'color_state')
+        _absolute_path(state['profile'], 'color_state.profile')
+        head = _exact(state['head'], {'revision', 'transaction', 'generation'}, 'color_state.head')
+        _hash(head['revision'], 'color_state.head.revision')
+        _identifier(head['transaction'], 'color_state.head.transaction')
+        if head['generation'] != generation['generation_id']:
+            _fail('color_state.head.generation')
+        if not any(item['mod_id'] == 'paxtrick.fft.colorcustomizer' for item in data['user_packages']):
+            _fail('color_state package binding')
     return data
 
 

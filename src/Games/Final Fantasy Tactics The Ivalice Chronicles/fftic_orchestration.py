@@ -90,6 +90,7 @@ class OperationKind(str, Enum):
     REVERT_LOADER = "revert_loader"
     REMOVE = "remove"
     RECONCILE_RUNTIME_OUTPUT = "reconcile_runtime_output"
+    SAVE_MOD_STATE = "save_mod_state"
 
 
 @dataclass(frozen=True)
@@ -251,6 +252,7 @@ def _action_availability(
     release: LoaderRelease | None = None,
     installed_loader: str = "",
     revert_absent_pac: bool = False,
+    color_state_present: bool = False,
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """Return only lifecycle actions supported by the current exact evidence."""
     by_key = {row.key: row for row in rows}
@@ -313,6 +315,12 @@ def _action_availability(
         and all(by_key.get(key) is not None
                 and by_key[key].state == expected_component_state
                 for key in ("runtime", "nenkai", "sigscan", "hooks")))
+    if (color_state_present and receipt_present and no_unsupported and verification is not None and verification.attested
+            and all(getattr(verification, key) == ReadinessAspect.READY for key in (
+                'game', 'artifacts', 'generation', 'prefix', 'prerequisites', 'bootstrap',
+                'steam_options', 'runner', 'recovery'))):
+        actions.append(OperationKind.SAVE_MOD_STATE.value)
+        reasons[OperationKind.SAVE_MOD_STATE.value] = ''
     if protected_reconciliation_state:
         actions.append(OperationKind.RECONCILE_RUNTIME_OUTPUT.value)
         reasons[OperationKind.RECONCILE_RUNTIME_OUTPUT.value] = ""
@@ -1006,7 +1014,10 @@ class DefaultStatusInspector:
             verification=verification, unsupported=unsupported,
             prerequisite_host_available=host_available,
             prerequisite_host_reason=host_reason, release=release,
-            installed_loader=installed_loader, revert_absent_pac=revert_absent_pac)
+            installed_loader=installed_loader, revert_absent_pac=revert_absent_pac,
+            color_state_present=bool(receipt and receipt.data.get("color_state")))
+        if receipt is None or not receipt.data.get('color_state'):
+            available_actions = tuple(a for a in available_actions if a != OperationKind.SAVE_MOD_STATE.value)
         hashes = dict(installation.executable_hashes)
         details = (
             f"Detected Steam build: {build or '<unknown>'}",
@@ -1080,6 +1091,17 @@ class FfticOrchestrator:
                 and OperationKind.RECONCILE_RUNTIME_OUTPUT.value in status.available_actions
                 and callable(probe)):
             return probe()
+        return None
+
+    def automatic_mod_state_ready(self) -> str | None:
+        status = self.last_status
+        probe = getattr(self._executor, 'mod_state_pending', None)
+        if (status and status.mutation_available and OperationKind.SAVE_MOD_STATE.value in status.available_actions
+                and callable(probe)):
+            try:
+                return probe()
+            except Exception:
+                return None
         return None
 
     @property
@@ -1211,6 +1233,9 @@ class FfticOrchestrator:
                 OperationStep(
                     "managed support", "restore receipt-owned files and retain shared runtimes",
                     "FFTIC game and prefix"),),
+            OperationKind.SAVE_MOD_STATE: (
+                OperationStep('mod state', 'snapshot stopped-game profile settings, themes and output',
+                              'receipt-owned working copy; PACs remain separate'),),
             OperationKind.RECONCILE_RUNTIME_OUTPUT: (
                 OperationStep(
                     "post-launch runtime output",

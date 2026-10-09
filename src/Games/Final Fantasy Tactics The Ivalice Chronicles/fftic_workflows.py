@@ -20,6 +20,8 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 try:
+    from .fftic_color_state import (ColorStateStore, ColorWorkingPolicy, ColorStateError, working_store,
+        working_baseline, reviewed_source_archive, _COLOR_ID)
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
     from .fftic_loader_releases import CHECKER, reviewed_release_identity
     from .fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
@@ -68,6 +70,8 @@ try:
     )
     from .fftic_transactions import TargetObservation, plan_owned_file_install
 except ImportError:
+    from fftic_color_state import (ColorStateStore, ColorWorkingPolicy, ColorStateError, working_store,
+        working_baseline, reviewed_source_archive, _COLOR_ID)
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, validate_file
     from fftic_loader_releases import CHECKER, reviewed_release_identity
     from fftic_detection import InstallStatus, InstallationDetection, VERIFIED_HASHES
@@ -205,6 +209,10 @@ class _Baseline:
     mutated_files: set[Path] | None = None
     activation_id: str | None = None
     pac_backup_files: dict[Path, bytes | None] | None = None
+    color_publications: list | None = None
+    color_captured: bool = False
+    color_file_backups: dict | None = None
+    color_created_dirs: list | None = None
 
 
 class FfticLifecycleComposition:
@@ -495,6 +503,9 @@ class FfticLifecycleComposition:
                               if item.is_dir() and not item.is_symlink()}
             if self.inputs.generations_root.exists() else set(),
         )
+        baseline.color_file_backups = {}
+        baseline.color_created_dirs = []
+        baseline.color_publications = []
         baseline.transaction_backups = []
         baseline.backup_files = {}
         baseline.quarantine_moves = []
@@ -537,7 +548,9 @@ class FfticLifecycleComposition:
     def _recovery_information(self, token: _Baseline) -> str:
         return (
             f"restore exact pre-{token.kind.value} receipt, activation, bootstrap, "
-            "prefix configuration, PACs, generations, and explicit replaced-file backups")
+            "prefix configuration, PACs, generations, and explicit replaced-file backups. "
+            + ("Prior Color state binding: " + json.dumps(token.receipt_record.data.get('color_state'))
+               if token.receipt_record and token.receipt_record.data.get('color_state') else ""))
 
     def _inject(self, name: str, kind: OperationKind) -> None:
         if self.inputs.failure_injector is not None:
@@ -575,10 +588,118 @@ class FfticLifecycleComposition:
             self._revert_loader(token, cancel)
         elif token.kind == OperationKind.REMOVE:
             self._remove(token, cancel)
+        elif token.kind == OperationKind.SAVE_MOD_STATE:
+            self._save_mod_state(token, cancel)
         elif token.kind == OperationKind.RECONCILE_RUNTIME_OUTPUT:
             self._reconcile_runtime_output(token, cancel)
         else:
             raise WorkflowError(f"Unsupported lifecycle operation {token.kind.value}")
+
+    def _color_manifest(self, receipt):
+        record = receipt.data['active_generation_identity']
+        root = self._bounded_path(record['root'], self.inputs.generations_root,
+                                  'Working-copy generation', kind='directory')
+        if verify_private_generation(root, record['generation_id']) != record['manifest_sha256']:
+            raise WorkflowError('Working-copy manifest differs from receipt')
+        manifest = json.loads((root / 'amethyst-generation.json').read_text())
+        if manifest.get('color_working_copy'):
+            profile = Path(manifest['color_working_copy']['profile'])
+            if (profile.parent != self.inputs.profile_dir.parent.resolve()
+                    or profile.resolve(strict=True) != profile or profile.is_symlink()):
+                raise WorkflowError('Working-copy profile is outside this game profile collection')
+            store = working_store(manifest)
+            if receipt.data.get('color_state') != {'profile': str(profile), 'head': store.head()}:
+                raise WorkflowError('Working-copy retained head differs from receipt')
+        elif receipt.data.get('color_state'):
+            raise WorkflowError('Unexpected Color state receipt binding')
+        return manifest
+
+    def _publish_color(self, token, store, revision, generation):
+        before = store.head()
+        after = store.publish(revision, expected_head=before,
+                              transaction=f'color-{uuid.uuid4().hex}', generation=generation,
+                              process_running=self.inputs.process_running)
+        token.color_publications.append((store, before, after))
+        self._inject('color:head', token.kind)
+
+    def _capture_color(self, token):
+        if token.color_captured or token.receipt_record is None:
+            return
+        manifest = self._color_manifest(token.receipt_record)
+        if manifest.get('color_working_copy'):
+            store = working_store(manifest)
+            root = Path(token.receipt_record.data['active_generation_identity']['root'])
+            revision = store.capture(root, working_baseline(manifest), expected_head=store.head(),
+                                     process_running=self.inputs.process_running)
+            self._color_manifest(token.receipt_record)
+            # The revision is durable even when migration or the outer operation fails.
+            self._inject('color:snapshot', token.kind)
+            try:
+                store.policy.check_migration(store.read(revision)[0])
+            except ColorStateError as exc:
+                raise WorkflowError(f'{exc} Retained snapshot: {store.root / "revisions" / revision}') from exc
+            self._publish_color(token, store, revision, manifest['generation_id'])
+        token.color_captured = True
+
+    def mod_state_pending(self):
+        if not callable(self.inputs.process_running) or self.inputs.process_running():
+            return None
+        receipt = read_receipt(self.inputs.receipts_root)
+        if receipt is None:
+            return None
+        manifest = self._color_manifest(receipt)
+        if not manifest.get('color_working_copy'):
+            return None
+        store = working_store(manifest)
+        snapshot = store.policy.inspect(Path(receipt.data['active_generation_identity']['root']),
+                                        working_baseline(manifest))
+        head = store.head()
+        if head is None or store.read(head['revision'])[0] != snapshot:
+            return hashlib.sha256(repr((head, snapshot)).encode()).hexdigest()
+        return None
+
+    def _verify_mod_state_context(self):
+        installation, verified = self._readiness()
+        protected = (verified.artifacts, verified.generation, verified.prefix,
+                     verified.prerequisites, verified.bootstrap, verified.steam_options,
+                     verified.runner, verified.recovery)
+        if (not verified.attested or any(v != ReadinessAspect.READY for v in protected)
+                or not (verified.game == ReadinessAspect.READY
+                        or installation.authority.startswith('isolated-fixture:'))):
+            raise WorkflowError('Mod state refuses unrelated ownership drift: ' + '; '.join(verified.issues))
+        # PAC/profile drift cannot authorize writes to mod-owned state outside
+        # the receipt's generation. State saving leaves both untouched.
+        self._color_manifest(read_receipt(self.inputs.receipts_root))
+
+    def _save_mod_state(self, token, cancel):
+        self._verify_mod_state_context()
+        self._capture_color(token)
+        self._cancelled(cancel)
+        updated = dict(token.receipt_record.data)
+        manifest = json.loads((Path(updated['active_generation_identity']['root']) /
+                               'amethyst-generation.json').read_text())
+        store = working_store(manifest)
+        if store is None:
+            raise WorkflowError('No profile-owned Color working copy to save')
+        root = Path(updated['active_generation_identity']['root'])
+        for name in ('Config.json', 'WindowState.json'):
+            fallback = root / f'Mods/{_COLOR_ID}/{name}'
+            user = root / f'User/Mods/{_COLOR_ID}/{name}'
+            if fallback.exists():
+                token.color_file_backups[fallback] = self._read_optional(fallback)
+                token.color_file_backups[user] = self._read_optional(user)
+                if not user.parent.exists():
+                    token.color_created_dirs.append(user.parent)
+        if store.policy.migrate_private_copy(root):
+            revision = store.capture(root, working_baseline(manifest), expected_head=store.head(),
+                                     process_running=self.inputs.process_running)
+            self._publish_color(token, store, revision, manifest['generation_id'])
+        updated['color_state'] = {'profile': str(store.profile), 'head': store.head()}
+        updated['updated_at'] = self._now()
+        self._ensure_stopped()
+        write_receipt(self.inputs.receipts_root, validate_receipt(updated))
+        token.mutated_files.add(self.inputs.receipts_root / 'fftic-receipt.json')
+        self._inject('color:receipt', token.kind)
 
     def _candidate_paths(self, candidates: ReviewedCandidateSet | None,
                          *, required_ids: set[str] | None = None) -> dict[str, Path]:
@@ -638,6 +759,27 @@ class FfticLifecycleComposition:
                candidates: ReviewedCandidateSet | None) -> tuple[GenerationResult, dict[str, Path]]:
         self._ensure_stopped()
         required = {*MANAGED_ARTIFACTS.values(), "reloaded-ii"}
+        self._capture_color(token)
+        mods = read_profile_mods(self.inputs.profile_dir, self.inputs.staging_root)
+        color = next((mod for mod in mods if mod.mod_id == _COLOR_ID), None)
+        store = None
+        binding = None
+        if color is not None:
+            source_archive = reviewed_source_archive(self.inputs.staging_root)
+            store = ColorStateStore(self.inputs.profile_dir, ColorWorkingPolicy(color.package_location))
+            reviewed_source_archive(store.profile, source_archive, profile=True)
+            head = store.head()
+            if head is not None:
+                store.policy.check_migration(store.read(head['revision'])[0])
+            binding = {'profile': str(self.inputs.profile_dir.resolve()),
+                       'revision': head['revision'] if head else None}
+        elif token.receipt_record and token.receipt_record.data.get('color_state'):
+            old_manifest = json.loads((Path(token.receipt_record.data['active_generation_identity']['root']) /
+                                       'amethyst-generation.json').read_text())
+            outgoing = working_store(old_manifest)
+            self.inputs.quarantine_root.mkdir(parents=True, exist_ok=True)
+            outgoing.export(outgoing.head()['revision'],
+                            self.inputs.quarantine_root / f'color-user-state-{uuid.uuid4().hex}')
         paths = self._candidate_paths(candidates, required_ids=required)
         trees = self._verified_trees(paths, cancel)
         steam = resolve_steam_s_path(
@@ -648,7 +790,7 @@ class FfticLifecycleComposition:
             generation = build_private_generation(
                 generations_root=self.inputs.generations_root,
                 verified_inputs=trees,
-                user_mods=read_profile_mods(self.inputs.profile_dir, self.inputs.staging_root),
+                user_mods=mods, color_working_copy=binding, color_store=store,
                 windows_game_path=steam.windows_game_path,
                 cancel=cancel, previous_generation=self._current_generation_id())
         finally:
@@ -999,6 +1141,9 @@ class FfticLifecycleComposition:
                     "prior_receipt_sha256": hashlib.sha256(prior_bytes).hexdigest(),
                 })
             data["runner_history"] = history
+        if manifest.get('color_working_copy'):
+            store = working_store(manifest)
+            data['color_state'] = {'profile': str(store.profile), 'head': store.head()}
         return validate_receipt(data)
 
     def _write_receipt(self, token: _Baseline, generation: GenerationResult,
@@ -1013,6 +1158,14 @@ class FfticLifecycleComposition:
         old = read_receipt(self.inputs.receipts_root)
         if self._read_optional(receipt_path) != old_bytes:
             raise WorkflowError("Ownership receipt changed while building runner history")
+        manifest = json.loads((generation.root / 'amethyst-generation.json').read_text())
+        if manifest.get('color_working_copy'):
+            store = working_store(manifest)
+            before = store.head()
+            revision = store.capture(generation.root, working_baseline(manifest), expected_head=before,
+                                     process_running=self.inputs.process_running)
+            store.policy.check_migration(store.read(revision)[0])
+            self._publish_color(token, store, revision, generation.generation_id)
         data = self._receipt_data(generation, operation, old, old_bytes)
         if self._read_optional(receipt_path) != old_bytes:
             raise WorkflowError("Ownership receipt changed before replacement")
@@ -1418,6 +1571,13 @@ class FfticLifecycleComposition:
                 allow_runner_transition=True)
         except WorkflowError as exc:
             raise RecoveryRequiredError(str(exc)) from exc
+        manifest = self._color_manifest(receipt)
+        self._capture_color(token)
+        if manifest.get('color_working_copy'):
+            store = working_store(manifest)
+            destination = self.inputs.quarantine_root / f'color-user-state-{uuid.uuid4().hex}'
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            store.export(store.head()['revision'], destination)
         for record in receipt.data["owned_game_targets"]:
             self._remove_owned_file(
                 token, self.inputs.game_root / record["relative_path"], record)
@@ -1577,7 +1737,9 @@ class FfticLifecycleComposition:
             raise WorkflowError(prefix + ": " + "; ".join(verified.issues))
 
     def _verify_forward(self, token: _Baseline) -> None:
-        if token.kind == OperationKind.REMOVE:
+        if token.kind == OperationKind.SAVE_MOD_STATE:
+            self._verify_mod_state_context()
+        elif token.kind == OperationKind.REMOVE:
             self._verify_removed(token, receipt_present=False, backups_present=False)
         else:
             self._assert_readiness(
@@ -1586,7 +1748,9 @@ class FfticLifecycleComposition:
 
     def _final_verify(self, token: _Baseline) -> None:
         self._inject("final-verifier", token.kind)
-        if token.kind == OperationKind.REMOVE:
+        if token.kind == OperationKind.SAVE_MOD_STATE:
+            self._verify_mod_state_context()
+        elif token.kind == OperationKind.REMOVE:
             self._verify_removed(token, receipt_present=False, backups_present=False)
         else:
             self._assert_readiness(
@@ -1716,6 +1880,16 @@ class FfticLifecycleComposition:
         os.replace(temporary, path)
 
     def _rollback(self, token: _Baseline) -> None:
+        for store, before, after in reversed(token.color_publications or ()):
+            store.rollback_publication(expected_head=after, previous_head=before,
+                                       process_running=self.inputs.process_running)
+        for path, payload in (token.color_file_backups or {}).items():
+            self._atomic_restore(path, payload)
+        for directory in reversed(list(dict.fromkeys(token.color_created_dirs or ()))):
+            if os.path.lexists(directory):
+                if directory.is_symlink():
+                    raise WorkflowError('Migration rollback directory is linked')
+                directory.rmdir()
         # Restore only exact files owned or explicitly replaced by this FFTIC
         # integration. Shared prerequisite installer changes are never reversed.
         for original, quarantined in reversed(token.quarantine_moves or ()):
@@ -1771,6 +1945,16 @@ class FfticLifecycleComposition:
                         raise WorkflowError(f"Could not roll back published generation {item}: {exc}") from exc
 
     def _verify_rollback(self, token: _Baseline) -> None:
+        for path, payload in (token.color_file_backups or {}).items():
+            if self._read_optional(path) != payload:
+                raise WorkflowError('Config migration rollback differs')
+        if any(os.path.lexists(path) for path in token.color_created_dirs or ()):
+            raise WorkflowError('Config migration rollback left a created directory')
+        expected = {}
+        for store, before, _after in token.color_publications or ():
+            expected.setdefault(store.root, (store, before))
+        if any(store.head() != before for store, before in expected.values()):
+            raise WorkflowError('Color state head rollback differs')
         self._inject("rollback-verifier", token.kind)
         receipt_path = self.inputs.receipts_root / "fftic-receipt.json"
         active = self.inputs.active_state_file
@@ -1823,5 +2007,8 @@ class FfticLifecycleComposition:
     def update(self, plan, cancel, progress): return self._run("update", plan, cancel, progress)
     def revert_loader(self, plan, cancel, progress): return self._run("revert_loader", plan, cancel, progress)
     def remove(self, plan, cancel, progress): return self._run("remove", plan, cancel, progress)
+    def save_mod_state(self, plan, cancel, progress):
+        return self._run("save_mod_state", plan, cancel, progress)
+
     def reconcile_runtime_output(self, plan, cancel, progress):
         return self._run("reconcile_runtime_output", plan, cancel, progress)

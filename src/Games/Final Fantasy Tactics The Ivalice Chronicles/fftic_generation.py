@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 try:
+    from .fftic_color_state import ColorWorkingPolicy, working_baseline, MOD, _COLOR_ID
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from .fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from .fftic_packages import PackageClassification, inspect_package
@@ -24,6 +25,7 @@ try:
         ExtractionLimits, VerifiedArtifactTree, extract_archive, verify_internal_file,
     )
 except ImportError:
+    from fftic_color_state import ColorWorkingPolicy, working_baseline, MOD, _COLOR_ID
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
     from fftic_packages import PackageClassification, inspect_package
@@ -159,6 +161,8 @@ def content_manifest(root: Path, *, exclude: tuple[str, ...] = ()) -> tuple[dict
                 f"Case-fold path collision in generation source: {seen[key]!r} and {relative!r}")
         seen[key] = relative
         if stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise GenerationError(f"Hardlinked generation file is not private: {path}")
             records.append({"path": relative, "size": info.st_size, "sha256": _sha256(path)})
     return tuple(sorted(records, key=lambda item: (item["path"].casefold(), item["path"])))
 
@@ -310,7 +314,7 @@ def verify_legacy_reloaded_normalization(root: Path,
 
 
 def generation_identity(*, artifact_inputs: tuple[dict, ...], user_records: tuple[dict, ...],
-                        windows_game_path: str) -> str:
+                        windows_game_path: str, color_working_copy: dict | None = None) -> str:
     loader_record = next(item for item in artifact_inputs
                          if item["artifact_id"] == "nenkai-loader")
     loader = loader_pin_from_digest(loader_record["archive_sha256"])
@@ -320,6 +324,8 @@ def generation_identity(*, artifact_inputs: tuple[dict, ...], user_records: tupl
         "user_packages": user_records,
         "windows_game_path": windows_game_path,
     }
+    if color_working_copy is not None:
+        compatibility["color_working_copy"] = color_working_copy
     digest = hashlib.sha256(json.dumps(
         compatibility, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return f"fftic-r2-{digest[:24]}"
@@ -368,9 +374,23 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise GenerationError(f"Generation manifest is unreadable: {root}: {exc}") from exc
-    manifest = _exact_dict(manifest, MANIFEST_FIELDS, "manifest")
-    if manifest["schema_version"] != 1 or not isinstance(manifest["generation_id"], str):
+    working = manifest.get("color_working_copy")
+    manifest = _exact_dict(manifest, MANIFEST_FIELDS | ({"color_working_copy"} if working else set()), "manifest")
+    if manifest["schema_version"] not in {1, 2} or not isinstance(manifest["generation_id"], str):
         raise GenerationError(f"Generation manifest schema is invalid: {root}")
+    if (manifest['schema_version'] == 2) != bool(working):
+        raise GenerationError('Working-copy schema and binding disagree')
+    baseline = None
+    policy = None
+    if working:
+        _exact_dict(working, {'profile', 'revision'}, 'working-copy binding')
+        if (not isinstance(working['profile'], str) or not Path(working['profile']).is_absolute()
+                or working['revision'] is not None and not _HASH.fullmatch(working['revision'])):
+            raise GenerationError('Invalid working-copy profile/revision')
+        _valid_file_records(manifest['files'])
+        baseline = working_baseline(manifest)
+        policy = ColorWorkingPolicy.from_baseline(baseline)
+        policy.inspect(root, baseline)
     try:
         loader_record = next(item for item in manifest["artifact_inputs"]
                              if item["artifact_id"] == "nenkai-loader")
@@ -445,8 +465,14 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
         package = root / "Mods" / item["mod_id"]
         if package.is_symlink() or not package.is_dir():
             raise GenerationError(f"Generation user package root is missing or linked: {package}")
-        if manifest_digest(content_manifest(package)) != item["content_manifest_sha256"]:
+        records = (tuple(dict(path=p[len(MOD):], size=v[0], sha256=v[1])
+                         for p, v in sorted(baseline[0].items(), key=lambda item: (item[0].casefold(), item[0]))
+                         if p.startswith(MOD))
+                   if working and item['mod_id'] == _COLOR_ID else content_manifest(package))
+        if manifest_digest(records) != item["content_manifest_sha256"]:
             raise GenerationError(f"Generation user package content identity changed: {item['mod_id']}")
+    if working and _COLOR_ID not in {item['mod_id'] for item in users}:
+        raise GenerationError('Working-copy binding has no matching package')
     if users != sorted(users, key=lambda item: (item["priority"], item["mod_id"].casefold())):
         raise GenerationError("Generation user packages are not in canonical order")
     expected_config_paths = {
@@ -477,13 +503,16 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
         raise GenerationError("Generation configuration identity is not reproducible")
     recomputed = generation_identity(
         artifact_inputs=tuple(artifacts), user_records=tuple(users),
-        windows_game_path=configuration["windows_game_path"])
+        windows_game_path=configuration["windows_game_path"], color_working_copy=working)
     if recomputed != manifest["generation_id"]:
         raise GenerationError(f"Generation declared identity is not reproducible: {root}")
     if expected_generation_id is not None and manifest["generation_id"] != expected_generation_id:
         raise GenerationError(f"Generation identity mismatch at {root}")
     expected = _valid_file_records(manifest["files"])
     observed = content_manifest(root, exclude=("amethyst-generation.json",))
+    if working:
+        expected = tuple(record for record in expected if not policy.mutable(record['path']))
+        observed = tuple(record for record in observed if not policy.mutable(record['path']))
     if tuple(expected) != observed:
         if not _allow_legacy_normalization:
             raise GenerationError(f"Generation content drift or incompleteness detected: {root}")
@@ -518,8 +547,10 @@ def build_private_generation(
     cancel=None,
     previous_generation: str | None = None,
     failure_injector=None,
+    color_working_copy: dict | None = None,
+    color_store=None,
 ) -> GenerationResult:
-    """Build and atomically publish a complete immutable generation."""
+    """Publish an exact runtime with a profile-owned Color working copy when requested."""
     expected_ids = {"reloaded-ii", *MANAGED_ARTIFACTS.values()}
     validate_user_dependencies(user_mods)
     if set(verified_inputs) != expected_ids:
@@ -557,9 +588,18 @@ def build_private_generation(
         "classification": mod.classification.value,
         "content_manifest_sha256": manifest_digest(content_manifest(mod.package_location)),
     } for mod in sorted(user_mods, key=lambda value: (value.amethyst_priority, value.mod_id.casefold())))
+    has_color = any(mod.mod_id == _COLOR_ID for mod in user_mods)
+    if has_color != bool(color_working_copy) or has_color != bool(color_store):
+        raise GenerationError('Color Customizer requires a profile-owned working copy')
+    if has_color:
+        _exact_dict(color_working_copy, {'profile', 'revision'}, 'working-copy binding')
+        head = color_store.head()
+        if (Path(color_working_copy['profile']) != color_store.profile
+                or color_working_copy['revision'] != (head['revision'] if head else None)):
+            raise GenerationError('Working-copy restoration does not belong to its profile/head')
     generation_id = generation_identity(
         artifact_inputs=artifact_inputs, user_records=user_records,
-        windows_game_path=windows_game_path.value)
+        windows_game_path=windows_game_path.value, color_working_copy=color_working_copy)
     generations_root = Path(generations_root)
     generations_root.mkdir(parents=True, exist_ok=True)
     final = generations_root / generation_id
@@ -653,7 +693,8 @@ def build_private_generation(
             if relative.endswith("AppConfig.json")
         }
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2 if has_color else 1,
+            **({"color_working_copy": color_working_copy} if has_color else {}),
             "generation_id": generation_id,
             "components": component_versions_for(verified_inputs["nenkai-loader"].pin),
             "compatibility_set": compatibility_set_for(verified_inputs["nenkai-loader"].pin),
@@ -668,6 +709,14 @@ def build_private_generation(
         }
         manifest_bytes = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8")
         (stage / "amethyst-generation.json").write_bytes(manifest_bytes)
+        if has_color and color_working_copy['revision'] is not None:
+            verify_private_generation(stage, generation_id)
+            baseline = working_baseline(manifest)
+            policy = ColorWorkingPolicy.from_baseline(baseline)
+            snapshot, payload = color_store.read(color_working_copy['revision'])
+            policy.check_migration(snapshot)
+            policy.restore(snapshot, payload, stage, baseline)
+            policy.migrate_private_copy(stage)
         verify_private_generation(stage, generation_id)
         inject("before_publish")
         _fsync_tree(stage)

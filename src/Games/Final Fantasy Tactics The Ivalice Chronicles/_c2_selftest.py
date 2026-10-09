@@ -607,6 +607,59 @@ def test_generation_and_profile_sync() -> None:
         raise AssertionError("Generation content drift activated")
     drift_target.write_bytes(prior_bytes)
 
+    # Color Customizer's source writes both User settings and package-local
+    # output. Model those writes without loading the mod or blessing its package.
+    # They must remain drift, including during cleanup; ignoring User alone
+    # would neither preserve themes nor make this lifecycle safe.
+    generation_manifest = (first.root / "amethyst-generation.json").read_bytes()
+    staged_before = content_manifest(staging)
+    active_before = state.read_bytes()
+    configuration_executor = FfticTransactionExecutor(
+        allowed_roots=(ROOT,), lock_path=ROOT / "data" / "configuration-remove.lock",
+        journal=_Journal())
+    for relative in (
+        "User/Mods/paxtrick.fft.colorcustomizer/Config.json",
+        "User/Mods/paxtrick.fft.colorcustomizer/WindowState.json",
+        "Mods/test.high/UserThemes.json",
+        "Mods/test.high/UserThemes/Knight_Male/Mine/palette.bin",
+        "Mods/test.high/Data/nxd/charclut.sqlite",
+        "Mods/test.high/logs/live_log.txt",
+        "Mods/test.high/FFTIVC/data/enhanced/same.nxd",
+    ):
+        target = first.root / relative
+        original = target.read_bytes() if target.exists() else None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"synthetic live edit")
+        try:
+            # Repeated reads must not adopt the edit or repair it away.
+            for _ in range(2):
+                try:
+                    verify_private_generation(first.root, first.generation_id)
+                except GenerationError:
+                    pass
+                else:
+                    raise AssertionError(f"Runtime write was silently accepted: {relative}")
+            try:
+                configuration_executor.quarantine_owned_generation(
+                    generation_root=first.root, generation_id=first.generation_id,
+                    quarantine_root=ROOT / "quarantine" / "configuration",
+                    transaction_id="configuration-drift")
+            except GenerationError:
+                pass
+            else:
+                raise AssertionError(f"Cleanup moved unowned live edits: {relative}")
+            assert target.read_bytes() == b"synthetic live edit"
+            assert state.read_bytes() == active_before
+            assert content_manifest(staging) == staged_before
+            assert (first.root / "amethyst-generation.json").read_bytes() == generation_manifest
+            assert not (ROOT / "quarantine" / "configuration").exists()
+        finally:
+            if original is None:
+                target.unlink()
+            else:
+                target.write_bytes(original)
+    assert verify_private_generation(first.root, first.generation_id) == first.manifest_sha256
+
     # A broad file-manifest rewrite cannot conceal changed user-package content.
     user_drift = ROOT / "generations" / "user-content-drift"
     shutil.copytree(first.root, user_drift)
