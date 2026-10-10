@@ -64,6 +64,167 @@ def _row(key: str, state: str = "Ready") -> StatusRow:
     return StatusRow(key, key, state, StatusSeverity.READY, state)
 
 
+def test_managed_loader_row_and_nexus_requirement() -> None:
+    from PySide6.QtCore import Qt, QModelIndex, QRect
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
+    from Utils.mods.modlist import ModEntry, read_modlist
+    from Nexus.nexus_requirements import (
+        RequirementIndex, FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,
+        check_requirements_from_gql)
+    from gui_qt.modlist_model import (
+        ModListModel, MANAGED_FFTIC_LOADER_ROW, COL_CATEGORY, COL_VERSION)
+    from gui_qt.modlist_view import ModListView
+    from gui_qt.modlist_delegate import ModRowDelegate, ROW_H
+    from gui_qt.modlist_menu import build_context_menu
+    from gui_qt.modlist_filter import search_hidden_rows, compute_hidden_rows, FilterData
+    from gui_qt.app import MainWindow
+    from gui_qt.missing_reqs_view import _ReqCard
+
+    app = QApplication.instance() or QApplication([])
+    del app
+    with tempfile.TemporaryDirectory(prefix="fftic-managed-row-") as root:
+        modlist_path = Path(root) / "modlist.txt"
+        modlist_path.write_text("+Ramza Overhaul\n", encoding="utf-8")
+        model = ModListModel()
+        model.set_entries([ModEntry("Ramza Overhaul", True, False)])
+        model.modlist_path = modlist_path
+        assert all(e.name != MANAGED_FFTIC_LOADER_ROW for e in model.natural_entries())
+        model.set_managed_fftic_loader_version("1.7.5")
+        row = next(i for i in range(model.rowCount())
+                   if model.entry(i).name == MANAGED_FFTIC_LOADER_ROW)
+        assert model.data(model.index(row, 0), Qt.DisplayRole) == (
+            "FFT: The Ivalice Chronicles Mod Loader (Managed)")
+        assert model.data(model.index(row, COL_VERSION), Qt.DisplayRole) == "1.7.5"
+        assert model.data(model.index(row, COL_CATEGORY), Qt.DisplayRole) == "Managed"
+        assert model.flags(model.index(row, 0)) == Qt.ItemIsEnabled
+        view = ModListView(model)
+        view._apply_separator_spanning()
+        assert not view.isFirstColumnSpanned(row, QModelIndex())
+        assert build_context_menu(view, model.index(row, 0)) is None
+        entries = [model.entry(i) for i in range(model.rowCount())]
+        assert row not in search_hidden_rows(entries, "mod loader")
+        assert row in search_hidden_rows(entries, "Ramza")
+        assert row not in compute_hidden_rows(
+            entries, {"filter_hide_separators": 1}, FilterData())
+        model.toggle_collapse(row)
+        assert row not in model.hidden_rows()
+        view.set_filter_hidden(compute_hidden_rows(
+            entries, {"filter_hide_separators": 1}, FilterData()))
+        assert not view.isRowHidden(row, QModelIndex())
+        view.set_search_hidden(search_hidden_rows(entries, "mod loader"),
+                               active=True)
+        assert not view.isRowHidden(row, QModelIndex())
+        delegate = ModRowDelegate(view)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 300, ROW_H)
+        assert delegate.sizeHint(option, model.index(row, 0)).height() == ROW_H
+        canvas = QImage(300, ROW_H, QImage.Format_ARGB32)
+        canvas.fill(Qt.black)
+        painter = QPainter(canvas)
+        for col in (0, COL_CATEGORY, COL_VERSION):
+            delegate.paint(painter, option, model.index(row, col))
+        painter.end()
+        model.set_rows_enabled([row], False)
+        assert not model.move_block([row], model.rowCount() - 1)
+        model.remove_row(row)
+        assert model.save() and [e.name for e in read_modlist(modlist_path)] == ["Ramza Overhaul"]
+        assert MANAGED_FFTIC_LOADER_ROW not in model.mod_names()
+        model.set_managed_fftic_loader_version("")
+        assert all(e.name != MANAGED_FFTIC_LOADER_ROW for e in model.natural_entries())
+
+    ordered = [ModEntry("Zed", True, False), ModEntry("Alpha", True, False),
+               ModEntry("Group_separator", True, False, True),
+               ModEntry("Delta", True, False), ModEntry("Beta", True, False)]
+    plain = ModListModel()
+    pinned = ModListModel()
+    plain.set_entries(ordered)
+    pinned.set_entries(ordered)
+    pinned.set_managed_fftic_loader_version("1.7.5")
+    for key, ascending in ((None, True), ("name", True), ("priority", True)):
+        plain.set_sort(key, ascending)
+        pinned.set_sort(key, ascending)
+        expected = [plain.entry(i).name for i in range(plain.rowCount())]
+        actual = [pinned.entry(i).name for i in range(pinned.rowCount())
+                  if pinned.entry(i).name != MANAGED_FFTIC_LOADER_ROW]
+        assert actual == expected, (key, expected, actual)
+        assert [pinned.entry(i).name for i in pinned.sep_block_rows(0)] == [
+            plain.entry(i).name for i in plain.sep_block_rows(0)]
+        assert list(pinned.sep_block_rows(1)) == []
+        for name in ("Zed", "Alpha", "Delta", "Beta"):
+            plain_row = next(i for i in range(plain.rowCount())
+                             if plain.entry(i).name == name)
+            pinned_row = next(i for i in range(pinned.rowCount())
+                              if pinned.entry(i).name == name)
+            assert pinned._priority_for_row(pinned_row) == plain._priority_for_row(plain_row)
+    pinned.set_sort(None)
+    assert 0 not in search_hidden_rows(
+        [pinned.entry(i) for i in range(pinned.rowCount())], "Zed")
+
+    domain, loader_id = FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+    meta = SimpleNamespace(mod_id=22, game_domain=domain,
+                           ignored_requirements="", missing_requirements="",
+                           nexus_requirements="4:FFT Mod Loader;56:Other API")
+    index = RequirementIndex({"Ramza Overhaul"}, domain)
+    index.refresh({"Ramza Overhaul": meta})
+    assert {mid for mid, _ in index.missing["Ramza Overhaul"]} == {4, 56}
+    staged_loader = SimpleNamespace(mod_name="staged loader", mod_id=4, game_domain=domain,
+                                    ignored_requirements="", missing_requirements="",
+                                    nexus_requirements="")
+    index.refresh({"staged loader": staged_loader})
+    index.set_enabled({"Ramza Overhaul", "staged loader"})
+    assert {mid for mid, _ in index.missing["Ramza Overhaul"]} == {4, 56}
+    assert index.set_managed_providers((FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)) == {"Ramza Overhaul"}
+    assert {mid for mid, _ in index.missing["Ramza Overhaul"]} == {56}
+    index.set_managed_providers(())
+    assert {mid for mid, _ in index.missing["Ramza Overhaul"]} == {4, 56}
+    other = RequirementIndex({"Ramza Overhaul"}, "skyrimspecialedition",
+                             (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,))
+    other.refresh({"Ramza Overhaul": SimpleNamespace(
+        mod_id=22, game_domain="skyrimspecialedition",
+        ignored_requirements="", missing_requirements="",
+        nexus_requirements="4:Other game's mod")})
+    assert other.missing["Ramza Overhaul"] == [(4, "Other game's mod")]
+
+    req = SimpleNamespace(mod_id=4, mod_name="FFT Mod Loader",
+                          is_external=False, game_domain=domain, notes="")
+    owner = SimpleNamespace(mod_name="Ramza Overhaul", mod_id=22,
+                            game_domain=domain, missing_requirements="",
+                            nexus_requirements="")
+    with patch("Nexus.nexus_requirements._load_requirement_filter",
+               return_value=(set(), {}, {})):
+        gql = {22: SimpleNamespace(requirements=[req])}
+        assert check_requirements_from_gql(
+            gql, [owner], domain, save_results=False,
+            managed_providers=(FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)) == []
+        assert len(check_requirements_from_gql(
+            gql, [owner, staged_loader], domain, save_results=False)) == 1
+        other_domain = "skyrimspecialedition"
+        owner.game_domain = other_domain
+        assert len(check_requirements_from_gql(
+            gql, [owner], other_domain, save_results=False,
+            managed_providers=(FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,))) == 1
+    from gui_qt.theme_qt import active_palette
+    card = _ReqCard(active_palette(), req, "", False, lambda _url: None,
+                    lambda _req: None, managed_setup=True)
+    assert card._install_btn.text() == "Set up / Repair"
+
+    routed = []
+    host = SimpleNamespace(_fftic_context=lambda: object(),
+                           _fftic_status_controller=SimpleNamespace(
+                               last_status=SimpleNamespace(error="", row=lambda _key:
+                                   SimpleNamespace(state="Not installed"))),
+                           _present_fftic_action=routed.append, _req_installing=True,
+                           _notify=lambda *_args: None, tr=lambda message: message)
+    MainWindow._install_nexus_mod_by_id(host, loader_id, domain, "FFT Mod Loader")
+    assert routed == ["setup"]
+    host._fftic_status_controller.last_status.row = lambda _key: SimpleNamespace(state="Conflict")
+    MainWindow._install_nexus_mod_by_id(host, loader_id, domain, "FFT Mod Loader")
+    assert routed == ["setup", "repair"]
+    MainWindow._install_nexus_mod_by_id(host, loader_id, "skyrimspecialedition", "Other")
+    assert routed == ["setup", "repair"]
+
+
 def _inventory(*roots: Path) -> tuple[tuple[str, str, bytes | str], ...]:
     records = []
     for root in roots:
@@ -688,6 +849,7 @@ def test_release_notice_once_across_rechecks_and_restart() -> None:
 
 def main() -> None:
     tests = (
+        test_managed_loader_row_and_nexus_requirement,
         test_composition_derives_owned_paths_and_delays_acquisition,
         test_invalid_composition_keeps_read_only_status,
         test_prerequisite_acquisition_matrix_and_host_capability,

@@ -56,9 +56,11 @@ class _ReqCard(QFrame):
     per-requirement Ignore checkbox + View + Enable/Install/Download."""
 
     def __init__(self, p, req, url, is_external, on_view, on_install,
-                 ignored=False, on_ignore=None, enable_target_fn=None):
+                 ignored=False, on_ignore=None, enable_target_fn=None,
+                 managed_setup=False):
         super().__init__()
         self._enable_target_fn = enable_target_fn
+        self._managed_setup = managed_setup
         self.setObjectName("ReqCard")
         self.setStyleSheet(
             f"#ReqCard{{background:{_c(p,'BG_PANEL')};"
@@ -116,6 +118,8 @@ class _ReqCard(QFrame):
             self._install_btn = inst
 
     def _install_label(self) -> str:
+        if self._managed_setup:
+            return self.tr("Set up / Repair")
         if self._enable_target_fn is not None and self._enable_target_fn():
             return self.tr("Enable")
         from Utils.ui.config import load_download_only
@@ -138,7 +142,8 @@ class MissingReqsView(QWidget):
 
     def __init__(self, api, game, mods, ignored_set, save_ignored_fn,
                  on_close, log_fn=None, install_fn=None, ignore_req_fn=None,
-                 enable_target_fn=None, enable_fn=None):
+                 enable_target_fn=None, enable_fn=None,
+                 managed_requirement_identity=None):
         super().__init__()
         self._api = api
         self._game = game
@@ -156,6 +161,7 @@ class MissingReqsView(QWidget):
         self._install_fn = install_fn
         self._enable_target_fn = enable_target_fn
         self._enable_fn = enable_fn
+        self._managed_requirement_identity = managed_requirement_identity
         # ignore_req_fn(req_id, req_name, ignored, owner_names) - persists a
         # per-requirement ignore into the owning mods' meta.ini (provided by
         # the window). None = no per-requirement Ignore checkboxes.
@@ -326,12 +332,16 @@ class MissingReqsView(QWidget):
         for r in reqs:
             is_external = bool(getattr(r, "is_external", False))
             url = self._req_url(r, is_external)
+            identity = ((getattr(r, "game_domain", "") or self._domain()).strip().lower(),
+                        int(r.mod_id))
+            managed_setup = identity == self._managed_requirement_identity
             card = _ReqCard(
                 p, r, url, is_external, self._open_url, self._install_req,
                 ignored=self._req_ignored(r),
                 on_ignore=(self._toggle_req_ignored
-                           if self._ignore_req_fn is not None else None),
-                enable_target_fn=lambda req=r: self._enable_target(req))
+                           if self._ignore_req_fn is not None and not managed_setup else None),
+                enable_target_fn=lambda req=r: self._enable_target(req),
+                managed_setup=managed_setup)
             self._cards_layout.insertWidget(insert_at, card)
             insert_at += 1
             key = ((getattr(r, "game_domain", "") or self._domain()).strip().lower(),

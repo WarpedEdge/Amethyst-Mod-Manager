@@ -176,6 +176,7 @@ class FfticStatusViewModel:
     available_actions: tuple[str, ...] = ()
     action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
     release: "LoaderRelease | None" = None
+    installed_loader_version: str = ""
 
     def row(self, key: str) -> StatusRow:
         return next(item for item in self.rows if item.key == key)
@@ -202,6 +203,7 @@ class InspectionResult:
     available_actions: tuple[str, ...] = ()
     action_unavailable_reasons: tuple[tuple[str, str], ...] = ()
     release: "LoaderRelease | None" = None
+    installed_loader_version: str = ""
 
 
 ProgressCallback = Callable[[ProgressUpdate], None]
@@ -522,7 +524,8 @@ class DefaultStatusInspector:
                         result.steam_copy_text, result.steam_preserved_options,
                         result.ready, result.verifier_attested, after,
                         result.available_actions,
-                        result.action_unavailable_reasons, result.release)
+                        result.action_unavailable_reasons, result.release,
+                        result.installed_loader_version)
                 if attempt == 0:
                     self._progress(
                         progress, 0, 5,
@@ -1047,7 +1050,12 @@ class DefaultStatusInspector:
             steam_options.preserved_unrelated, ready,
             bool(verification and verification.attested),
             available_actions=available_actions,
-            action_unavailable_reasons=action_reasons, release=release)
+            action_unavailable_reasons=action_reasons, release=release,
+            installed_loader_version=(installed_loader if
+                receipt is not None and verification is not None
+                and verification.artifacts == ReadinessAspect.READY
+                and verification.generation == ReadinessAspect.READY
+                and component_rows["nenkai"].severity == StatusSeverity.READY else ""))
 
     @staticmethod
     def _observation_identity(context: InspectionContext) -> str:
@@ -1158,7 +1166,8 @@ class FfticOrchestrator:
                 observation_sha256=observation,
                 available_actions=available_actions,
                 action_unavailable_reasons=tuple(action_reasons.items()),
-                release=result.release)
+                release=result.release,
+                installed_loader_version=result.installed_loader_version)
         except InspectionCancelled:
             raise
         except Exception as exc:

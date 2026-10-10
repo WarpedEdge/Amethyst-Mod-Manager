@@ -23,6 +23,7 @@ from Utils.filegraph.constants import (
     OVERWRITE_NAME, ROOT_FOLDER_NAME,
     CONFLICT_NONE, CONFLICT_WINS, CONFLICT_LOSES, CONFLICT_PARTIAL, CONFLICT_FULL,
 )
+from gui_qt.modlist_managed import MANAGED_FFTIC_LOADER_ROW, MANAGED_FFTIC_LOADER_NAME
 
 
 # Status checkbox keys (match the Tk _FILTER_CHECKBOXES var_keys 1:1 so the
@@ -99,8 +100,12 @@ class FilterData:
 def _sep_block_range(entries, sep_idx: int) -> range:
     """[sep_idx, end) - the separator plus its non-separator mods until the next
     separator (or end). (No bundle handling - Qt has no bundle separators yet.)"""
+    if entries[sep_idx].name == MANAGED_FFTIC_LOADER_ROW:
+        return range(sep_idx + 1, sep_idx + 1)
     end = sep_idx + 1
     n = len(entries)
+    if end < n and entries[end].name == MANAGED_FFTIC_LOADER_ROW:
+        end += 1
     while end < n and not entries[end].is_separator:
         end += 1
     return range(sep_idx, end)
@@ -227,7 +232,14 @@ def search_hidden_rows(entries, query: str, data: "FilterData | None" = None) ->
 
     hide: set[int] = set()
     for i, e in enumerate(entries):
-        if e.is_separator:
+        if e.name == MANAGED_FFTIC_LOADER_ROW:
+            # This pinned, UI-only component is painted like an installed mod.
+            # Its internal separator shape must not inherit a neighboring block's
+            # search result.
+            label = f"{MANAGED_FFTIC_LOADER_NAME} (Managed)".lower()
+            if tokens or needle not in label:
+                hide.add(i)
+        elif e.is_separator:
             if not _sep_block_has(entries, i, _match):
                 hide.add(i)
         elif not _match(e):
@@ -552,6 +564,11 @@ def compute_hidden_rows(entries, state: dict, data: FilterData) -> set[int]:
         keep = _apply_exclude(entries, keep, lambda e: e.name in ft_ex)
 
     visible = set(keep)
+    # The managed component is a pinned installed row, not a user separator or
+    # a staged mod with filegraph/filter metadata. Keep it visible in the side
+    # filters, including Hide separators; search applies separately above.
+    visible.update(i for i, e in enumerate(entries)
+                   if e.name == MANAGED_FFTIC_LOADER_ROW)
     return {i for i in range(len(entries)) if i not in visible}
 
 

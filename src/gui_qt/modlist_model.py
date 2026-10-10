@@ -26,12 +26,13 @@ from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
 from gui_qt.modlist_sort import (
     DIVIDER_NAME, build_display, uninvert_display, make_divider, is_reverse,
 )
+from gui_qt.modlist_managed import MANAGED_FFTIC_LOADER_ROW, MANAGED_FFTIC_LOADER_NAME
 
 # UI-only boundary separators: pinned + locked, never written to modlist.txt.
 # Overwrite floats at the top, Root Folder at the bottom (Tk parity).
 _BOUNDARY_NAMES = (OVERWRITE_NAME, ROOT_FOLDER_NAME)
-# All UI-only pinned rows: boundaries + the reverse-mode float divider.
-_PINNED_NAMES = _BOUNDARY_NAMES + (DIVIDER_NAME,)
+# All UI-only pinned rows: boundaries, managed component, and float divider.
+_PINNED_NAMES = _BOUNDARY_NAMES + (DIVIDER_NAME, MANAGED_FFTIC_LOADER_ROW)
 
 # Version stamped into a newly created empty mod's meta.ini, and shown in the
 # Version column for it right away.
@@ -117,6 +118,7 @@ class ModListModel(ModGrouping, QAbstractTableModel):
         # ModEntry objects, so per-entry edits need no translation; save()
         # always writes from _natural.
         self._natural: list[ModEntry] = entries or []
+        self._managed_fftic_loader_version = ""
         self._entries: list[ModEntry] = self._natural
         self._priority_by_entry: dict[int, int] | None = None
         # Mod names as of the last load from disk. save() needs it to tell a
@@ -225,14 +227,27 @@ class ModListModel(ModGrouping, QAbstractTableModel):
     def from_modlist(cls, modlist_path, **kw) -> "ModListModel":
         return cls(read_modlist(modlist_path), **kw)
 
-    @staticmethod
-    def _with_boundaries(entries: list[ModEntry]) -> list[ModEntry]:
+    def _with_boundaries(self, entries: list[ModEntry]) -> list[ModEntry]:
         """Wrap raw entries with the pinned Overwrite (top) + Root Folder
         (bottom) boundary separators. They're locked + UI-only."""
         body = [e for e in entries if e.name not in _PINNED_NAMES]
         top = ModEntry(OVERWRITE_NAME, True, True, True)
         bot = ModEntry(ROOT_FOLDER_NAME, True, True, True)
-        return [top] + body + [bot]
+        managed = ([ModEntry(MANAGED_FFTIC_LOADER_ROW, True, True, True)]
+                   if self._managed_fftic_loader_version else [])
+        return [top] + managed + body + [bot]
+
+    def set_managed_fftic_loader_version(self, version: str) -> None:
+        """Show only receipt-verified managed ownership; never persist this row."""
+        version = str(version or "")
+        if version == self._managed_fftic_loader_version:
+            return
+        self._managed_fftic_loader_version = version
+        body = [e for e in self._natural if e.name not in _PINNED_NAMES]
+        self.set_entries(body)
+
+    def managed_row_label(self) -> str:
+        return f"{MANAGED_FFTIC_LOADER_NAME} (Managed)"
 
     def set_entries(self, entries: list[ModEntry], mod_groups=None) -> None:
         self.beginResetModel()
@@ -769,6 +784,9 @@ class ModListModel(ModGrouping, QAbstractTableModel):
 
         if role == EntryRole:
             return e
+        if role == Qt.ToolTipRole and e.name == MANAGED_FFTIC_LOADER_ROW:
+            return (f"{self.managed_row_label()} — installed version "
+                    f"{self._managed_fftic_loader_version}. Managed by FFTIC Setup/Repair.")
         if self.is_group_collapsed(e.name):
             summary_roles = (FlagsRole, ConflictRole, BsaConflictRole, UuidConflictRole)
             if role in summary_roles:
@@ -818,6 +836,10 @@ class ModListModel(ModGrouping, QAbstractTableModel):
             return self._priority_for_row(index.row())
 
         if role == Qt.DisplayRole:
+            if e.name == MANAGED_FFTIC_LOADER_ROW:
+                return (self.managed_row_label() if col == COL_NAME else
+                        self._managed_fftic_loader_version if col == COL_VERSION else
+                        "Managed" if col == COL_CATEGORY else "")
             if e.is_separator:
                 return e.display_name if col == COL_NAME else ""
             if col == COL_NAME:
@@ -850,7 +872,7 @@ class ModListModel(ModGrouping, QAbstractTableModel):
         e = self._entries[index.row()]
         # The reverse-mode float divider is a pure visual marker: enabled only
         # (not selectable, not draggable, not a drop target).
-        if e.name == DIVIDER_NAME:
+        if e.name in (DIVIDER_NAME, MANAGED_FFTIC_LOADER_ROW):
             return Qt.ItemIsEnabled
         # Draggable unless pinned: boundary separators + locked MODS can't be
         # dragged (a regular separator reads as locked=True but IS draggable).
@@ -866,6 +888,9 @@ class ModListModel(ModGrouping, QAbstractTableModel):
         lo, hi = 0, len(self._entries)
         if self._entries and self._entries[0].is_separator and self._entries[0].locked:
             lo = 1
+        if (len(self._entries) > lo
+                and self._entries[lo].name == MANAGED_FFTIC_LOADER_ROW):
+            lo += 1
         if (self._entries and self._entries[-1].is_separator
                 and self._entries[-1].locked):
             hi = len(self._entries) - 1
@@ -1026,7 +1051,7 @@ class ModListModel(ModGrouping, QAbstractTableModel):
 
     def toggle_collapse(self, row: int) -> set[str]:
         e = self._entries[row]
-        if not e.is_separator or e.name == DIVIDER_NAME:
+        if not e.is_separator or e.name in (DIVIDER_NAME, MANAGED_FFTIC_LOADER_ROW):
             return self._collapsed
         name = e.display_name
         if name in self._collapsed:
@@ -1138,6 +1163,7 @@ class ModListModel(ModGrouping, QAbstractTableModel):
             if e.is_separator:
                 collapsing = (not self._separators_hidden
                               and e.name not in _BOUNDARY_NAMES
+                              and e.name != MANAGED_FFTIC_LOADER_ROW
                               and e.display_name in self._collapsed)
             elif collapsing:
                 hidden.add(i)
@@ -1148,10 +1174,16 @@ class ModListModel(ModGrouping, QAbstractTableModel):
 
     def sep_block_rows(self, sep_row: int) -> range:
         """Row range [sep_row+1, next-separator) - the mods a separator owns."""
-        end = sep_row + 1
+        if self._entries[sep_row].name == MANAGED_FFTIC_LOADER_ROW:
+            return range(sep_row + 1, sep_row + 1)
+        start = sep_row + 1
+        if (start < len(self._entries)
+                and self._entries[start].name == MANAGED_FFTIC_LOADER_ROW):
+            start += 1
+        end = start
         while end < len(self._entries) and not self._entries[end].is_separator:
             end += 1
-        return range(sep_row + 1, end)
+        return range(start, end)
 
     def sep_block_priority_range(self, sep_row: int) -> str:
         """Priority range of the mods a separator owns, for the collapsed-

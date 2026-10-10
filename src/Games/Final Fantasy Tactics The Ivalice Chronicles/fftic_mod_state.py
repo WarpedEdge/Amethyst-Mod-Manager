@@ -10,18 +10,20 @@ import json
 try:
     from .fftic_color_state import (ColorWorkingPolicy, ColorStateStore, ColorStateError,
         working_baseline, working_store, _scan, _digest,
-        _path, _read_regular, _copy_state_file, MAX_BYTES, _HASH)
+        _path, _read_regular, _copy_state_file, MAX_FILES, MAX_BYTES, _HASH)
     from .fftic_packages import inspect_package, COMPILED_RUNTIME_EXTENSIONS, _safe_identifier, _safe_relative_path, SUPPORTED_APP_IDS, _CODE_FIELDS
 except ImportError:
     from fftic_color_state import (ColorWorkingPolicy, ColorStateStore, ColorStateError,
         working_baseline, working_store, _scan, _digest,
-        _path, _read_regular, _copy_state_file, MAX_BYTES, _HASH)
+        _path, _read_regular, _copy_state_file, MAX_FILES, MAX_BYTES, _HASH)
     from fftic_packages import inspect_package, COMPILED_RUNTIME_EXTENSIONS, _safe_identifier, _safe_relative_path, SUPPORTED_APP_IDS, _CODE_FIELDS
 
 # Code-like data is never imported from a workspace, even under User. Native
 # entry points and external programs still require a separate package policy.
 CODE_SUFFIXES = COMPILED_RUNTIME_EXTENSIONS | frozenset({
     '.bat', '.cmd', '.ps1', '.sh', '.py', '.pyc', '.js', '.vbs', '.msi', '.wasm', '.jar'})
+MAX_MANAGED_STATE_FILES = 1536
+NEW_MANAGED_STATE_FILES = 256
 
 
 def metadata(manifest):
@@ -43,17 +45,24 @@ def contract_for(package):
     if not result.is_user_content or not result.manifest or not result.manifest.managed_native_declarations:
         raise ColorStateError('Working state requires a validated managed entry package')
     files, _ = _scan(package)
-    return {'schema': 1, **metadata(result.manifest), 'package_sha256': package_identity(files)}
+    original_apps = set(result.manifest.supported_app_ids)
+    selected_apps = [app for app in result.manifest.supported_app_ids if app in SUPPORTED_APP_IDS]
+    if original_apps <= SUPPORTED_APP_IDS:
+        return {'schema': 1, **metadata(result.manifest), 'package_sha256': package_identity(files)}
+    return {'schema': 2, **metadata(result.manifest),
+            'selected_applications': selected_apps,
+            'package_sha256': package_identity(files)}
 
 
 class ModWorkingPolicy(ColorWorkingPolicy):
     """Bound opaque mod data; loader metadata and every code payload stay exact."""
 
     def __init__(self, contract, baseline):
-        if (not isinstance(contract, dict) or set(contract) != {
+        if (not isinstance(contract, dict) or set(contract) != ({
                 'schema', 'mod_id', 'version', 'applications', 'dependencies',
-                'optional_dependencies', 'entry_points', 'package_sha256'}
-                or type(contract['schema']) is not int or contract['schema'] != 1
+                'optional_dependencies', 'entry_points', 'package_sha256'} |
+                ({'selected_applications'} if contract.get('schema') == 2 else set()))
+                or type(contract['schema']) is not int or contract['schema'] not in (1, 2)
                 or not _safe_identifier(contract['mod_id']) or not _safe_relative_path(contract['mod_id'])):
             raise ColorStateError('Invalid mod working-state contract')
         if (not isinstance(contract['version'], str) or not contract['version'].strip()
@@ -65,8 +74,13 @@ class ModWorkingPolicy(ColorWorkingPolicy):
             if (not isinstance(values, list) or any(not _safe_identifier(v) for v in values)
                     or len({v.casefold() for v in values}) != len(values)):
                 raise ColorStateError(f'Invalid working-state {key}')
-        if not contract['applications'] or not set(contract['applications']) <= SUPPORTED_APP_IDS:
-            raise ColorStateError('Working-state contract is not FFTIC-only')
+        applications = set(contract['applications'])
+        selected = [app for app in contract['applications'] if app in SUPPORTED_APP_IDS]
+        if not selected or (contract['schema'] == 1 and not applications <= SUPPORTED_APP_IDS):
+            raise ColorStateError('Working-state contract declares no valid FFTIC application')
+        if contract['schema'] == 2 and (applications <= SUPPORTED_APP_IDS
+                or contract['selected_applications'] != selected):
+            raise ColorStateError('Working-state FFTIC application selection differs from the manifest')
         entries = contract['entry_points']
         if (not isinstance(entries, list) or any(not isinstance(e, list) or len(e) != 2
                 or e[0] not in _CODE_FIELDS or e[0].startswith('ModNative')
@@ -86,6 +100,12 @@ class ModWorkingPolicy(ColorWorkingPolicy):
             raise ColorStateError('Working-state baseline lacks its manifest or entry DLL')
         self.package_dirs = {p[len(self.mod):] for p in dirs if p.startswith(self.mod)}
         self.seed = {p: v for p, v in files.items() if self.mutable(p)}
+        if len(self.seed) > MAX_MANAGED_STATE_FILES:
+            raise ColorStateError('Managed package exceeds bounded writable seed count')
+        # Bind the count to the immutable package seed. Small packages retain
+        # the historical limit; larger data packages get at most 256 new files.
+        self.max_files = min(MAX_MANAGED_STATE_FILES, max(MAX_FILES,
+                                                        len(self.seed) + NEW_MANAGED_STATE_FILES))
 
     def mutable(self, path):
         pure = _path(path)

@@ -3427,7 +3427,8 @@ def _check_nexus_flags_after_install(game, mod_names, log_fn: LogFn,
             return
         from Nexus.nexus_meta import (
             normalise_game_domain, scan_installed_mods, read_meta, write_meta)
-        from Nexus.nexus_requirements import check_requirements_from_gql
+        from Nexus.nexus_requirements import (
+            FFTIC_MANAGED_LOADER_NEXUS_IDENTITY, check_requirements_from_gql)
 
         all_installed = scan_installed_mods(staging_root)
         # The mods we just installed must have a Nexus mod_id to have flags.
@@ -3474,6 +3475,11 @@ def _check_nexus_flags_after_install(game, mod_names, log_fn: LogFn,
                     save_results=True,
                     enabled_only=domain_names,
                     api=api,
+                    # Install-time workers have no verified managed receipt.
+                    # Keep the full requirement for the profile status index,
+                    # but do not stamp a possibly false missing loader flag.
+                    deferred_requirement_ids=(FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[1],)
+                    if domain == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[0] else (),
                 )
 
             # viewerEndorsed is keyed by same-domain mod id.

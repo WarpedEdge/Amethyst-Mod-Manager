@@ -63,6 +63,9 @@ def build_context_menu(view, index):
         return None
     row = index.row()
     entry = model.entry(row)
+    from gui_qt.modlist_model import MANAGED_FFTIC_LOADER_ROW
+    if entry.name == MANAGED_FFTIC_LOADER_ROW:
+        return None
     # Fresh meta.ini memo per build - the gate helpers re-read the same metas
     # many times per selected mod (see _read_mod_meta).
     view._menu_meta_cache = {}

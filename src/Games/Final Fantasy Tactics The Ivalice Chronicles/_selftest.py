@@ -1006,12 +1006,61 @@ def test_nexus_browser_install_contract() -> None:
     assert not button.visible
 
 
+def test_nexus_install_managed_requirement_flags() -> None:
+    from Nexus.nexus_api import NexusModRequirement, NexusModUpdateInfo
+    from Nexus.nexus_meta import NexusModMeta, read_meta, write_meta
+    from Nexus.nexus_requirements import (
+        FFTIC_MANAGED_LOADER_NEXUS_IDENTITY, RequirementIndex)
+    from Utils.mods.install import _check_nexus_flags_after_install
+
+    domain, loader_id = FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+    staging = _ROOT / "nexus-managed-requirements"
+    mod_path = staging / "Ramza Overhaul"
+    mod_path.mkdir(parents=True)
+    meta_path = mod_path / "meta.ini"
+    write_meta(meta_path, NexusModMeta(
+        mod_name=mod_path.name, game_domain=domain, mod_id=22,
+        missing_requirements="4:FFT Mod Loader"))
+    game = SimpleNamespace(nexus_game_domain=domain,
+                           get_effective_mod_staging_path=lambda: staging)
+    api = SimpleNamespace(graphql_mod_update_info_batch=lambda _ids: {
+        22: NexusModUpdateInfo(22, "Ramza Overhaul", "1.0", requirements=[
+            NexusModRequirement(loader_id, "FFT Mod Loader", domain),
+            NexusModRequirement(56, "Other API", domain)])})
+    log = []
+    with (patch("Utils.mods.install._build_nexus_api", return_value=api),
+          patch("Nexus.nexus_file_requirements.compute_file_level_all",
+                return_value={}),
+          patch("Nexus.nexus_requirements._load_requirement_filter",
+                return_value=(set(), {}, {}))):
+        _check_nexus_flags_after_install(game, mod_path.name, log.append)
+    meta = read_meta(meta_path)
+    assert meta.nexus_requirements == "4:FFT Mod Loader;56:Other API"
+    assert meta.missing_requirements == "56:Other API", log
+    # The saved full list resolves against current managed ownership, without
+    # relying on a staged copy or a stale install-time receipt guess.
+    for providers, expected in (((), {4, 56}),
+                                ((FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,), {56})):
+        index = RequirementIndex({mod_path.name}, domain, providers)
+        index.refresh({mod_path.name: meta})
+        assert {mod_id for mod_id, _ in index.missing[mod_path.name]} == expected
+
+    # The same Nexus numeric ID belongs to another game independently.
+    other = RequirementIndex({mod_path.name}, "skyrimspecialedition",
+                             (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,))
+    other.refresh({mod_path.name: NexusModMeta(
+        mod_name=mod_path.name, game_domain="skyrimspecialedition", mod_id=22,
+        nexus_requirements="4:Other game's mod")})
+    assert {mod_id for mod_id, _ in other.missing[mod_path.name]} == {4}
+
+
 def main() -> None:
     tests = [
         test_collision_safe_discovery_imports,
         test_identity_detection_and_cache_contract,
         test_package_recognition,
         test_nexus_browser_install_contract,
+        test_nexus_install_managed_requirement_flags,
         test_special_file_manifest,
         test_managed_code_packages,
         test_color_customizer_configuration_boundary,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from Utils.mods.modlist import ModEntry
 from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
+from gui_qt.modlist_managed import MANAGED_FFTIC_LOADER_ROW
 
 # The reverse-mode divider between the last user group and the ungrouped
 # float. UI-only: lives in the display list, never in the natural list, and is
@@ -49,6 +50,8 @@ def split_groups(entries: list[ModEntry]) -> list[tuple[ModEntry | None,
     cur_sep: ModEntry | None = None
     cur_mods: list[ModEntry] = []
     for e in entries:
+        if e.name == MANAGED_FFTIC_LOADER_ROW:
+            continue
         if e.is_separator:
             if cur_sep is not None or cur_mods:
                 groups.append((cur_sep, cur_mods))
@@ -181,6 +184,15 @@ def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
     separators are appended at the end (hidden by the filter anyway) so the
     natural round-trip and boundary handling stay intact. The special
     reverse-priority mode is unaffected - its grouping is intrinsic."""
+    managed = next((e for e in natural if e.name == MANAGED_FFTIC_LOADER_ROW), None)
+    if managed is not None:
+        # Keep the managed component visible beside the leading boundary while
+        # excluding it from sorting, separator groups and user priorities.
+        body = [e for e in natural if e.name != MANAGED_FFTIC_LOADER_ROW]
+        display = build_display(body, key, ascending, ctx, divider,
+                                flatten_groups, mod_groups)
+        display.insert(1 if display and display[0].is_separator else 0, managed)
+        return display
     if mod_groups:
         from Utils.mods.groups import blocks, owners
         membership = owners(mod_groups)
@@ -262,6 +274,7 @@ def uninvert_display(display: list[ModEntry]) -> list[ModEntry]:
     """Convert a reverse-mode display list back to natural order (Tk
     _uninvert_entries_order). The divider entry is dropped; its group becomes
     the ungrouped float between Overwrite and the first user group."""
+    managed = next((e for e in display if e.name == MANAGED_FFTIC_LOADER_ROW), None)
     groups = split_groups(display)
     ow = rf = None
     middle: list[tuple[ModEntry | None, list[ModEntry]]] = []
@@ -300,6 +313,10 @@ def uninvert_display(display: list[ModEntry]) -> list[ModEntry]:
         if sep is not None:
             out.append(sep)
         out.extend(reversed(mods))
+    if managed is not None:
+        at = next((i + 1 for i, e in enumerate(out)
+                   if e.name == OVERWRITE_NAME), 0)
+        out.insert(at, managed)
     return out
 
 
@@ -333,16 +350,19 @@ def resolve_reverse_drop(entries: list[ModEntry], slot: int,
     n = len(entries)
     slot = max(0, min(slot, n))
     below = next((i for i in range(slot, n)
-                  if i not in src and i not in hidden), None)
+                  if i not in src and i not in hidden
+                  and entries[i].name != MANAGED_FFTIC_LOADER_ROW), None)
 
     rf_idx = next((i for i, e in enumerate(entries)
                    if e.is_separator and e.name == ROOT_FOLDER_NAME), None)
     first_user_sep = None
-    if (rf_idx is not None and rf_idx + 1 < n
-            and entries[rf_idx + 1].is_separator
-            and entries[rf_idx + 1].name not in (OVERWRITE_NAME,
+    after_root = rf_idx + 1 if rf_idx is not None else n
+    if (after_root < n and entries[after_root].name == MANAGED_FFTIC_LOADER_ROW):
+        after_root += 1
+    if (after_root < n and entries[after_root].is_separator
+            and entries[after_root].name not in (OVERWRITE_NAME,
                                                  DIVIDER_NAME)):
-        first_user_sep = rf_idx + 1
+        first_user_sep = after_root
 
     if below is None:
         ins = n

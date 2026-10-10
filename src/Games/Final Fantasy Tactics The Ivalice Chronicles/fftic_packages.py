@@ -35,6 +35,14 @@ _CODE_FIELDS = (
     "ModDll", "ModR2RManagedDll32", "ModR2RManagedDll64",
     "ModNativeDll32", "ModNativeDll64",
 )
+_NATIVE_RID_MACHINES = {
+    'win-x86': (0x14c, 0x10b),
+    'win-x64': (0x8664, 0x20b),
+    'win-arm': (0x1c4, 0x10b),
+    'win-arm64': (0xaa64, 0x20b),
+}
+_MAX_NATIVE_DEPENDENCIES = 32
+_MAX_NATIVE_DEPENDENCY_BYTES = 64 * 1024 * 1024
 
 
 class PackageClassification(str, Enum):
@@ -235,6 +243,97 @@ def is_managed_dll(path: Path) -> bool:
         return False
 
 
+def _is_native_dependency_dll(path: Path, rid: str) -> bool:
+    """Check a declared RID's native PE shape without loading the DLL."""
+    try:
+        with path.open('rb') as stream:
+            if stream.read(2) != b'MZ':
+                return False
+            stream.seek(0x3c)
+            pe_offset = struct.unpack('<I', stream.read(4))[0]
+            if pe_offset < 64 or pe_offset > path.stat().st_size - 24:
+                return False
+            stream.seek(pe_offset)
+            header = stream.read(24)
+            if len(header) != 24 or header[:4] != b'PE\0\0':
+                return False
+            machine = struct.unpack_from('<H', header, 4)[0]
+            sections = struct.unpack_from('<H', header, 6)[0]
+            optional_size, characteristics = struct.unpack_from('<HH', header, 20)
+            if (machine != _NATIVE_RID_MACHINES[rid][0] or not characteristics & 0x2000
+                    or not 1 <= sections <= 96 or optional_size < 96):
+                return False
+            optional = stream.read(optional_size)
+            if (len(optional) != optional_size or
+                    struct.unpack_from('<H', optional)[0] != _NATIVE_RID_MACHINES[rid][1]):
+                return False
+            directory = 112 if _NATIVE_RID_MACHINES[rid][1] == 0x20b else 96
+            if (len(optional) < directory + 15 * 8
+                    or struct.unpack_from('<I', optional, directory - 4)[0] < 15):
+                return False
+            clr_rva, clr_size = struct.unpack_from('<II', optional, directory + 14 * 8)
+            return clr_rva == 0 and clr_size == 0
+    except (OSError, KeyError, ValueError, struct.error):
+        return False
+
+
+def _declared_native_dependencies(root: Path, entry: str, package_files: list[str]):
+    """Validate exact native RID targets from the managed entry's deps manifest."""
+    deps = str(PurePosixPath(entry).with_suffix('.deps.json'))
+    if deps not in package_files:
+        return set(), 'managed entry has no matching .deps.json native declaration'
+    path = root / deps
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError('.deps.json exceeds 2 MiB')
+        def unique_pairs(pairs):
+            values = {}
+            for key, value in pairs:
+                if key in values:
+                    raise ValueError(f'duplicate .deps.json key {key!r}')
+                values[key] = value
+            return values
+        document = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=unique_pairs)
+        targets = document['targets']
+        libraries = document['libraries']
+        if not isinstance(targets, dict) or not isinstance(libraries, dict) or len(targets) != 1:
+            raise ValueError('invalid .deps.json target or library map')
+        dependencies = set()
+        for target in targets.values():
+            if not isinstance(target, dict):
+                raise ValueError('invalid .deps.json target')
+            for library, details in target.items():
+                if not isinstance(details, dict):
+                    raise ValueError('invalid .deps.json library')
+                declared = details.get('runtimeTargets', {})
+                if not isinstance(declared, dict):
+                    raise ValueError('invalid native runtime targets')
+                for rel, record in declared.items():
+                    if not isinstance(record, dict) or record.get('assetType') != 'native':
+                        continue
+                    parts = PurePosixPath(rel).parts
+                    if (library not in libraries or not isinstance(libraries[library], dict)
+                            or libraries[library].get('type') != 'package'
+                            or len(parts) != 4 or parts[0] != 'runtimes'
+                            or parts[1] not in _NATIVE_RID_MACHINES or parts[2] != 'native'
+                            or PurePosixPath(rel).suffix.casefold() != '.dll'
+                            or not _safe_relative_path(rel) or rel not in package_files):
+                        raise ValueError(f'unsafe or missing declared native target {rel!r}')
+                    if rel in dependencies:
+                        raise ValueError(f'duplicate native target {rel!r}')
+                    dependencies.add(rel)
+        if not dependencies or len(dependencies) > _MAX_NATIVE_DEPENDENCIES:
+            raise ValueError('native target count is empty or exceeds bound')
+        if sum((root / rel).stat().st_size for rel in dependencies) > _MAX_NATIVE_DEPENDENCY_BYTES:
+            raise ValueError('native target bytes exceed bound')
+        for rel in dependencies:
+            if not _is_native_dependency_dll(root / rel, PurePosixPath(rel).parts[1]):
+                raise ValueError(f'native DLL does not match declared RID: {rel}')
+        return dependencies, None
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        return set(), str(exc)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -398,13 +497,12 @@ def inspect_package(root: Path) -> PackageResult:
         return PackageResult(PackageClassification.MANAGED_INTERNAL, manifest,
                              (f"{mod_id!r} is managed internally and cannot be a profile mod.",),
                              tuple(sorted(payloads)))
-    supported_set = set(supported)
-    unknown = supported_set - SUPPORTED_APP_IDS
-    if not supported_set or unknown:
+    supported_set = set(supported) & SUPPORTED_APP_IDS
+    if not supported_set:
         exact = ", ".join(repr(value) for value in supported) or "<empty>"
         return PackageResult(PackageClassification.UNSUPPORTED_APPLICATION, manifest,
-                             (f"{name} ({mod_id}) at {source}: SupportedAppId is not an "
-                              f"FFTIC-only set: {exact}.",),
+                             (f"{name} ({mod_id}) at {source}: SupportedAppId declares "
+                              f"no FFTIC application: {exact}.",),
                              tuple(sorted(payloads)))
     compiled_files = [
         path for path in package_files
@@ -426,6 +524,14 @@ def inspect_package(root: Path) -> PackageResult:
     if not reviewed_color and not (mod_id.casefold() == _COLOR_ID and version == '3.3.0'):
         unknown_dlls = [p for p in compiled_files if PurePosixPath(p).suffix.casefold() == '.dll'
                         and not is_managed_dll(root / p)]
+        if unknown_dlls and declared_dll:
+            native_dependencies, native_error = _declared_native_dependencies(
+                root, declared_dll, package_files)
+            if native_error is None:
+                managed_entries = {value for key, value in declarations
+                                   if key in {'ModDll', 'ModR2RManagedDll32', 'ModR2RManagedDll64'}}
+                unknown_dlls = [p for p in unknown_dlls
+                                if p not in native_dependencies or p in managed_entries]
         scripts = [p for p in package_files if PurePosixPath(p).suffix.casefold() in {
             '.bat', '.cmd', '.ps1', '.sh', '.py', '.pyc', '.js', '.vbs', '.msi', '.wasm', '.jar'}]
         disguised = []

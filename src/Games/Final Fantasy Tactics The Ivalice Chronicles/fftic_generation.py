@@ -17,7 +17,7 @@ try:
     from .fftic_color_state import ColorWorkingPolicy, working_baseline, _COLOR_ID
     from .fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from .fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
-    from .fftic_packages import PackageClassification, inspect_package
+    from .fftic_packages import PackageClassification, SUPPORTED_APP_IDS, inspect_package
     from .fftic_reloaded_config import (
         MANAGED_ORDER, Mode, UserMod, ValidatedSteamPath, _compatible,
         generate_reloaded_configuration,
@@ -30,7 +30,7 @@ except ImportError:
     from fftic_color_state import ColorWorkingPolicy, working_baseline, _COLOR_ID
     from fftic_artifacts import ARTIFACTS, INTERNAL_FILES, loader_pin, loader_pin_from_digest
     from fftic_detection import VERIFIED_HASHES, VERIFIED_STEAM_BUILD, VERIFIED_UI_VERSION
-    from fftic_packages import PackageClassification, inspect_package
+    from fftic_packages import PackageClassification, SUPPORTED_APP_IDS, inspect_package
     from fftic_reloaded_config import (
         MANAGED_ORDER, Mode, UserMod, ValidatedSteamPath, _compatible,
         generate_reloaded_configuration,
@@ -419,6 +419,9 @@ def verify_private_generation(root: Path, expected_generation_id: str | None = N
                              'ModNativeDll32', 'ModNativeDll64') if config.get(k)]}
         if any(contract.get(k) != v for k, v in expected_metadata.items()):
             raise GenerationError('Working-copy metadata differs from immutable manifest')
+        if contract['schema'] == 2 and contract['selected_applications'] != [
+                app for app in expected_metadata['applications'] if app in SUPPORTED_APP_IDS]:
+            raise GenerationError('Working-copy FFTIC application selection differs from immutable manifest')
         if binding['transfer'] is not None:
             transfer = _exact_dict(binding['transfer'], {'contract', 'revision'}, 'version transfer')
             if not _HASH.fullmatch(transfer['revision']) or transfer['contract']['mod_id'] != contract['mod_id']:

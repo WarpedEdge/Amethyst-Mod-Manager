@@ -91,6 +91,7 @@ py.install_sources(
   'modlist_data.py',
   'modlist_delegate.py',
   'modlist_filter.py',
+  'modlist_managed.py',
   'modlist_header.py',
   'modlist_menu.py',
   'modlist_model.py',

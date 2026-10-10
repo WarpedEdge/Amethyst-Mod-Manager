@@ -211,6 +211,7 @@ def check_for_updates(
     save_results: bool = True,
     enabled_only: Optional[set] = None,
     max_workers: int = 10,
+    managed_providers=(),
 ) -> tuple[list["UpdateInfo"], list["MissingRequirementInfo"]]:
     """Check installed mods in domain-qualified batches.
 
@@ -263,7 +264,8 @@ def check_for_updates(
                 save_results=save_results, enabled_only=names,
                 max_workers=max_workers,
                 installed_mods=installed,
-                endorsements_cb=get_endorsements, write_meta_cb=queue_meta)
+                endorsements_cb=get_endorsements, write_meta_cb=queue_meta,
+                managed_providers=managed_providers)
             updates.extend(domain_updates)
             missing.extend(domain_missing)
     finally:
@@ -294,6 +296,7 @@ def _check_for_updates_one_domain(
     installed_mods: Optional[list[NexusModMeta]] = None,
     endorsements_cb: Optional[Callable[[], list[dict]]] = None,
     write_meta_cb: Optional[Callable[[Path, NexusModMeta], None]] = None,
+    managed_providers=(),
 ) -> tuple[list["UpdateInfo"], list["MissingRequirementInfo"]]:
     """
     Check all Nexus-sourced mods under *staging_root* for updates and missing
@@ -761,6 +764,7 @@ def _check_for_updates_one_domain(
         enabled_only=enabled_only,
         api=api,
         write_meta_cb=save_meta,
+        managed_providers=managed_providers,
     )
 
     return updates, missing_reqs

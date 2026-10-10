@@ -24,7 +24,7 @@ from gui_qt.tooltips import wrap_tooltip
 from gui_qt.modlist_model import (
     EntryRole, ConflictRole, BsaConflictRole, UuidConflictRole, FlagsRole,
     HighlightRole, ContentRole,
-    COL_NAME, COL_FLAGS, COL_CONFLICTS, COL_VERSION, COL_PRIORITY, COL_CONTENT,
+    COL_NAME, COL_CATEGORY, COL_FLAGS, COL_CONFLICTS, COL_VERSION, COL_PRIORITY, COL_CONTENT,
 )
 from gui_qt.modlist_content import BADGE_LABELS
 from gui_qt.modlist_data import (
@@ -361,7 +361,9 @@ class ModRowDelegate(QStyledItemDelegate):
 
     def sizeHint(self, opt, index):
         e = index.data(EntryRole)
-        h = SEP_H if (e and e.is_separator) else ROW_H
+        from gui_qt.modlist_model import MANAGED_FFTIC_LOADER_ROW
+        h = SEP_H if (e and e.is_separator
+                      and e.name != MANAGED_FFTIC_LOADER_ROW) else ROW_H
         if index.row() in getattr(self.parent(), "_group_end_markers", {}):
             h += SEP_H
         return QSize(opt.rect.width(), h)
@@ -384,6 +386,28 @@ class ModRowDelegate(QStyledItemDelegate):
             r.setHeight(r.height() - SEP_H)
         p.save()
         p.setRenderHint(p.RenderHint.Antialiasing, False)
+
+        # The managed loader is a separator only for action/persistence safety.
+        # Present it as an installed mod with separate Name, Category and Version
+        # cells, leaving the checkbox and priority cells empty.
+        from gui_qt.modlist_model import MANAGED_FFTIC_LOADER_ROW
+        if e.name == MANAGED_FFTIC_LOADER_ROW:
+            p.fillRect(r, self.c_row_alt if self.parent().is_alternate_row(index.row())
+                       else self.c_row)
+            p.setPen(self.c_text)
+            p.setFont(self.f_row)
+            if index.column() == COL_NAME:
+                lock = QRect(r.left() + 10, r.top(), 20, r.height())
+                p.drawText(lock, Qt.AlignVCenter | Qt.AlignLeft, "\U0001F512")
+                label = QRect(r.left() + 35, r.top(), max(0, r.width() - 41), r.height())
+                p.drawText(label, Qt.AlignVCenter | Qt.AlignLeft,
+                           self.fm_row.elidedText(index.data(Qt.DisplayRole) or "",
+                                                  Qt.ElideRight, label.width()))
+            elif index.column() in (COL_VERSION, COL_CATEGORY):
+                label = QRect(r.left() + 6, r.top(), max(0, r.width() - 12), r.height())
+                p.drawText(label, _ALIGN_CENTER, index.data(Qt.DisplayRole) or "")
+            p.restore()
+            return
 
         # Separator: paint a full band only on the name column; blank elsewhere
         # so the band reads as one strip across the row. A collapsed separator
@@ -916,6 +940,12 @@ class ModRowDelegate(QStyledItemDelegate):
         try:
             if event.type() == QEvent.ToolTip and index.isValid():
                 entry = index.data(EntryRole)
+                from gui_qt.modlist_model import MANAGED_FFTIC_LOADER_ROW
+                if entry is not None and entry.name == MANAGED_FFTIC_LOADER_ROW:
+                    QToolTip.showText(event.globalPos(),
+                                      wrap_tooltip(index.data(Qt.ToolTipRole)),
+                                      view, opt.rect)
+                    return True
                 if (entry is not None and index.model().is_group_collapsed(entry.name)
                         and index.column() in (COL_FLAGS, COL_CONFLICTS)):
                     if index.column() == COL_FLAGS:

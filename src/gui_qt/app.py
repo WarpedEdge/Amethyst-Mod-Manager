@@ -8766,6 +8766,9 @@ class MainWindow(QMainWindow):
 
         import threading
         from Nexus.nexus_update_checker import check_for_updates
+        from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+        managed_providers = ((FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)
+                             if getattr(self, "_fftic_managed_loader_ready", False) else ())
 
         def _worker():
             # Carry the checked subset (None = all) so _on_updates_ready can do a
@@ -8817,6 +8820,7 @@ class MainWindow(QMainWindow):
                         out["nexus"] = check_for_updates(
                             api, staging, game_domain=domain, save_results=True,
                             enabled_only=subset,
+                            managed_providers=managed_providers,
                             progress_cb=lambda m: self._append_log(f"[nexus] {m}"),
                         )
                     except Exception as exc:
@@ -10392,6 +10396,15 @@ class MainWindow(QMainWindow):
             return
         api = self._ensure_nexus_api()
         if api is None:
+            from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+            missing = [(normalise_game_domain(spec["domain"]), mid)
+                       for spec in specs for mid in spec["missing_ids"]]
+            if missing and all(identity == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+                               for identity in missing):
+                self._install_nexus_mod_by_id(
+                    FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[1],
+                    FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[0], "FFTIC Mod Loader")
+                return
             self._notify(self.tr("Log in first: Settings ▸ Connections ▸ Nexus ▸ Login via SSO."),
                          "warning")
             return
@@ -10416,7 +10429,10 @@ class MainWindow(QMainWindow):
             install_fn=self._install_nexus_mod_by_id,
             ignore_req_fn=self._set_req_ignored,
             enable_target_fn=self._disabled_requirement_mod,
-            enable_fn=self._enable_requirement_mod)
+            enable_fn=self._enable_requirement_mod,
+            managed_requirement_identity=(
+                "finalfantasytacticstheivalicechronicles", 4)
+            if self._fftic_context() is not None else None)
         self._missing_reqs_view = view
         view.prune_installed({key for key, providers in requirement_index.providers.items()
                               if providers})
@@ -10428,10 +10444,13 @@ class MainWindow(QMainWindow):
 
     def _disabled_requirement_mod(self, mod_id, domain):
         from Nexus.nexus_meta import normalise_game_domain
+        from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
         index = getattr(self, "_requirement_index", None)
         if index is None:
             return None
         identity = normalise_game_domain(domain), int(mod_id)
+        if identity == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY:
+            return None
         if index.providers.get(identity):
             return None
         return next(iter(index.installed.get(identity, ())), None)
@@ -11396,6 +11415,21 @@ class MainWindow(QMainWindow):
             self._append_log(f"[download] cancellation failed: {exc}")
 
     def _install_nexus_mod_by_id(self, mod_id: int, domain: str, name: str):
+        from Nexus.nexus_meta import normalise_game_domain
+        from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+        if (normalise_game_domain(domain), int(mod_id or 0)) == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY:
+            if self._fftic_context() is None:
+                return
+            status = getattr(self._fftic_status_controller, "last_status", None)
+            action = "setup"
+            if status is not None and not status.error:
+                try:
+                    if status.row("nenkai").state != "Not installed":
+                        action = "repair"
+                except (KeyError, StopIteration):
+                    pass
+            self._present_fftic_action(action)
+            return
         if self._req_installing:
             self._notify(self.tr("An install is already in progress."), "info")
             return
@@ -18384,6 +18418,9 @@ class MainWindow(QMainWindow):
         # game/profile SWITCH the shown mod may not exist, so we drop it.
         prev_context = (self._gs.game_name, self._gs.profile_dir())
         context_changed = prev_context != getattr(self, "_modlist_context", None)
+        if context_changed:
+            self._modlist_model.set_managed_fftic_loader_version("")
+            self._fftic_managed_loader_ready = False
         keep_mod_files = None
         if not context_changed:
             mfv = getattr(self, "_mod_files_view", None)
@@ -18618,10 +18655,13 @@ class MainWindow(QMainWindow):
             pdir_meta = self._gs.profile_dir()
             is_bg3 = (getattr(self._gs.game, "game_id", "") == "baldurs_gate_3")
             meta_entries = list(entries)
-            from Nexus.nexus_requirements import RequirementIndex
+            from Nexus.nexus_requirements import (
+                RequirementIndex, FFTIC_MANAGED_LOADER_NEXUS_IDENTITY)
             requirement_index = RequirementIndex(
                 (e.name for e in meta_entries if e.enabled and not e.is_separator),
-                getattr(self._gs.game, "nexus_game_domain", "") or "")
+                getattr(self._gs.game, "nexus_game_domain", "") or "",
+                (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)
+                if getattr(self, "_fftic_managed_loader_ready", False) else ())
             startup_meta = startup_timing
             if startup_meta is not None:
                 startup_meta_timings = getattr(
@@ -18734,6 +18774,10 @@ class MainWindow(QMainWindow):
                     phase_started=callback_started, category="mod data")
             return
         payload, self._requirement_index = payload
+        from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+        self._requirement_index.set_managed_providers(
+            (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)
+            if getattr(self, "_fftic_managed_loader_ready", False) else ())
         (versions, installed, flags, categories, updates,
          fomod, bain, missing_reqs, descriptions, authors, source_locations,
          nexus_mod_ids, nexus_file_ids) = payload
@@ -19044,7 +19088,8 @@ class MainWindow(QMainWindow):
         if staging is None:
             return
         subset = set(names) if names else None
-        from Nexus.nexus_requirements import RequirementIndex
+        from Nexus.nexus_requirements import (
+            RequirementIndex, FFTIC_MANAGED_LOADER_NEXUS_IDENTITY)
         requirement_index = getattr(self, "_requirement_index", None)
         if requirement_index is None:
             subset = None
@@ -19052,7 +19097,9 @@ class MainWindow(QMainWindow):
             requirement_index = RequirementIndex(
                 (e.name for e in self._modlist_model.natural_entries()
                  if e.enabled and not e.is_separator),
-                getattr(self._gs.game, "nexus_game_domain", "") or "")
+                getattr(self._gs.game, "nexus_game_domain", "") or "",
+                (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,)
+                if getattr(self, "_fftic_managed_loader_ready", False) else ())
         entries = [e for r in range(self._modlist_model.rowCount())
                    if (e := self._modlist_model.entry(r)) is not None
                    and (subset is None or e.name in subset)]
@@ -20654,6 +20701,8 @@ class MainWindow(QMainWindow):
             self._fftic_status_context = None
             self._fftic_status_jobs.discard_pending()
             panel.clear()
+            self._modlist_model.set_managed_fftic_loader_version("")
+            self._fftic_managed_loader_ready = False
             return
         import threading
         cancel = threading.Event()
@@ -20712,6 +20761,24 @@ class MainWindow(QMainWindow):
         self._fftic_status_cancel = None
         self._fftic_initial_status_ready = True
         panel.set_status(model)
+        modlist = getattr(self, "_modlist_model", None)
+        if modlist is not None:
+            version = "" if model.error else getattr(model, "installed_loader_version", "")
+            if version != modlist._managed_fftic_loader_version:
+                modlist.set_managed_fftic_loader_version(version)
+                self._apply_modlist_filters()
+                self._apply_modlist_search()
+                self._modlist_view._apply_separator_spanning()
+        loader_ready = bool(not model.error and getattr(model, "installed_loader_version", ""))
+        if loader_ready != getattr(self, "_fftic_managed_loader_ready", False):
+            self._fftic_managed_loader_ready = loader_ready
+            index = getattr(self, "_requirement_index", None)
+            if index is not None:
+                from Nexus.nexus_requirements import FFTIC_MANAGED_LOADER_NEXUS_IDENTITY
+                affected = index.set_managed_providers(
+                    (FFTIC_MANAGED_LOADER_NEXUS_IDENTITY,) if loader_ready else ())
+                if affected:
+                    self._refresh_modlist_flags(affected)
         release = getattr(model, "release", None)
         if release is not None:
             try:

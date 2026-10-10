@@ -216,6 +216,7 @@ class ColorSnapshot:
 
 class Color330Policy:
     """Derive literal paths only from a rehashed exact pristine release tree."""
+    max_files = MAX_FILES
 
     def __init__(self, pristine_package):
         self.package = _canonical(pristine_package)
@@ -399,7 +400,7 @@ class Color330Policy:
         if not self._pristine_destination(generation, baseline):
             raise ColorStateError("Restore destination is not the exact pristine generation")
         expected = {path: (size, digest) for path, size, digest in snapshot.files}
-        actual, dirs = _scan(payload_root, max_files=MAX_FILES, max_bytes=MAX_BYTES)
+        actual, dirs = _scan(payload_root, max_files=self.max_files, max_bytes=MAX_BYTES)
         if actual != expected or dirs != _parents(expected):
             raise ColorStateError("Retained mutable payload drift")
         self._validate_inputs(Path(payload_root), actual)
@@ -547,7 +548,7 @@ class ColorStateStore:
         except (TypeError, ValueError) as exc:
             raise ColorStateError("Invalid retained revision schema") from exc
         expected = {path: (size, digest) for path, size, digest in snapshot.files}
-        files, dirs = _scan(root / 'payload', max_files=MAX_FILES, max_bytes=MAX_BYTES)
+        files, dirs = _scan(root / 'payload', max_files=self.policy.max_files, max_bytes=MAX_BYTES)
         if files != expected or dirs != _parents(expected):
             raise ColorStateError("Retained revision payload changed")
         if {p.name for p in root.iterdir()} != {'revision.json', 'payload'}:
@@ -586,7 +587,7 @@ class ColorStateStore:
                 self._stopped(process_running)
                 if self.policy.inspect(generation, baseline) != snapshot:
                     raise ColorStateError("Generation changed during capture")
-                files, dirs = _scan(stage / 'payload', max_files=MAX_FILES, max_bytes=MAX_BYTES)
+                files, dirs = _scan(stage / 'payload', max_files=self.policy.max_files, max_bytes=MAX_BYTES)
                 if files != {p: (s, h) for p, s, h in snapshot.files} or dirs != _parents(files):
                     raise ColorStateError("Mutable files changed during capture")
                 for path in stage.rglob('*'):
@@ -720,7 +721,7 @@ class ColorStateStore:
                 for path in sorted((p for p in stage.rglob('*') if p.is_dir()), reverse=True):
                     _sync_dir(path)
                 _sync_dir(stage)
-                if _scan(stage / 'payload', max_files=MAX_FILES, max_bytes=MAX_BYTES)[0] != {
+                if _scan(stage / 'payload', max_files=self.policy.max_files, max_bytes=MAX_BYTES)[0] != {
                         p: (s, h) for p, s, h in snapshot.files}:
                     raise ColorStateError("Export copy differs")
                 _publish_directory(stage, destination)
@@ -855,7 +856,7 @@ class ColorWorkingPolicy(Color330Policy):
         return snapshot
 
     def validate_snapshot(self, snapshot):
-        if len(snapshot.files) > MAX_FILES or sum(v[1] for v in snapshot.files) > MAX_BYTES:
+        if len(snapshot.files) > self.max_files or sum(v[1] for v in snapshot.files) > MAX_BYTES:
             raise ColorStateError('Working state budget exceeded; files remain preserved')
         paths = []
         for path, size, digest in snapshot.files:

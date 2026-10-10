@@ -643,9 +643,11 @@ class ModListView(QTreeView):
         """Separator rows span all columns so the band + centred name + the
         right-side lock box use the full row width."""
         m = self.model()
+        from gui_qt.modlist_model import MANAGED_FFTIC_LOADER_ROW
         for r in range(m.rowCount()):
             self.setFirstColumnSpanned(r, self.rootIndex(),
-                                       m.entry(r).is_separator)
+                                       m.entry(r).is_separator
+                                       and m.entry(r).name != MANAGED_FFTIC_LOADER_ROW)
 
     def is_alternate_row(self, row: int) -> bool:
         parity = self._stripe_parity

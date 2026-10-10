@@ -254,12 +254,18 @@ def load_requirement_substitutions(game_domain: str = "") -> dict[int, tuple[int
     return _substitutions_for_game(game_domain, load_local_requirement_filter()[2])
 
 
+FFTIC_MANAGED_LOADER_NEXUS_IDENTITY = (
+    "finalfantasytacticstheivalicechronicles", 4)
+
+
 class RequirementIndex:
     """Profile-local dependency graph; toggles visit only affected dependents."""
 
-    def __init__(self, enabled_names=(), game_domain: str = ""):
+    def __init__(self, enabled_names=(), game_domain: str = "",
+                 managed_providers=()):
         self.enabled = set(enabled_names)
         self.game_domain = normalise_game_domain(game_domain)
+        self.managed_providers = set(managed_providers)
         self.metas: dict[str, NexusModMeta] = {}
         self.identities = {}
         self.installed = {}
@@ -286,7 +292,7 @@ class RequirementIndex:
                 identity = domain, meta.mod_id
                 self.identities[name] = identity
                 self.installed.setdefault(identity, []).append(name)
-                if name in self.enabled:
+                if name in self.enabled and identity != FFTIC_MANAGED_LOADER_NEXUS_IDENTITY:
                     self.providers.setdefault(identity, set()).add(name)
             subs = _substitutions_for_game(domain, substitutions)
             self.ignored[name] = {
@@ -307,6 +313,8 @@ class RequirementIndex:
                 for identity in candidates:
                     self.dependents.setdefault(identity, set()).add(name)
             self.requirements[name] = reqs
+        for identity in self.managed_providers:
+            self.providers.setdefault(identity, set()).add("<managed>")
         self._recompute(self.metas)
         # Reconcile disk after a reload, including a superseded writer/profile.
         self.dirty.update(name for name, meta in self.metas.items()
@@ -319,6 +327,8 @@ class RequirementIndex:
             identity = self.identities.get(name)
             if identity is None:
                 continue
+            if identity == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY:
+                continue
             providers = self.providers.setdefault(identity, set())
             was_available = bool(providers)
             if name in enabled:
@@ -328,6 +338,21 @@ class RequirementIndex:
             if was_available != bool(providers):
                 affected.update(self.dependents.get(identity, ()))
         self.enabled = enabled
+        self._recompute(affected)
+        return affected
+
+    def set_managed_providers(self, identities):
+        """Refresh verified, non-staged providers without changing modlist entries."""
+        identities = set(identities)
+        changed = self.managed_providers ^ identities
+        for identity in changed:
+            providers = self.providers.setdefault(identity, set())
+            if identity in identities:
+                providers.add("<managed>")
+            else:
+                providers.discard("<managed>")
+        self.managed_providers = identities
+        affected = set().union(*(self.dependents.get(i, set()) for i in changed))
         self._recompute(affected)
         return affected
 
@@ -477,6 +502,7 @@ def check_missing_requirements(
     progress_cb: Optional[ProgressCallback] = None,
     save_results: bool = True,
     enabled_only: Optional[set] = None,
+    managed_providers=(),
 ) -> list[MissingRequirementInfo]:
     """Check requirements in separate Nexus-domain batches."""
     _log = progress_cb or (lambda m: None)
@@ -497,7 +523,8 @@ def check_missing_requirements(
     for domain, names in by_domain.items():
         results.extend(_check_missing_requirements_one_domain(
             api, staging_root, game_domain=domain, progress_cb=progress_cb,
-            save_results=save_results, enabled_only=names))
+            save_results=save_results, enabled_only=names,
+            managed_providers=managed_providers))
     return results
 
 
@@ -508,6 +535,7 @@ def _check_missing_requirements_one_domain(
     progress_cb: Optional[ProgressCallback] = None,
     save_results: bool = True,
     enabled_only: Optional[set] = None,
+    managed_providers=(),
 ) -> list[MissingRequirementInfo]:
     """
     Check all Nexus-sourced mods under *staging_root* for missing requirements.
@@ -567,6 +595,11 @@ def _check_missing_requirements_one_domain(
     # 2. Build set of all installed Nexus mod IDs
     installed_mod_ids: set[int] = {
         m.mod_id for m in all_installed if m.mod_id > 0}
+    wanted_domain = normalise_game_domain(game_domain)
+    if wanted_domain == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[0]:
+        installed_mod_ids.discard(FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[1])
+    installed_mod_ids.update(
+        mod_id for domain, mod_id in managed_providers if domain == wanted_domain)
 
     # External tools (never flag), requirement alternatives and requirement
     # substitutions; all three can be game-scoped
@@ -662,6 +695,8 @@ def check_requirements_from_gql(
     enabled_only: Optional[set] = None,
     api: Optional[NexusAPI] = None,
     write_meta_cb: Optional[Callable[[Path, NexusModMeta], None]] = None,
+    managed_providers=(),
+    deferred_requirement_ids=(),
 ) -> list[MissingRequirementInfo]:
     """
     Check for missing requirements using pre-fetched GraphQL data.
@@ -724,6 +759,12 @@ def check_requirements_from_gql(
     # trigger spurious "missing requirement" warnings.
     installed_mod_ids: set[int] = {
         m.mod_id for m in domain_installed if m.mod_id > 0}
+    # A staged copy of FFTIC's loader is not the setup-owned component.
+    if wanted_domain == FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[0]:
+        installed_mod_ids.discard(FFTIC_MANAGED_LOADER_NEXUS_IDENTITY[1])
+    installed_mod_ids.update(
+        mod_id for domain, mod_id in managed_providers if domain == wanted_domain)
+    deferred_requirement_ids = set(deferred_requirement_ids)
 
     external_set, alternatives_dict, substitutions = _load_requirement_filter()
 
@@ -764,6 +805,8 @@ def check_requirements_from_gql(
 
         missing: list[NexusModRequirement] = []
         for req in reqs:
+            if req.mod_id in deferred_requirement_ids:
+                continue
             if req.is_external:
                 continue
             if req.mod_id <= 0:
